@@ -5,6 +5,9 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Load local environment variables if available (.env file)
+load_dotenv()
+
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -14,32 +17,49 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
-from sqlalchemy import BigInteger, String, Float, Boolean, Column, DateTime
+from sqlalchemy import BigInteger, String, Float, Boolean, Column, DateTime, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-# --- CONFIGURATION & ENVIRONMENT ---
-BOT_TOKEN = "8785635298:AAGCGT3Df8VKrCH5fbClvSRySRQSugAZa0E"
-DATABASE_URL = "sqlite+aiosqlite:///rolex_casino.db"  # Self-contained robust async persistent storage
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# --- CONFIGURATION & ENVIRONMENT (Loaded securely from Railway Environment) ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8785635298:AAGCGT3Df8VKrCH5fbClvSRySRQSugAZa0E")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:////data/rolex_casino.db")
+GROUP_ID = int(os.getenv("GROUP_ID", "-1004458883943"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1004458883943"))
+GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/RolexCasinos")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "Rolex_Casino_BOT")
 
-GROUP_ID = -1004458883943
-GROUP_LINK = "https://t.me/RolexCasinos"
-BOT_USERNAME = "Rolex_Casino_BOT"
-LOG_CHANNEL_ID = -1004458883943  # Dedicated logs channel username/id
+# Parse Admin IDs safely from CSV or fallback
+raw_admins = os.getenv("ADMIN_IDS", "8860529495,1053006219")
+ADMINS = {int(x.strip()) for x in raw_admins.split(",") if x.strip().isdigit()}
 
-ADMINS = {8860529495, 1053006219}
-MOD_USERNAMES = {"@Lucifer_1209", "@luffy_rolex", "@RolexCasinoMod"}
-
-UPI_ADDRESS = "rutvik1209@fam"
+UPI_ADDRESS = os.getenv("UPI_ADDRESS", "rutvik1209@fam")
 CRYPTO_WALLETS = {
-    "BEP20": "0xD8419224A65C3d35C10AE695562463c8445ACb15",
-    "SOLANA": "3bKsCSR2mmconFaExejbkuGfeQNuVQPFttzj9y2MP2mE",
-    "ETHEREUM": "0xD8419224A65C3d35C10AE695562463c8445ACb15",
-    "BITCOIN": "bc1qsm7xzn4k8kpxwurzjsredangepvzgh70y0ypzd"
+    "BEP20": os.getenv("WALLET_BEP20", "0xD8419224A65C3d35C10AE695562463c8445ACb15"),
+    "SOLANA": os.getenv("WALLET_SOLANA", "3bKsCSR2mmconFaExejbkuGfeQNuVQPFttzj9y2MP2mE"),
+    "ETHEREUM": os.getenv("WALLET_ETHEREUM", "0xD8419224A65C3d35C10AE695562463c8445ACb15"),
+    "BITCOIN": os.getenv("WALLET_BITCOIN", "bc1qsm7xzn4k8kpxwurzjsredangepvzgh70y0ypzd")
 }
 
-logging.basicConfig(level=logging.INFO)
+# Ensure SQLite directory exists if using persistent volume (e.g., /data)
+if DATABASE_URL.startswith("sqlite+aiosqlite:////"):
+    sqlite_path = DATABASE_URL.replace("sqlite+aiosqlite:////", "/")
+    os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
+elif DATABASE_URL.startswith("sqlite+aiosqlite:///"):
+    sqlite_rel = DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    if "/" in sqlite_rel:
+        os.makedirs(os.path.dirname(sqlite_rel), exist_ok=True)
+
+# Convert standard postgres URL to asyncpg driver if Railway provides standard URL
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("RolexCasino")
 
 # --- DATABASE MODELS ---
@@ -62,7 +82,7 @@ class Transaction(Base):
     __tablename__ = "transactions"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger)
-    type: Mapped[str] = mapped_column(String)  # DEPOSIT / WITHDRAW / TIP / ADMIN_ADD / ADMIN_DED
+    type: Mapped[str] = mapped_column(String)  # DEPOSIT / WITHDRAW / TIP / ADMIN_ADD
     amount: Mapped[float] = mapped_column(Float)
     method: Mapped[str] = mapped_column(String)
     proof_ref: Mapped[str] = mapped_column(String, nullable=True)
@@ -75,12 +95,19 @@ class GiftCode(Base):
     amount: Mapped[float] = mapped_column(Float)
     is_claimed: Mapped[bool] = mapped_column(Boolean, default=False)
 
+# Async Engine with greenlet support
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Initializes tables safely using SQLAlchemy async engine with greenlet"""
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database schema initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise
 
 async def get_user(session: AsyncSession, telegram_id: int, username: str = None) -> User:
     user = await session.get(User, telegram_id)
@@ -106,6 +133,7 @@ BOT_STATE = {"maintenance": False}
 class DepositStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_proof = State()
+    waiting_for_photo = State()
 
 class WithdrawStates(StatesGroup):
     waiting_for_amount = State()
@@ -115,16 +143,11 @@ class AdminStates(StatesGroup):
     broadcast_text = State()
     modify_balance = State()
     modify_user_id = State()
-    gift_code_amount = State()
-    gift_code_string = State()
 
-class PvPStates(StatesGroup):
-    waiting_for_opponent = State()
-
-# Active PvP Challenge storage: {challenger_id: {amount, game, message_id}}
+# Active PvP storage: {challenger_id: {"amount": bet, "game": game, "msg_id": msg_id, "chat_id": chat_id}}
 ACTIVE_PVPS = {}
 
-# --- COLORED BUTTON STYLING (Mocking color schemes using standard Telegram formatting icons) ---
+# --- NAVIGATION KEYBOARDS ---
 def get_channel_lock_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Join Official Group 🌐", url=GROUP_LINK)],
@@ -134,6 +157,20 @@ def get_channel_lock_kb():
 def get_dm_redirect_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
+    ])
+
+def get_main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
+            InlineKeyboardButton(text="📤 Withdraw 🔴", callback_data="menu_withdraw")
+        ],
+        [
+            InlineKeyboardButton(text="🎮 PvP Games Arena 🔵", callback_data="menu_games"),
+            InlineKeyboardButton(text="💼 My Wallet 🟢", callback_data="menu_wallet")
+        ],
+        [InlineKeyboardButton(text="📢 Join Official Group 🌐", url=GROUP_LINK)],
+        [InlineKeyboardButton(text="🛟 Support Center 🔵", callback_data="menu_support")]
     ])
 
 # --- SECURITY & MIDDLEWARE ---
@@ -147,36 +184,48 @@ async def security_middleware(handler, event: types.Update, data: dict):
     chat_type = message.chat.type
     is_admin = user.id in ADMINS
 
-    # 1. Maintenance Mode Check
+    # Check ban status
+    async with async_session() as session:
+        db_user = await session.get(User, user.id)
+        if db_user and db_user.is_banned and not is_admin:
+            if chat_type == "private":
+                return await message.answer("⛔ Your account has been suspended by Rolex Casino Security.")
+            return
+
+    # Maintenance Mode Check
     if BOT_STATE["maintenance"] and not is_admin:
         if chat_type in ["group", "supergroup"]:
             return
         return await message.answer("⚠️ **Rolex Casino** is currently under scheduled maintenance. Please check back soon!", parse_mode="Markdown")
 
     text = message.text or message.caption or ""
-    command = text.split()[0].lower() if text.startswith("/") else ""
+    # Normalize command stripped of bot mention like /dice@Rolex_Casino_BOT
+    raw_cmd = text.split()[0].lower() if text.startswith("/") else ""
+    command = raw_cmd.split("@")[0]
 
-    # 2. Admin Commands must ONLY work in DM
-    admin_commands = {"/panel", "/pending", "/user", "/users", "/creategift", "/balanceadd", "/ban", "/unban", "/broadcast", "/admincommands", "/announcement", "/hb"}
+    # Admin Commands in DM only
+    admin_commands = {"/panel", "/pending", "/user", "/users", "/creategift", "/balanceadd", "/ban", "/unban", "/broadcast", "/admincommands", "/announcement", "/hb", "/maintenance", "/restart"}
     if command in admin_commands and chat_type in ["group", "supergroup"]:
-        await message.delete()
+        try: await message.delete()
+        except Exception: pass
         return await message.answer(
             f"⛔ **{user.first_name}, administrative commands can only be executed securely inside our DM inbox!**",
             reply_markup=get_dm_redirect_kb(),
             parse_mode="Markdown"
         )
 
-    # 3. Deposit & Withdraw strictly in DM
+    # Deposit & Withdraw in DM only
     dm_only_commands = {"/deposit", "/withdraw"}
     if command in dm_only_commands and chat_type in ["group", "supergroup"]:
-        await message.delete()
+        try: await message.delete()
+        except Exception: pass
         return await message.answer(
             f"⛔ **{user.first_name}, deposits & withdrawals can only be processed securely inside our DM inbox!**",
             reply_markup=get_dm_redirect_kb(),
             parse_mode="Markdown"
         )
 
-    # 4. Games must ONLY work in the group chat (PvP arena)
+    # Games restricted to group chat
     game_commands = {"/dice", "/basket", "/darts", "/football", "/bowling", "/slots", "/coin", "/battle"}
     if command in game_commands and chat_type == "private" and not is_admin:
         await message.answer(
@@ -191,7 +240,7 @@ async def security_middleware(handler, event: types.Update, data: dict):
 # --- ROUTERS ---
 router = Router()
 
-# --- START & GENERAL COMMANDS ---
+# --- START & MENU COMMANDS ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.chat.type in ["group", "supergroup"]:
@@ -218,26 +267,39 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"💰 **Starting Balance:** ₹{user.balance:.2f}\n\n"
         f"Explore options using the buttons below or check `/help`."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
-            InlineKeyboardButton(text="📤 Withdraw 🔴")
-        ],
-        [
-            InlineKeyboardButton(text="🎮 PvP Games Arena 🔵", callback_data="menu_games"),
-            InlineKeyboardButton(text="💼 My Wallet 🟢")
-        ],
-        [InlineKeyboardButton(text="📢 Join Official Group 🌐", url=GROUP_LINK)],
-        [InlineKeyboardButton(text="🛟 Support Center 🔵", callback_data="menu_support")]
-    ])
-    await message.answer(welcome_text, reply_markup=kb, parse_mode="Markdown")
+    await message.answer(welcome_text, reply_markup=get_main_menu_kb(), parse_mode="Markdown")
+
+@router.callback_query(F.data == "menu_deposit")
+async def cb_menu_deposit(callback: types.CallbackQuery, state: FSMContext):
+    await start_deposit_flow(callback.message, state)
+    await callback.answer()
+
+@router.callback_query(F.data == "menu_withdraw")
+async def cb_menu_withdraw(callback: types.CallbackQuery, state: FSMContext):
+    await cmd_withdraw(callback.message, state)
+    await callback.answer()
+
+@router.callback_query(F.data == "menu_wallet")
+async def cb_menu_wallet(callback: types.CallbackQuery):
+    await cmd_wallet(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "menu_games")
+async def cb_menu_games(callback: types.CallbackQuery):
+    await cmd_games(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "menu_support")
+async def cb_menu_support(callback: types.CallbackQuery):
+    await cmd_support(callback.message)
+    await callback.answer()
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
     help_text = (
         "📜 **Rolex Casino Help & Command Directory**\n\n"
-        "⚔️ **PvP Games:** `/dice`, `/basket`, `/darts`, `/football`, `/bowling`, `/slots`, `/coin`, `/battle`\n"
-        "💳 **Wallet & Finance:** `/wallet`, `/deposit`, `/withdraw`, `/wagerstatus`, `/mystats`, `/tip`, `/claim`\n"
+        "⚔️ **PvP Games:** `/dice <amt>`, `/basket <amt>`, `/darts <amt>`, `/football <amt>`, `/bowling <amt>`, `/slots <amt>`, `/coin <amt>`, `/battle <amt>`\n"
+        "💳 **Wallet & Finance:** `/wallet`, `/deposit`, `/withdraw`, `/wagerstatus`, `/tip <amt>`, `/claim <code>`\n"
         "⚙️ **General:** `/start`, `/help`, `/games`, `/support`\n"
     )
     await message.answer(help_text, parse_mode="Markdown")
@@ -252,8 +314,9 @@ async def cmd_games(message: types.Message):
         "• `/football <amount>` - PvP Football penalty kick\n"
         "• `/bowling <amount>` - PvP Bowling strike match\n"
         "• `/slots <amount>` - PvP High roller slots\n"
-        "• `/coin <amount> <heads/tails>` - PvP Coin flip challenge\n"
-        "• `/battle <amount>` - PvP custom challenge match\n"
+        "• `/coin <amount>` - PvP Coin flip challenge\n"
+        "• `/battle <amount>` - PvP custom challenge match\n\n"
+        "💡 *Note: All games are strictly PvP against real players in the group! Win multiplier: 1.92×*"
     )
     await message.answer(games_text, parse_mode="Markdown")
 
@@ -263,7 +326,7 @@ async def cmd_support(message: types.Message):
         [InlineKeyboardButton(text="👨‍💻 Owner Support 🔵", url="https://t.me/Lucifer_1209")],
         [InlineKeyboardButton(text="📢 Official Community 🟢", url=GROUP_LINK)]
     ])
-    await message.answer("🛟 **Rolex Casino Support Center**\nNeed assistance? Contact our team below:", reply_markup=kb, parse_mode="Markdown")
+    await message.answer("🛟 **Rolex Casino Support Center**\nNeed assistance with deposits, withdrawals, or queries? Contact our team:", reply_markup=kb, parse_mode="Markdown")
 
 # --- WALLET, DEPOSIT & WITHDRAW ---
 @router.message(Command("wallet"))
@@ -280,7 +343,7 @@ async def cmd_wallet(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
-            InlineKeyboardButton(text="📤 Withdraw 🔴")
+            InlineKeyboardButton(text="📤 Withdraw 🔴", callback_data="menu_withdraw")
         ]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
@@ -300,14 +363,14 @@ async def choose_deposit_method(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(DepositStates.waiting_for_amount)
     
     if method == "UPI":
-        msg = f"🇮🇳 **UPI Deposit Selected**\nEnter amount to deposit (*Min: ₹70 | Max: ₹5000*):\nUPI Address: `{UPI_ADDRESS}`"
+        msg = f"🇮🇳 **UPI Deposit Selected**\nEnter amount to deposit (*Min: ₹70 | Max: ₹5000*):\n\nUPI Address: `{UPI_ADDRESS}`\n*(Tap address to copy)*"
     else:
         msg = (
             f"⚡ **Crypto Deposit Selected**\nEnter amount in USD ($) (*Min: $1 | Max: $50*):\n\n"
-            f"• **BEP20:** `{CRYPTO_WALLETS['BEP20']}`\n"
-            f"• **Solana:** `{CRYPTO_WALLETS['SOLANA']}`\n"
-            f"• **Ethereum:** `{CRYPTO_WALLETS['ETHEREUM']}`\n"
-            f"• **Bitcoin:** `{CRYPTO_WALLETS['BITCOIN']}`"
+            f"• **BEP20 (USDT):** `{CRYPTO_WALLETS['BEP20']}`\n"
+            f"• **Solana (SOL/USDT):** `{CRYPTO_WALLETS['SOLANA']}`\n"
+            f"• **Ethereum (ETH/USDT):** `{CRYPTO_WALLETS['ETHEREUM']}`\n"
+            f"• **Bitcoin (BTC):** `{CRYPTO_WALLETS['BITCOIN']}`"
         )
     await callback.message.edit_text(msg, parse_mode="Markdown")
     await callback.answer()
@@ -317,10 +380,10 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
     except ValueError:
-        return await message.answer("❌ Invalid amount format. Please enter numbers only.")
+        return await message.answer("❌ Invalid amount format. Please enter numbers only (e.g., 500).")
 
     data = await state.get_data()
-    method = data.get("deposit_method")
+    method = data.get("deposit_method", "UPI")
 
     if method == "UPI" and not (70 <= amount <= 5000):
         return await message.answer("❌ UPI Deposit limits: Min ₹70, Max ₹5000.")
@@ -332,33 +395,38 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
     
     if method == "UPI":
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="I've Paid 🟢", callback_data="paid_upi")]])
-        await message.answer("📥 **Payment initiated!**\nSend the **12-digit UTR transaction number** (numbers only):", reply_markup=kb, parse_mode="Markdown")
+        await message.answer(f"📥 **Deposit Order for ₹{amount:.2f} Initiated!**\n\nSend payment to: `{UPI_ADDRESS}`\nThen send the **12-digit UPI UTR / Ref number**:", reply_markup=kb, parse_mode="Markdown")
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="I've Paid 🟢", callback_data="paid_crypto")]])
-        await message.answer("📥 **Payment initiated!**\nSend your **Crypto Transaction Hash / ID** (64-66 characters):", reply_markup=kb, parse_mode="Markdown")
+        await message.answer(f"📥 **Crypto Order for ${amount:.2f} Initiated!**\n\nSend payment and then paste your **Transaction Hash / ID** (64-66 characters):", reply_markup=kb, parse_mode="Markdown")
+
+@router.callback_query(F.data.in_(["paid_upi", "paid_crypto"]))
+async def cb_paid_reminder(callback: types.CallbackQuery):
+    await callback.answer("Please send the transaction reference ID in this chat.", show_alert=True)
 
 @router.message(DepositStates.waiting_for_proof)
 async def process_deposit_proof(message: types.Message, state: FSMContext):
     proof = message.text.strip()
     data = await state.get_data()
-    method = data.get("deposit_method")
+    method = data.get("deposit_method", "UPI")
 
     if method == "UPI":
         if not (proof.isdigit() and len(proof) == 12):
-            return await message.answer("❌ Invalid UPI UTR! Must be exactly 12 numeric digits.")
+            return await message.answer("❌ Invalid UPI UTR! It must be exactly 12 numeric digits.")
     else:
         if not (64 <= len(proof) <= 66):
-            return await message.answer("❌ Invalid Crypto Hash length! Must be between 64 and 66 characters.")
+            return await message.answer("❌ Invalid Crypto Hash length! It must be 64 to 66 characters long.")
 
     await state.update_data(deposit_proof=proof)
-    await message.answer("📸 Now upload/send your **payment screenshot** receipt as proof:", parse_mode="Markdown")
+    await state.set_state(DepositStates.waiting_for_photo)
+    await message.answer("📸 Now upload/send your **payment screenshot** as receipt proof:", parse_mode="Markdown")
 
-@router.message(F.photo, DepositStates.waiting_for_proof)
+@router.message(F.photo, DepositStates.waiting_for_photo)
 async def process_deposit_screenshot(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    amount = data.get("deposit_amount")
-    method = data.get("deposit_method")
-    proof = data.get("deposit_proof")
+    amount = data.get("deposit_amount", 0.0)
+    method = data.get("deposit_method", "UPI")
+    proof = data.get("deposit_proof", "N/A")
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
 
@@ -377,8 +445,8 @@ async def process_deposit_screenshot(message: types.Message, state: FSMContext):
         tx_id = tx.id
 
     await state.clear()
-    await message.answer("⏳ **Deposit submitted!** Wait for admins approval.", parse_mode="Markdown")
-    await send_log(message.bot, f"📥 **New Deposit Request [# {tx_id}]**\nUser: @{username} (`{user_id}`)\nAmount: {amount} ({method})\nRef: `{proof}`")
+    await message.answer("⏳ **Deposit submitted successfully!**\nOur automated review team will verify and credit your wallet shortly.", parse_mode="Markdown")
+    await send_log(message.bot, f"📥 **New Deposit Request [# {tx_id}]**\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount:.2f} ({method})\nRef: `{proof}`")
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -388,37 +456,46 @@ async def process_deposit_screenshot(message: types.Message, state: FSMContext):
     ])
     for adm in ADMINS:
         try:
-            await message.bot.send_message(adm, f"🚨 **New Deposit Request [# {tx_id}]**\nUser: @{username}\nAmount: {amount} ({method})\nRef: `{proof}`", reply_markup=admin_kb, parse_mode="Markdown")
-        except Exception:
-            pass
+            await message.bot.send_message(
+                adm,
+                f"🚨 **New Deposit Request [# {tx_id}]**\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount:.2f} ({method})\nRef: `{proof}`",
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed sending alert to admin {adm}: {e}")
 
 @router.message(Command("withdraw"))
 async def cmd_withdraw(message: types.Message, state: FSMContext):
     async with async_session() as session:
         user = await get_user(session, message.from_user.id)
         if user.wager_required > 0:
-            return await message.answer(f"⛔ You must clear your wagering requirement of ₹{user.wager_required:.2f} before withdrawing!", parse_mode="Markdown")
+            return await message.answer(
+                f"⛔ **Withdrawal Locked**\nYou have a pending wagering requirement of ₹{user.wager_required:.2f} to clear through PvP play before withdrawing!",
+                parse_mode="Markdown"
+            )
         if user.balance <= 0:
-            return await message.answer("❌ You have zero balance available for withdrawal.")
+            return await message.answer("❌ You have zero available balance for withdrawal.")
 
     await state.set_state(WithdrawStates.waiting_for_amount)
-    await message.answer(f"📤 **Withdrawal Request**\nEnter amount to withdraw (Max available: ₹{user.balance:.2f}):", parse_mode="Markdown")
+    await message.answer(f"📤 **Withdrawal Request**\nEnter amount to withdraw (Available: ₹{user.balance:.2f}):", parse_mode="Markdown")
 
 @router.message(WithdrawStates.waiting_for_amount)
 async def process_withdraw_amount(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
+        if amount <= 0: raise ValueError
     except ValueError:
-        return await message.answer("❌ Invalid amount.")
+        return await message.answer("❌ Invalid amount. Enter positive numeric amount.")
 
     async with async_session() as session:
         user = await get_user(session, message.from_user.id)
         if amount > user.balance:
-            return await message.answer("❌ Insufficient balance.")
+            return await message.answer(f"❌ Insufficient funds! You only have ₹{user.balance:.2f} available.")
 
     await state.update_data(withdraw_amount=amount)
     await state.set_state(WithdrawStates.waiting_for_address)
-    await message.answer("📝 Send your payout destination address (UPI ID or Crypto Address):", parse_mode="Markdown")
+    await message.answer("📝 Send your payout destination address (UPI ID e.g. `user@upi` or Crypto Wallet):", parse_mode="Markdown")
 
 @router.message(WithdrawStates.waiting_for_address)
 async def process_withdraw_address(message: types.Message, state: FSMContext):
@@ -431,7 +508,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     async with async_session() as session:
         user = await get_user(session, user_id)
         if user.balance < amount:
-            return await message.answer("❌ Balance error.")
+            return await message.answer("❌ Insufficient balance for this withdrawal.")
         user.balance -= amount
         
         tx = Transaction(telegram_id=user_id, type="WITHDRAW", amount=amount, method="MANUAL", proof_ref=address, status="PENDING")
@@ -441,8 +518,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         tx_id = tx.id
 
     await state.clear()
-    await message.answer("⏳ **Withdrawal submitted!** Sent to admins for verification.", parse_mode="Markdown")
-    await send_log(message.bot, f"📤 **Withdrawal Request [# {tx_id}]**\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount}\nAddress: `{address}`")
+    await message.answer("⏳ **Withdrawal submitted!** Our payout cashier is reviewing your request.", parse_mode="Markdown")
+    await send_log(message.bot, f"📤 **Withdrawal Request [# {tx_id}]**\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount:.2f}\nAddress: `{address}`")
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -452,7 +529,12 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     ])
     for adm in ADMINS:
         try:
-            await message.bot.send_message(adm, f"🚨 **Withdrawal Request [# {tx_id}]**\nUser: @{username}\nAmount: ₹{amount}\nAddress: `{address}`", reply_markup=admin_kb, parse_mode="Markdown")
+            await message.bot.send_message(
+                adm,
+                f"🚨 **Withdrawal Request [# {tx_id}]**\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount:.2f}\nAddress: `{address}`",
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
         except Exception:
             pass
 
@@ -460,7 +542,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
 async def cmd_wager(message: types.Message):
     async with async_session() as session:
         user = await get_user(session, message.from_user.id)
-    await message.answer(f"📊 **Wagering Status**\nPending Wager to clear: **₹{user.wager_required:.2f}**", parse_mode="Markdown")
+    await message.answer(f"📊 **Wagering Status**\nPending Wager to clear: **₹{user.wager_required:.2f}**\n*Play any PvP game to clear your 1× wagering requirement.*", parse_mode="Markdown")
 
 @router.message(Command("tip"))
 async def cmd_tip(message: types.Message):
@@ -468,7 +550,7 @@ async def cmd_tip(message: types.Message):
         return await message.answer("Usage: Reply to a user's message with `/tip <amount>`", parse_mode="Markdown")
     args = message.text.split()
     if len(args) < 2:
-        return await message.answer("❌ Specify amount to tip.", parse_mode="Markdown")
+        return await message.answer("❌ Specify amount to tip (e.g., `/tip 50`).", parse_mode="Markdown")
     try:
         amount = float(args[1])
         if amount <= 0: raise ValueError
@@ -500,7 +582,7 @@ async def cmd_tip(message: types.Message):
     try:
         await message.bot.send_message(
             recipient.id,
-            f"🎁 **You got a tip!**\n\n👤 From: @{tipper_name}\n💵 Amount: ₹{amount:.2f}\n🏦 Balance updated to: ₹{new_bal:.2f}",
+            f"🎁 **You received a tip!**\n\n👤 From: @{tipper_name}\n💵 Amount: ₹{amount:.2f}\n🏦 New Balance: ₹{new_bal:.2f}",
             parse_mode="Markdown"
         )
     except Exception:
@@ -512,10 +594,10 @@ async def cmd_claim(message: types.Message):
     args = message.text.split()
     if len(args) < 2:
         return await message.answer("Usage: `/claim <gift_code>`", parse_mode="Markdown")
-    code_str = args.text if hasattr(message, "text") else args[1]
+    code = args[1].strip()
     
     async with async_session() as session:
-        gift = await session.get(GiftCode, args[1])
+        gift = await session.get(GiftCode, code)
         if not gift or gift.is_claimed:
             return await message.answer("❌ Invalid or already claimed gift code.")
         
@@ -525,10 +607,10 @@ async def cmd_claim(message: types.Message):
         await session.commit()
         new_bal = user.balance
 
-    await message.answer(f"🎉 **Gift Code Claimed Successfully!**\nCredited: ₹{gift.amount:.2f}\nNew Balance: ₹{new_bal:.2f}", parse_mode="Markdown")
-    await send_log(message.bot, f"🎉 **Gift Code Claimed**\nCode: `{args[1]}`\nUser: @{message.from_user.username} (`{message.from_user.id}`)\nAmount: ₹{gift.amount:.2f}")
+    await message.answer(f"🎉 **Gift Code Claimed!**\nCredited: ₹{gift.amount:.2f}\nNew Balance: ₹{new_bal:.2f}", parse_mode="Markdown")
+    await send_log(message.bot, f"🎉 **Gift Claimed**\nCode: `{code}`\nUser: @{message.from_user.username} (`{message.from_user.id}`)\nAmount: ₹{gift.amount:.2f}")
 
-# --- STRICT PVP MULTIPLAYER GAMES IMPLEMENTATION ---
+# --- STRICT PVP MULTIPLAYER GAMES WITH CANCEL / REFUND ---
 @router.message(Command("battle"))
 async def game_battle(message: types.Message):
     args = message.text.split()
@@ -545,15 +627,39 @@ async def game_battle(message: types.Message):
         if user.balance < bet:
             return await message.answer(f"❌ Insufficient balance! You have ₹{user.balance:.2f}")
         user.balance -= bet
+        # Reduce wager requirement by bet played
+        user.wager_required = max(0.0, user.wager_required - bet)
         await session.commit()
 
-    ACTIVE_PVPS[message.from_user.id] = {"amount": bet, "game": "battle"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚔️ Accept PvP Battle 🟢", callback_data=f"pvp_accept_{message.from_user.id}")]])
+    ACTIVE_PVPS[message.from_user.id] = {"amount": bet, "game": "battle", "chat_id": message.chat.id}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚔️ Accept Battle 🟢", callback_data=f"pvp_accept_{message.from_user.id}")],
+        [InlineKeyboardButton(text="❌ Cancel & Refund 🔴", callback_data=f"pvp_cancel_{message.from_user.id}")]
+    ])
     await message.answer(
-        f"⚔️ **PvP Battle Challenge Created!**\n\n👤 Challenger: @{message.from_user.username or message.from_user.first_name}\n💰 Stake: ₹{bet:.2f}\n\nClick below to accept this duel!",
+        f"⚔️ **PvP Battle Challenge Created!**\n\n👤 Challenger: @{message.from_user.username or message.from_user.first_name}\n💰 Stake: ₹{bet:.2f}\n✨ Multiplier: 1.92×\n\nClick below to accept this duel:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
+
+@router.callback_query(F.data.startswith("pvp_cancel_"))
+async def cancel_pvp(callback: types.CallbackQuery):
+    challenger_id = int(callback.data.split("_")[2])
+    if callback.from_user.id != challenger_id:
+        return await callback.answer("Only the challenger can cancel this game!", show_alert=True)
+    if challenger_id not in ACTIVE_PVPS:
+        return await callback.answer("This challenge has already been resolved or expired.", show_alert=True)
+
+    challenge = ACTIVE_PVPS.pop(challenger_id)
+    bet = challenge["amount"]
+
+    async with async_session() as session:
+        user = await get_user(session, challenger_id)
+        user.balance += bet
+        await session.commit()
+
+    await callback.message.edit_text(f"❌ **PvP Challenge Cancelled.** ₹{bet:.2f} has been refunded to your wallet.", parse_mode="Markdown")
+    await callback.answer("Refunded!")
 
 @router.callback_query(F.data.startswith("pvp_accept_"))
 async def accept_pvp(callback: types.CallbackQuery):
@@ -561,10 +667,10 @@ async def accept_pvp(callback: types.CallbackQuery):
     acceptor_id = callback.from_user.id
 
     if challenger_id == acceptor_id:
-        return await callback.answer("You cannot accept your own challenge!", show_alert=True)
+        return await callback.answer("You cannot play against yourself!", show_alert=True)
 
     if challenger_id not in ACTIVE_PVPS:
-        return await callback.answer("This PvP challenge has expired or already started.", show_alert=True)
+        return await callback.answer("This PvP challenge has expired or was already played.", show_alert=True)
 
     challenge = ACTIVE_PVPS.pop(challenger_id)
     bet = challenge["amount"]
@@ -572,14 +678,16 @@ async def accept_pvp(callback: types.CallbackQuery):
     async with async_session() as session:
         acceptor = await get_user(session, acceptor_id, callback.from_user.username)
         if acceptor.balance < bet:
+            # Restore challenger game in map if acceptor has no money
+            ACTIVE_PVPS[challenger_id] = challenge
             return await callback.answer(f"Insufficient funds! You need ₹{bet:.2f}", show_alert=True)
         acceptor.balance -= bet
+        acceptor.wager_required = max(0.0, acceptor.wager_required - bet)
         await session.commit()
 
-    # Determine winner randomly
     winner_id = random.choice([challenger_id, acceptor_id])
     loser_id = acceptor_id if winner_id == challenger_id else challenger_id
-    payout = bet * 1.92
+    payout = round(bet * 1.92, 2)
 
     async with async_session() as session:
         winner = await get_user(session, winner_id)
@@ -587,21 +695,24 @@ async def accept_pvp(callback: types.CallbackQuery):
         await session.commit()
         new_bal = winner.balance
 
-    winner_name = (await callback.bot.get_chat(winner_id)).username or "Winner"
-    loser_name = callback.from_user.username if acceptor_id == loser_id else "Challenger"
+    try:
+        w_user = await callback.bot.get_chat(winner_id)
+        winner_name = f"@{w_user.username}" if w_user.username else w_user.first_name
+    except Exception:
+        winner_name = f"User {winner_id}"
 
     msg = (
         f"⚔️ **ROLEX CASINO - PVP BATTLE RESULT** ⚔️\n\n"
         f"💰 **Staked Amount:** ₹{bet:.2f} each\n"
-        f"✨ **Win Type:** 1.92x Multiplayer PvP\n"
-        f"🏆 **Winner:** @{winner_name}\n"
+        f"✨ **Multiplier:** 1.92× PvP\n"
+        f"🏆 **Winner:** {winner_name}\n"
         f"💵 **Total Payout:** ₹{payout:.2f}\n"
-        f"🏦 **New Balance:** ₹{new_bal:.2f}"
+        f"🏦 **Winner New Balance:** ₹{new_bal:.2f}"
     )
     await callback.message.edit_text(msg, parse_mode="Markdown")
-    await send_log(callback.bot, f"⚔️ **PvP Battle Completed**\nWinner: `{winner_id}`\nLoser: `{loser_id}`\nPot: ₹{bet * 2:.2f}")
+    await send_log(callback.bot, f"⚔️ **PvP Battle Finished**\nWinner: `{winner_id}`\nLoser: `{loser_id}`\nStake: ₹{bet:.2f}")
 
-# Dedicated PvP Dice Game vs User
+# Dedicated PvP Animated Dice Game
 @router.message(Command("dice"))
 async def pvp_dice(message: types.Message):
     args = message.text.split()
@@ -618,12 +729,16 @@ async def pvp_dice(message: types.Message):
         if user.balance < bet:
             return await message.answer(f"❌ Insufficient balance! You have ₹{user.balance:.2f}")
         user.balance -= bet
+        user.wager_required = max(0.0, user.wager_required - bet)
         await session.commit()
 
-    ACTIVE_PVPS[message.from_user.id] = {"amount": bet, "game": "dice"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Accept PvP Dice 🟢", callback_data=f"dice_accept_{message.from_user.id}")]])
+    ACTIVE_PVPS[message.from_user.id] = {"amount": bet, "game": "dice", "chat_id": message.chat.id}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Accept PvP Dice 🟢", callback_data=f"dice_accept_{message.from_user.id}")],
+        [InlineKeyboardButton(text="❌ Cancel & Refund 🔴", callback_data=f"pvp_cancel_{message.from_user.id}")]
+    ])
     await message.answer(
-        f"🎲 **PvP Dice Challenge Created!**\n\n👤 Challenger: @{message.from_user.username or message.from_user.first_name}\n💰 Stake: ₹{bet:.2f}\n\nClick below to match and roll 🎲!",
+        f"🎲 **PvP Dice Challenge Created!**\n\n👤 Challenger: @{message.from_user.username or message.from_user.first_name}\n💰 Stake: ₹{bet:.2f}\n\nClick below to roll dice against each other:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -635,7 +750,7 @@ async def accept_dice(callback: types.CallbackQuery):
     if challenger_id == acceptor_id:
         return await callback.answer("Cannot accept your own challenge!", show_alert=True)
     if challenger_id not in ACTIVE_PVPS:
-        return await callback.answer("Challenge expired.", show_alert=True)
+        return await callback.answer("Challenge expired or already taken.", show_alert=True)
 
     challenge = ACTIVE_PVPS.pop(challenger_id)
     bet = challenge["amount"]
@@ -643,15 +758,18 @@ async def accept_dice(callback: types.CallbackQuery):
     async with async_session() as session:
         acceptor = await get_user(session, acceptor_id, callback.from_user.username)
         if acceptor.balance < bet:
+            ACTIVE_PVPS[challenger_id] = challenge
             return await callback.answer("Insufficient funds.", show_alert=True)
         acceptor.balance -= bet
+        acceptor.wager_required = max(0.0, acceptor.wager_required - bet)
         await session.commit()
 
-    # Send telegram animated dice for both
+    await callback.message.answer("🎲 **Rolling dice for Challenger...**")
     d1 = await callback.message.bot.send_dice(callback.message.chat.id, emoji="🎲")
-    await asyncio.sleep(4)
+    await asyncio.sleep(3.5)
+    await callback.message.answer("🎲 **Rolling dice for Acceptor...**")
     d2 = await callback.message.bot.send_dice(callback.message.chat.id, emoji="🎲")
-    await asyncio.sleep(4)
+    await asyncio.sleep(3.5)
 
     v1, v2 = d1.dice.value, d2.dice.value
     if v1 > v2:
@@ -659,16 +777,16 @@ async def accept_dice(callback: types.CallbackQuery):
     elif v2 > v1:
         winner_id = acceptor_id
     else:
-        # Tie refund
+        # Tie - full refund to both
         async with async_session() as session:
             c_user = await get_user(session, challenger_id)
             a_user = await get_user(session, acceptor_id)
             c_user.balance += bet
             a_user.balance += bet
             await session.commit()
-        return await callback.message.answer("🤝 **It's a Tie!** Both bets refunded.", parse_mode="Markdown")
+        return await callback.message.answer(f"🤝 **It's a Tie!** (Rolls: {v1} vs {v2}). Both players refunded ₹{bet:.2f}.", parse_mode="Markdown")
 
-    payout = bet * 1.92
+    payout = round(bet * 1.92, 2)
     async with async_session() as session:
         winner = await get_user(session, winner_id)
         winner.balance += payout
@@ -677,20 +795,21 @@ async def accept_dice(callback: types.CallbackQuery):
 
     msg = (
         f"🎲 **ROLEX CASINO - PVP DICE RESULT** 🎲\n\n"
-        f"Challenger Rolled: {v1}\n"
-        f"Acceptor Rolled: {v2}\n"
-        f"✨ **1.92x Win Type**\n"
+        f"Challenger Rolled: **{v1}**\n"
+        f"Acceptor Rolled: **{v2}**\n"
+        f"✨ **1.92× Win Payout**\n"
         f"🏆 **Winner ID:** `{winner_id}`\n"
-        f"💵 Payout: ₹{payout:.2f}\n"
-        f"🏦 New Balance: ₹{new_bal:.2f}"
+        f"💵 **Payout:** ₹{payout:.2f}\n"
+        f"🏦 **New Balance:** ₹{new_bal:.2f}"
     )
     await callback.message.answer(msg, parse_mode="Markdown")
-    await send_log(callback.bot, f"🎲 **PvP Dice Completed**\nWinner: `{winner_id}`\nRolls: {v1} vs {v2}\nPot: ₹{bet * 2:.2f}")
+    await send_log(callback.bot, f"🎲 **PvP Dice Complete**\nWinner: `{winner_id}`\nScores: {v1} vs {v2}\nPot: ₹{bet * 2:.2f}")
 
-# Generic wrapper for Darts, Basketball, Football, Bowling, Slots, Coin PvP
+# Generic wrapper for Sports & Casino PvP
 @router.message(Command("basket", "darts", "football", "bowling", "slots", "coin"))
 async def pvp_generic_games(message: types.Message):
-    cmd = message.text.split()[0].lower().replace("/", "")
+    raw_cmd = message.text.split()[0].lower().replace("/", "")
+    cmd = raw_cmd.split("@")[0]
     args = message.text.split()
     if len(args) < 2:
         return await message.answer(f"Usage: `/{cmd} <amount>` (Strictly PvP)", parse_mode="Markdown")
@@ -705,15 +824,19 @@ async def pvp_generic_games(message: types.Message):
         if user.balance < bet:
             return await message.answer(f"❌ Insufficient balance! You have ₹{user.balance:.2f}")
         user.balance -= bet
+        user.wager_required = max(0.0, user.wager_required - bet)
         await session.commit()
 
-    ACTIVE_PVPS[message.from_user.id] = {"amount": bet, "game": cmd}
+    ACTIVE_PVPS[message.from_user.id] = {"amount": bet, "game": cmd, "chat_id": message.chat.id}
     emoji_map = {"basket": "🏀", "darts": "🎯", "football": "⚽", "bowling": "🎳", "slots": "🎰", "coin": "🪙"}
     em = emoji_map.get(cmd, "🎮")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"Accept PvP {cmd.capitalize()} {em} 🟢", callback_data=f"pvpgen_accept_{message.from_user.id}_{cmd}")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Accept PvP {cmd.capitalize()} {em} 🟢", callback_data=f"pvpgen_accept_{message.from_user.id}_{cmd}")],
+        [InlineKeyboardButton(text="❌ Cancel & Refund 🔴", callback_data=f"pvp_cancel_{message.from_user.id}")]
+    ])
     await message.answer(
-        f"{em} **PvP {cmd.capitalize()} Challenge Created!**\n\n👤 Challenger: @{message.from_user.username or message.from_user.first_name}\n💰 Stake: ₹{bet:.2f}\n\nClick below to accept!",
+        f"{em} **PvP {cmd.capitalize()} Challenge Created!**\n\n👤 Challenger: @{message.from_user.username or message.from_user.first_name}\n💰 Stake: ₹{bet:.2f}\n\nClick below to accept this duel:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -726,7 +849,7 @@ async def accept_pvp_gen(callback: types.CallbackQuery):
     acceptor_id = callback.from_user.id
 
     if challenger_id == acceptor_id:
-        return await callback.answer("Cannot accept your own challenge!", show_alert=True)
+        return await callback.answer("Cannot play against yourself!", show_alert=True)
     if challenger_id not in ACTIVE_PVPS:
         return await callback.answer("Challenge expired.", show_alert=True)
 
@@ -736,17 +859,19 @@ async def accept_pvp_gen(callback: types.CallbackQuery):
     async with async_session() as session:
         acceptor = await get_user(session, acceptor_id, callback.from_user.username)
         if acceptor.balance < bet:
+            ACTIVE_PVPS[challenger_id] = challenge
             return await callback.answer("Insufficient funds.", show_alert=True)
         acceptor.balance -= bet
+        acceptor.wager_required = max(0.0, acceptor.wager_required - bet)
         await session.commit()
 
-    emoji_map = {"basket": "🏀", "darts": "🎯", "football": "⚽", "bowling": "🎳", "slots": "🎰", "coin": "🪙"}
+    emoji_map = {"basket": "🏀", "darts": "🎯", "football": "⚽", "bowling": "🎳", "slots": "🎰", "coin": "🎲"}
     em = emoji_map.get(game, "🎲")
 
     d1 = await callback.message.bot.send_dice(callback.message.chat.id, emoji=em)
-    await asyncio.sleep(4)
+    await asyncio.sleep(3.5)
     d2 = await callback.message.bot.send_dice(callback.message.chat.id, emoji=em)
-    await asyncio.sleep(4)
+    await asyncio.sleep(3.5)
 
     v1, v2 = d1.dice.value, d2.dice.value
     if v1 > v2:
@@ -760,9 +885,9 @@ async def accept_pvp_gen(callback: types.CallbackQuery):
             c_user.balance += bet
             a_user.balance += bet
             await session.commit()
-        return await callback.message.answer("🤝 **It's a Tie!** Both bets refunded.", parse_mode="Markdown")
+        return await callback.message.answer(f"🤝 **It's a Tie!** Both bets refunded: ₹{bet:.2f}", parse_mode="Markdown")
 
-    payout = bet * 1.92
+    payout = round(bet * 1.92, 2)
     async with async_session() as session:
         winner = await get_user(session, winner_id)
         winner.balance += payout
@@ -771,15 +896,15 @@ async def accept_pvp_gen(callback: types.CallbackQuery):
 
     msg = (
         f"{em} **ROLEX CASINO - PVP {game.upper()} RESULT** {em}\n\n"
-        f"Challenger Score: {v1}\n"
-        f"Acceptor Score: {v2}\n"
-        f"✨ **1.92x Win Type**\n"
+        f"Challenger: **{v1}**\n"
+        f"Acceptor: **{v2}**\n"
+        f"✨ **1.92× Win Multiplier**\n"
         f"🏆 **Winner ID:** `{winner_id}`\n"
         f"💵 Payout: ₹{payout:.2f}\n"
         f"🏦 New Balance: ₹{new_bal:.2f}"
     )
     await callback.message.answer(msg, parse_mode="Markdown")
-    await send_log(callback.bot, f"{em} **PvP {game.upper()} Completed**\nWinner: `{winner_id}`\nScores: {v1} vs {v2}\nPot: ₹{bet * 2:.2f}")
+    await send_log(callback.bot, f"{em} **PvP {game.upper()} Finished**\nWinner: `{winner_id}`\nScores: {v1} vs {v2}\nStake: ₹{bet:.2f}")
 
 # --- ADMIN PANEL & ALL ADMIN COMMANDS ---
 @router.message(Command("panel"))
@@ -789,11 +914,55 @@ async def cmd_panel(message: types.Message):
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Pending Requests 🔵", callback_data="admin_pending")],
-        [InlineKeyboardButton(text="📢 Broadcast 🟢", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📢 Broadcast Message 🟢", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="👥 View Users 🔵", callback_data="admin_users")]
     ])
     status_str = "🟢 Active" if not BOT_STATE["maintenance"] else "🔴 Maintenance / Bets Off"
     await message.answer(f"🎛️ **Rolex Casino Admin Dashboard**\nBot Status: {status_str}", reply_markup=kb, parse_mode="Markdown")
+
+@router.callback_query(F.data == "admin_pending")
+async def cb_admin_pending(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return await callback.answer("Access denied.")
+    await cmd_pending(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_users")
+async def cb_admin_users(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return await callback.answer("Access denied.")
+    await cmd_users(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMINS:
+        return await callback.answer("Access denied.")
+    await state.set_state(AdminStates.broadcast_text)
+    await callback.message.answer("📢 Send the broadcast message to deliver to all players:")
+    await callback.answer()
+
+@router.message(AdminStates.broadcast_text)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMINS:
+        return
+    text = message.text
+    await state.clear()
+    
+    async with async_session() as session:
+        users = (await session.execute(select(User.telegram_id))).scalars().all()
+
+    success, failed = 0, 0
+    await message.answer(f"⏳ Broadcasting to {len(users)} users...")
+    for uid in users:
+        try:
+            await message.bot.send_message(uid, f"📢 **Rolex Casino Announcement**\n\n{text}", parse_mode="Markdown")
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await message.answer(f"✅ Broadcast finished! Sent: {success} | Failed/Blocked: {failed}")
 
 @router.message(Command("hb"))
 async def cmd_hb(message: types.Message):
@@ -802,9 +971,7 @@ async def cmd_hb(message: types.Message):
     
     status_str = "🟢 Active (Bets ON)" if not BOT_STATE["maintenance"] else "🔴 Maintenance (Bets OFF)"
     async with async_session() as session:
-        # Calculate total vault liquidity
-        import sqlalchemy as sa
-        total_bal = (await session.execute(sa.select(sa.func.sum(User.balance)))).scalar() or 0.0
+        total_bal = (await session.execute(select(func.sum(User.balance)))).scalar() or 0.0
 
     await message.answer(
         f"🏦 **Rolex Casino Bot Treasury Vault (/hb)**\n\n"
@@ -835,7 +1002,7 @@ async def cmd_creategift(message: types.Message):
     if len(args) < 3:
         return await message.answer("Usage: `/creategift <code> <amount>`", parse_mode="Markdown")
     
-    code, amt = args[1], float(args[2])
+    code, amt = args[1].strip(), float(args[2])
     async with async_session() as session:
         g = GiftCode(code=code, amount=amt, is_claimed=False)
         session.add(g)
@@ -866,7 +1033,7 @@ async def cmd_balanceadd(message: types.Message):
 async def cmd_ban_unban(message: types.Message):
     if message.from_user.id not in ADMINS:
         return await message.answer("⛔ Admins only.")
-    cmd = message.text.split()[0].lower()
+    cmd = message.text.split()[0].lower().split("@")[0]
     args = message.text.split()
     if len(args) < 2:
         return await message.answer(f"Usage: `{cmd} <user_id>`")
@@ -883,9 +1050,8 @@ async def cmd_ban_unban(message: types.Message):
 async def cmd_pending(message: types.Message):
     if message.from_user.id not in ADMINS:
         return await message.answer("⛔ Admins only.")
-    import sqlalchemy as sa
     async with async_session() as session:
-        txs = (await session.execute(sa.select(Transaction).where(Transaction.status == "PENDING"))).scalars().all()
+        txs = (await session.execute(select(Transaction).where(Transaction.status == "PENDING"))).scalars().all()
     if not txs:
         return await message.answer("📋 No pending deposit or withdrawal requests.")
     
@@ -894,15 +1060,14 @@ async def cmd_pending(message: types.Message):
             InlineKeyboardButton(text="✅ Approve 🟢", callback_data=f"adm_dep_yes_{tx.id}" if tx.type=="DEPOSIT" else f"adm_wd_yes_{tx.id}"),
             InlineKeyboardButton(text="❌ Reject 🔴", callback_data=f"adm_dep_no_{tx.id}" if tx.type=="DEPOSIT" else f"adm_wd_no_{tx.id}")
         ]])
-        await message.answer(f"🆔 **TX ID:** `{tx.id}`\n👤 User: `{tx.telegram_id}`\nType: **{tx.type}**\nAmount: ₹{tx.amount}\nMethod: {tx.method}", reply_markup=kb, parse_mode="Markdown")
+        await message.answer(f"🆔 **TX ID:** `#{tx.id}`\n👤 User ID: `{tx.telegram_id}`\nType: **{tx.type}**\nAmount: ₹{tx.amount:.2f}\nMethod: {tx.method}\nRef: `{tx.proof_ref}`", reply_markup=kb, parse_mode="Markdown")
 
 @router.message(Command("users"))
 async def cmd_users(message: types.Message):
     if message.from_user.id not in ADMINS:
         return await message.answer("⛔ Admins only.")
-    import sqlalchemy as sa
     async with async_session() as session:
-        count = (await session.execute(sa.select(sa.func.count(User.telegram_id)))).scalar() or 0
+        count = (await session.execute(select(func.count(User.telegram_id)))).scalar() or 0
     await message.answer(f"👥 **Total Registered Users in Rolex Database:** `{count}`", parse_mode="Markdown")
 
 @router.message(Command("admincommands"))
@@ -929,7 +1094,7 @@ async def cmd_maintenance(message: types.Message):
     if message.from_user.id not in ADMINS:
         return await message.answer("⛔ Admins only.")
     BOT_STATE["maintenance"] = True
-    await message.answer("🛠️ **Rolex Casino is now in Maintenance Mode / Bets OFF.** All non-admin commands and chats are locked.", parse_mode="Markdown")
+    await message.answer("🛠️ **Rolex Casino is now in Maintenance Mode / Bets OFF.** All non-admin commands are locked.", parse_mode="Markdown")
     await send_log(message.bot, "🛠️ **Bot Maintenance Enabled / Bets OFF by Admin**")
 
 @router.message(Command("restart"))
@@ -952,9 +1117,11 @@ async def handle_admin_approval(callback: types.CallbackQuery):
     async with async_session() as session:
         tx = await session.get(Transaction, tx_id)
         if not tx or tx.status != "PENDING":
-            return await callback.message.edit_text("⚠️ Transaction already processed or missing.")
+            return await callback.message.edit_text("⚠️ Transaction already processed or does not exist.")
         
         user = await session.get(User, tx.telegram_id)
+        if not user:
+            return await callback.message.edit_text("⚠️ Target user not found in database.")
         
         if status_decision == "yes":
             tx.status = "APPROVED"
@@ -965,7 +1132,7 @@ async def handle_admin_approval(callback: types.CallbackQuery):
                 try:
                     await callback.bot.send_message(
                         tx.telegram_id,
-                        f"🏆 **Deposit Approved!**\n\n💵 Credited: ₹{tx.amount:.2f}\n🏦 Balance: ₹{user.balance:.2f}\n\n⚠️ Wager ₹{tx.amount:.2f} before withdrawing (1× rule).",
+                        f"🏆 **Deposit Approved!**\n\n💵 Credited: ₹{tx.amount:.2f}\n🏦 Balance: ₹{user.balance:.2f}\n\n⚠️ Wager ₹{tx.amount:.2f} before withdrawing (1× wagering rule).",
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -973,39 +1140,50 @@ async def handle_admin_approval(callback: types.CallbackQuery):
             elif tx.type == "WITHDRAW":
                 await session.commit()
                 try:
-                    await callback.bot.send_message(tx.telegram_id, f"🏆 **Withdrawal Approved & Processed!** Payout of ₹{tx.amount:.2f} sent.", parse_mode="Markdown")
+                    await callback.bot.send_message(
+                        tx.telegram_id,
+                        f"🏆 **Withdrawal Approved & Processed!**\n\nPayout of ₹{tx.amount:.2f} has been dispatched to your destination account.",
+                        parse_mode="Markdown"
+                    )
                 except Exception:
                     pass
-            await callback.message.edit_text(f"✅ Transaction #{tx_id} **APPROVED**.")
-            await send_log(callback.bot, f"✅ **Transaction #{tx_id} ({tx.type}) Approved** for User `{tx.telegram_id}` (Amount: ₹{tx.amount})")
+            await callback.message.edit_text(f"✅ Transaction #{tx_id} **APPROVED** by @{callback.from_user.username}.")
+            await send_log(callback.bot, f"✅ **Transaction #{tx_id} ({tx.type}) Approved** for User `{tx.telegram_id}` (Amount: ₹{tx.amount:.2f})")
         else:
             tx.status = "REJECTED"
             if tx.type == "WITHDRAW":
-                user.balance += tx.amount
+                user.balance += tx.amount  # Refund balance back to user
             await session.commit()
             try:
-                await callback.bot.send_message(tx.telegram_id, f"❌ **Request #{tx_id} Rejected by Admin.**", parse_mode="Markdown")
+                await callback.bot.send_message(tx.telegram_id, f"❌ **Request #{tx_id} Rejected by Admin.** Funds returned if withdrawal.", parse_mode="Markdown")
             except Exception:
                 pass
-            await callback.message.edit_text(f"❌ Transaction #{tx_id} **REJECTED**.")
+            await callback.message.edit_text(f"❌ Transaction #{tx_id} **REJECTED** by @{callback.from_user.username}.")
             await send_log(callback.bot, f"❌ **Transaction #{tx_id} ({tx.type}) Rejected** for User `{tx.telegram_id}`")
     await callback.answer()
 
 # --- MAIN ENTRY POINT ---
 async def main():
+    logger.info("Initializing Rolex Casino Database...")
     await init_db()
+    
     bot = Bot(token=BOT_TOKEN)
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
+    # Attach security middleware
     dp.message.middleware(security_middleware)
     dp.callback_query.middleware(security_middleware)
 
+    # Register all handlers
     dp.include_router(router)
 
-    logger.info("Rolex Casino PvP Bot starting polling...")
+    logger.info(f"Rolex Casino PvP Bot starting polling as @{BOT_USERNAME}...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped gracefully.")
