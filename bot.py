@@ -174,9 +174,19 @@ def get_main_menu_kb():
     ])
 
 # --- SECURITY & MIDDLEWARE ---
-async def security_middleware(handler, event: types.Update, data: dict):
-    message = event.message or (event.callback_query.message if event.callback_query else None)
-    user = event.message.from_user if event.message else (event.callback_query.from_user if event.callback_query else None)
+async def security_middleware(handler, event: types.TelegramObject, data: dict):
+    if isinstance(event, types.CallbackQuery):
+        message = event.message
+        user = event.from_user
+    elif isinstance(event, types.Message):
+        message = event
+        user = event.from_user
+    elif isinstance(event, types.Update):
+        message = event.message or (event.callback_query.message if event.callback_query else None)
+        user = (event.message.from_user if event.message else 
+                (event.callback_query.from_user if event.callback_query else None))
+    else:
+        return await handler(event, data)
     
     if not message or not user:
         return await handler(event, data)
@@ -188,12 +198,16 @@ async def security_middleware(handler, event: types.Update, data: dict):
     async with async_session() as session:
         db_user = await session.get(User, user.id)
         if db_user and db_user.is_banned and not is_admin:
+            if isinstance(event, types.CallbackQuery):
+                return await event.answer("⛔ Your account has been suspended.", show_alert=True)
             if chat_type == "private":
                 return await message.answer("⛔ Your account has been suspended by Rolex Casino Security.")
             return
 
     # Maintenance Mode Check
     if BOT_STATE["maintenance"] and not is_admin:
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer("⚠️ Bot is currently under maintenance.", show_alert=True)
         if chat_type in ["group", "supergroup"]:
             return
         return await message.answer("⚠️ **Rolex Casino** is currently under scheduled maintenance. Please check back soon!", parse_mode="Markdown")
