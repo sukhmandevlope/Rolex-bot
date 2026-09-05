@@ -30,6 +30,7 @@ const admins = new Set(
 );
 let offset = 0;
 let running = false;
+const dailyPlayLimit = 5000;
 
 const games = [
   "✊ Rock • Paper • Scissors",
@@ -111,24 +112,24 @@ async function isMember(userId: number) {
 
 const joinKeyboard = {
   inline_keyboard: [
-    [{ text: "✦ Join Rolex Casino", url: requiredChannelUrl }],
-    [{ text: "✓ I Have Joined", callback_data: "verify_join" }],
+    [{ text: "✦ Join Rolex Casino", url: requiredChannelUrl, style: "success" }],
+    [{ text: "✓ I Have Joined", callback_data: "verify_join", style: "success" }],
   ],
 };
 
 const mainKeyboard = {
   inline_keyboard: [
     [
-      { text: "🎮 Games", callback_data: "games" },
-      { text: "💎 Wallet", callback_data: "wallet" },
+      { text: "🎮 Games", callback_data: "games", style: "success" },
+      { text: "💎 Wallet", callback_data: "wallet", style: "success" },
     ],
     [
-      { text: "🏆 Leaderboard", callback_data: "leaderboard" },
-      { text: "📊 My Stats", callback_data: "stats" },
+      { text: "🏆 Leaderboard", callback_data: "leaderboard", style: "success" },
+      { text: "📊 My Stats", callback_data: "stats", style: "success" },
     ],
     [
-      { text: "🎁 Refer & Earn", callback_data: "refer" },
-      { text: "🛟 Support", callback_data: "support" },
+      { text: "🎁 Refer & Earn", callback_data: "refer", style: "success" },
+      { text: "🛟 Support", callback_data: "support", style: "success" },
     ],
   ],
 };
@@ -164,10 +165,26 @@ async function showGames(chatId: number) {
 async function showWallet(chatId: number, userId: number) {
   const user = await getUser(userId);
   if (!user) return;
+  const playedToday = await getDailyWagered(userId);
   await send(
     chatId,
-    `<b>💎 𝐏𝐑𝐈𝐕𝐀𝐓𝐄 𝐕𝐀𝐔𝐋𝐓</b>\n\nAvailable: <b>${Number(user.balance).toFixed(2)} RC</b>\nTotal wagered: ${Number(user.total_wagered).toFixed(2)} RC\nGames played: ${user.games_played}\n\n⚠️ Play credits cannot be deposited, withdrawn, traded, or redeemed.`,
+    `<b>💎 𝐏𝐑𝐈𝐕𝐀𝐓𝐄 𝐕𝐀𝐔𝐋𝐓</b>\n\nAvailable: <b>${Number(user.balance).toFixed(2)} RC</b>\nToday's play: <b>${playedToday.toFixed(2)} / ${dailyPlayLimit.toFixed(2)} RC</b>\nTotal wagered: ${Number(user.total_wagered).toFixed(2)} RC\nGames played: ${user.games_played}\n\n⚠️ Play credits cannot be deposited, withdrawn, traded, or redeemed.`,
   );
+}
+
+async function getDailyWagered(
+  userId: number,
+  client: { query: (...args: any[]) => Promise<any> } = pool,
+) {
+  const result = (await client.query(
+    `SELECT COALESCE(SUM((metadata->>'stake')::numeric), 0)::text AS wagered
+     FROM casino_ledger
+     WHERE telegram_id = $1
+       AND type IN ('game_win', 'game_loss')
+       AND created_at >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`,
+    [userId],
+  )) as { rows: Array<{ wagered: string }> };
+  return Number(result.rows[0]?.wagered ?? 0);
 }
 
 async function showStats(chatId: number, userId: number) {
@@ -193,8 +210,8 @@ async function leaderboard(chatId: number) {
 }
 
 async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", stake: number) {
-  if (!Number.isFinite(stake) || stake < 1 || stake > 10000) {
-    await send(chatId, `Use <code>/${game} 100</code>. Stake must be 1–10,000 RC.`);
+  if (!Number.isFinite(stake) || stake < 1 || stake > dailyPlayLimit) {
+    await send(chatId, `Use <code>/${game} 100</code>. Stake must be 1–${dailyPlayLimit.toLocaleString("en-IN")} RC.`);
     return;
   }
   const client = await pool.connect();
@@ -207,6 +224,15 @@ async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", 
     if (!locked.rows[0] || Number(locked.rows[0].balance) < stake) {
       await client.query("ROLLBACK");
       await send(chatId, "Insufficient play-credit balance.");
+      return;
+    }
+    const playedToday = await getDailyWagered(userId, client);
+    if (playedToday + stake > dailyPlayLimit) {
+      await client.query("ROLLBACK");
+      await send(
+        chatId,
+        `<b>🛡 DAILY PLAY LIMIT</b>\n\nYou have played ${playedToday.toFixed(2)} RC today.\nRemaining: <b>${Math.max(0, dailyPlayLimit - playedToday).toFixed(2)} RC</b>\n\nThe limit resets at midnight IST.`,
+      );
       return;
     }
     const won = randomInt(0, 2) === 1;
@@ -226,7 +252,7 @@ async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", 
     await send(
       chatId,
       `${game === "coin" ? "🪙" : "🎲"} <b>${game.toUpperCase()} RESULT</b>\n\n${won ? "✦ <b>YOU WIN</b>" : "◇ <b>HOUSE WINS</b>"}\nStake: ${stake.toFixed(2)} RC\nNet: ${delta > 0 ? "+" : ""}${delta.toFixed(2)} RC`,
-      { reply_markup: { inline_keyboard: [[{ text: "Play Again", callback_data: `replay_${game}_${stake}` }]] } },
+      { reply_markup: { inline_keyboard: [[{ text: "Play Again", callback_data: `replay_${game}_${stake}`, style: "success" }]] } },
     );
   } catch (err) {
     await client.query("ROLLBACK");
@@ -237,8 +263,16 @@ async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", 
 }
 
 async function createBattle(chatId: number, userId: number, stake: number) {
-  if (!Number.isFinite(stake) || stake < 1 || stake > 10000) {
-    await send(chatId, "Use <code>/battle 100</code>. Stake must be 1–10,000 RC.");
+  if (!Number.isFinite(stake) || stake < 1 || stake > dailyPlayLimit) {
+    await send(chatId, `Use <code>/battle 100</code>. Stake must be 1–${dailyPlayLimit.toLocaleString("en-IN")} RC.`);
+    return;
+  }
+  const playedToday = await getDailyWagered(userId);
+  if (playedToday + stake > dailyPlayLimit) {
+    await send(
+      chatId,
+      `<b>🛡 DAILY PLAY LIMIT</b>\n\nRemaining today: <b>${Math.max(0, dailyPlayLimit - playedToday).toFixed(2)} RC</b>\nThe limit resets at midnight IST.`,
+    );
     return;
   }
   const result = await pool.query<{ id: number }>(
