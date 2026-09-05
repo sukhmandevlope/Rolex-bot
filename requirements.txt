@@ -1,11 +1,2 @@
-# Core Telegram Bot Framework
-aiogram>=3.17.0
-
-# Database & Async ORM (greenlet fixes the Railway crash!)
-SQLAlchemy[asyncio]>=2.0.36
-greenlet>=3.1.1
-aiosqlite>=0.20.0
-asyncpg>=0.30.0
-
-# Environment Management
-python-dotenv>=1.0.1
+python-telegram-bot>=20.0,<22.0
+python-dotenv>=1.0.0
