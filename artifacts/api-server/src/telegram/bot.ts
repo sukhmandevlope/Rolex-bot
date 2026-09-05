@@ -189,6 +189,25 @@ async function getDailyWagered(
   return Number(result.rows[0]?.wagered ?? 0);
 }
 
+async function showPaymentStatus(chatId: number, command: "deposit" | "withdraw") {
+  const result = await pool.query<{ jurisdiction: string }>(
+    `SELECT jurisdiction FROM operator_licenses
+     WHERE status='verified' AND valid_from <= CURRENT_DATE AND valid_until >= CURRENT_DATE
+     ORDER BY verified_at DESC LIMIT 1`,
+  );
+  if (!result.rows[0]) {
+    await send(
+      chatId,
+      "<b>🔒 PAYMENTS LOCKED</b>\n\nDeposits and withdrawals remain disabled until the operator's jurisdiction and license are independently verified.",
+    );
+    return;
+  }
+  await send(
+    chatId,
+    `<b>🛡 COMPLIANT ${command.toUpperCase()}</b>\n\nLicensed jurisdiction: <b>${escapeHtml(result.rows[0].jurisdiction)}</b>\n\nThis action is available only after age, location, KYC/AML, risk, and responsible-gambling checks. ${command === "withdraw" ? "Every withdrawal is held for review before a provider receives it." : "UPI and crypto instructions are issued only by the configured payment provider."}\n\nNever share a private key, seed phrase, or mnemonic.`,
+  );
+}
+
 async function showStats(chatId: number, userId: number) {
   const user = await getUser(userId);
   if (!user) return;
@@ -504,11 +523,10 @@ async function handleMessage(message: TgMessage) {
       break;
     case "deposit":
     case "withdraw":
+      await showPaymentStatus(message.chat.id, command);
+      break;
     case "setwallet":
-      await send(
-        message.chat.id,
-        "<b>🔒 PAYMENTS LOCKED</b>\n\nReal-money and crypto transactions are disabled in this unlicensed prototype. Never send funds or private keys to anyone claiming to represent this bot.",
-      );
+      await send(message.chat.id, "Wallet custody is provider-managed. Private keys and seed phrases are never accepted.");
       break;
     case "support":
       await send(

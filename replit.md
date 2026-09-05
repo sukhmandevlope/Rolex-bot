@@ -31,6 +31,9 @@ A private Telegram casino prototype with play-credit games, PvP challenges, chan
 
 - The unlicensed prototype uses non-redeemable play credits only.
 - Payment and withdrawal commands are intentionally locked.
+- Regulated payment APIs remain locked until a submitted operator license is independently marked verified and in-date.
+- UPI and crypto flows are provider-backed, non-custodial, and reject private-key or seed-phrase fields.
+- Confirmed money movements use balanced, append-only double-entry records; withdrawals always require review.
 - Game balance changes use row locks and database transactions.
 
 ## Product
