@@ -32,24 +32,26 @@ let offset = 0;
 let running = false;
 const dailyPlayLimit = 5000;
 
-const games = [
-  "✊ Rock • Paper • Scissors",
-  "🪙 Coin Flip",
-  "🎲 Dice",
-  "🎯 Darts",
-  "🏀 Basketball",
-  "⚽ Football",
-  "🎳 Bowling",
-  "🎰 Slots",
-  "🏰 Towers",
-  "🚀 Limbo",
-  "🎲 Dice Rush",
-  "7️⃣ 7 Up",
-  "🃏 Blackjack",
-  "💣 Mines",
-  "🔒 Vault",
-  "🏏 Cricket Dice",
-];
+const gameNames = {
+  rps: "✊ Rock Paper Scissors",
+  coin: "🪙 Coin Flip",
+  dice: "🎲 Dice Duel",
+  darts: "🎯 Darts",
+  basket: "🏀 Basketball",
+  football: "⚽ Football",
+  bowling: "🎳 Bowling",
+  slots: "🎰 Slots",
+  towers: "🏰 Towers",
+  limbo: "🚀 Limbo",
+  dr: "🎲 Dice Rush",
+  "7up": "7️⃣ 7 Up",
+  bj: "🃏 Blackjack",
+  mines: "💣 Mines",
+  vault: "🔒 Vault",
+  cdice: "🏏 Cricket Dice",
+} as const;
+
+type GameId = keyof typeof gameNames;
 
 async function callTelegram<T>(method: string, body: Record<string, unknown>): Promise<T> {
   const response = await fetch(`${api}/${method}`, {
@@ -158,7 +160,7 @@ function escapeHtml(value: string) {
 async function showGames(chatId: number) {
   await send(
     chatId,
-    `<b>🎮 𝐀𝐕𝐀𝐈𝐋𝐀𝐁𝐋𝐄 𝐆𝐀𝐌𝐄𝐒</b>\n\n${games.join("\n")}\n\n<b>Quick play</b>\n<code>/coin 100</code> — play vs bot\n<code>/dice 100</code> — roll vs bot\n<code>/battle 100</code> — create a PvP challenge\n\nAll balances are play credits in this prototype.`,
+    `<b>🎮 𝐀𝐕𝐀𝐈𝐋𝐀𝐁𝐋𝐄 𝐆𝐀𝐌𝐄𝐒</b>\n\n${Object.values(gameNames).join("\n")}\n\n<b>Play against the bot</b>\n<code>/rps 100 rock</code> · <code>/coin 100 heads</code>\n<code>/dice 100</code> · <code>/slots 100</code> · <code>/limbo 100 2</code>\n<code>/7up 100 up</code> · <code>/towers 100 2</code> · <code>/mines 100 3</code>\n\nEvery game is a one-round, server-settled play-credit game. Use <code>/help</code> for rules.`,
   );
 }
 
@@ -180,7 +182,7 @@ async function getDailyWagered(
     `SELECT COALESCE(SUM((metadata->>'stake')::numeric), 0)::text AS wagered
      FROM casino_ledger
      WHERE telegram_id = $1
-       AND type IN ('game_win', 'game_loss')
+        AND type IN ('game_win', 'game_loss', 'game_draw')
        AND created_at >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`,
     [userId],
   )) as { rows: Array<{ wagered: string }> };
@@ -209,9 +211,107 @@ async function leaderboard(chatId: number) {
   await send(chatId, `<b>🏆 𝐇𝐈𝐆𝐇 𝐑𝐎𝐋𝐋𝐄𝐑𝐒</b>\n\n${rows.join("\n") || "No players yet."}`);
 }
 
-async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", stake: number) {
+function parseStake(value: string | undefined) {
+  if (!value || !/^\d+(?:\.\d{1,2})?$/.test(value)) return null;
+  const stake = Number(value);
+  return Number.isFinite(stake) && stake >= 1 && stake <= dailyPlayLimit ? stake : null;
+}
+
+type Outcome = { delta: number; detail: string };
+
+function roll(max: number) {
+  return randomInt(1, max + 1);
+}
+
+function resolveGame(game: GameId, stake: number, option?: string): Outcome | string {
+  const choice = option?.toLowerCase();
+  const net = (multiplier: number) => Math.round(stake * multiplier * 100) / 100;
+  const duel = (label: string, max: number, multiplier: number): Outcome => {
+    const player = roll(max);
+    const bot = roll(max);
+    return player === bot
+      ? { delta: 0, detail: `${label}: you ${player}, bot ${bot}. Draw — stake returned.` }
+      : { delta: player > bot ? net(multiplier) : -stake, detail: `${label}: you ${player}, bot ${bot}.` };
+  };
+  switch (game) {
+    case "rps": {
+      if (!["rock", "paper", "scissors"].includes(choice ?? "")) return "Choose rock, paper, or scissors: <code>/rps 100 rock</code>.";
+      const bot = ["rock", "paper", "scissors"][randomInt(0, 3)]!;
+      const win = (choice === "rock" && bot === "scissors") || (choice === "paper" && bot === "rock") || (choice === "scissors" && bot === "paper");
+      return { delta: choice === bot ? 0 : win ? stake : -stake, detail: `You chose ${choice}; bot chose ${bot}.` };
+    }
+    case "coin": {
+      if (!["heads", "tails"].includes(choice ?? "")) return "Choose heads or tails: <code>/coin 100 heads</code>.";
+      const landed = randomInt(0, 2) ? "heads" : "tails";
+      return { delta: choice === landed ? stake : -stake, detail: `Coin landed <b>${landed}</b>.` };
+    }
+    case "dice": return duel("Dice", 6, 1);
+    case "darts": return duel("Bullseye score", 6, 0.9);
+    case "basket": return duel("Baskets", 4, 1.2);
+    case "football": return duel("Goals", 5, 1.1);
+    case "bowling": return duel("Pins", 10, 0.95);
+    case "dr": return duel("Three-roll total", 18, 1.5);
+    case "cdice": return duel("Cricket runs", 6, 1);
+    case "slots": {
+      const symbols = ["🍒", "🍋", "🔔", "💎"];
+      const reels = [symbols[randomInt(0, 4)]!, symbols[randomInt(0, 4)]!, symbols[randomInt(0, 4)]!];
+      const matches = reels.filter((symbol) => symbol === reels[0]).length;
+      const multiplier = matches === 3 ? 8 : matches === 2 ? 0.5 : -1;
+      return { delta: multiplier < 0 ? -stake : net(multiplier), detail: `Reels: ${reels.join(" ")}. ${matches === 3 ? "Three of a kind!" : matches === 2 ? "Pair landed!" : "No matching reels."}` };
+    }
+    case "towers": {
+      const floor = Number(choice);
+      if (!Number.isInteger(floor) || floor < 1 || floor > 3) return "Choose a safe floor from 1–3: <code>/towers 100 2</code>.";
+      const safe = roll(3);
+      return { delta: floor === safe ? net(2) : -stake, detail: `You chose floor ${floor}; the safe floor was ${safe}.` };
+    }
+    case "limbo": {
+      const target = Number(choice);
+      if (!Number.isFinite(target) || target < 1.1 || target > 10) return "Choose a target from 1.1x–10x: <code>/limbo 100 2</code>.";
+      const crash = randomInt(100, 1001) / 100;
+      return { delta: crash >= target ? net(target - 1) : -stake, detail: `Crash point: <b>${crash.toFixed(2)}x</b>; your target: ${target.toFixed(2)}x.` };
+    }
+    case "7up": {
+      if (!["up", "down", "7"].includes(choice ?? "")) return "Choose up, down, or 7: <code>/7up 100 up</code>.";
+      const total = roll(6) + roll(6);
+      const result = total === 7 ? "7" : total > 7 ? "up" : "down";
+      return { delta: choice === result ? net(result === "7" ? 4 : 0.9) : -stake, detail: `Dice total: ${total} (${result}).` };
+    }
+    case "bj": {
+      const player = roll(10) + roll(10);
+      const bot = roll(10) + roll(10);
+      const playerScore = player > 21 ? 0 : player;
+      const botScore = bot > 21 ? 0 : bot;
+      return { delta: playerScore === botScore ? 0 : playerScore > botScore ? stake : -stake, detail: `Your hand: ${player}; bot hand: ${bot}. Scores over 21 bust.` };
+    }
+    case "mines": {
+      const tile = Number(choice);
+      if (!Number.isInteger(tile) || tile < 1 || tile > 5) return "Pick a tile from 1–5: <code>/mines 100 3</code>.";
+      const mine = roll(5);
+      return { delta: tile === mine ? -stake : net(0.2), detail: `You picked tile ${tile}; mine was on tile ${mine}.` };
+    }
+    case "vault": {
+      const code = Number(choice);
+      if (!Number.isInteger(code) || code < 1 || code > 5) return "Guess a vault code from 1–5: <code>/vault 100 4</code>.";
+      const secret = roll(5);
+      return { delta: code === secret ? net(4) : -stake, detail: `Vault code was ${secret}.` };
+    }
+  }
+  throw new Error(`Unsupported game: ${game}`);
+}
+
+async function playVsBot(chatId: number, userId: number, game: GameId, stake: number, option?: string) {
   if (!Number.isFinite(stake) || stake < 1 || stake > dailyPlayLimit) {
     await send(chatId, `Use <code>/${game} 100</code>. Stake must be 1–${dailyPlayLimit.toLocaleString("en-IN")} RC.`);
+    return;
+  }
+  const outcome = resolveGame(game, stake, option);
+  if (typeof outcome === "string") {
+    await send(chatId, outcome);
+    return;
+  }
+  if (!(await isMember(userId))) {
+    await send(chatId, "Join the official community before playing.", { reply_markup: joinKeyboard });
     return;
   }
   const client = await pool.connect();
@@ -235,24 +335,24 @@ async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", 
       );
       return;
     }
-    const won = randomInt(0, 2) === 1;
-    const delta = won ? stake : -stake;
+    const won = outcome.delta > 0;
+    const settledAs = outcome.delta === 0 ? "game_draw" : won ? "game_win" : "game_loss";
     await client.query(
       `UPDATE casino_users SET balance = balance + $1, games_played = games_played + 1,
        wins = wins + $2, total_wagered = total_wagered + $3, updated_at = NOW()
        WHERE telegram_id = $4`,
-      [delta, won ? 1 : 0, stake, userId],
+       [outcome.delta, won ? 1 : 0, stake, userId],
     );
     await client.query(
       `INSERT INTO casino_ledger (telegram_id, amount, type, reference, metadata)
        VALUES ($1, $2, $3, $4, $5)`,
-      [userId, delta, won ? "game_win" : "game_loss", game, JSON.stringify({ stake })],
+       [userId, outcome.delta, settledAs, game, JSON.stringify({ stake, option: option ?? null, net: outcome.delta, outcome: outcome.detail })],
     );
     await client.query("COMMIT");
     await send(
       chatId,
-      `${game === "coin" ? "🪙" : "🎲"} <b>${game.toUpperCase()} RESULT</b>\n\n${won ? "✦ <b>YOU WIN</b>" : "◇ <b>HOUSE WINS</b>"}\nStake: ${stake.toFixed(2)} RC\nNet: ${delta > 0 ? "+" : ""}${delta.toFixed(2)} RC`,
-      { reply_markup: { inline_keyboard: [[{ text: "Play Again", callback_data: `replay_${game}_${stake}`, style: "success" }]] } },
+      `<b>${gameNames[game].toUpperCase()} RESULT</b>\n\n${outcome.detail}\n\n${won ? "✦ <b>YOU WIN</b>" : outcome.delta === 0 ? "◇ <b>DRAW</b>" : "◇ <b>BOT WINS</b>"}\nStake: ${stake.toFixed(2)} RC\nNet: ${outcome.delta > 0 ? "+" : ""}${outcome.delta.toFixed(2)} RC`,
+      { reply_markup: { inline_keyboard: [[{ text: "Play Again", callback_data: `replay_${game}_${stake}_${option ?? ""}`, style: "success" }]] } },
     );
   } catch (err) {
     await client.query("ROLLBACK");
@@ -265,6 +365,10 @@ async function playVsBot(chatId: number, userId: number, game: "coin" | "dice", 
 async function createBattle(chatId: number, userId: number, stake: number) {
   if (!Number.isFinite(stake) || stake < 1 || stake > dailyPlayLimit) {
     await send(chatId, `Use <code>/battle 100</code>. Stake must be 1–${dailyPlayLimit.toLocaleString("en-IN")} RC.`);
+    return;
+  }
+  if (!(await isMember(userId))) {
+    await send(chatId, "Join the official community before creating a challenge.", { reply_markup: joinKeyboard });
     return;
   }
   const playedToday = await getDailyWagered(userId);
@@ -371,10 +475,30 @@ async function handleMessage(message: TgMessage) {
     case "top":
       await leaderboard(message.chat.id);
       break;
+    case "rps":
     case "coin":
     case "dice":
-      await playVsBot(message.chat.id, user.id, command, Number(args[0]));
+    case "darts":
+    case "basket":
+    case "football":
+    case "bowling":
+    case "slots":
+    case "towers":
+    case "limbo":
+    case "dr":
+    case "7up":
+    case "bj":
+    case "mines":
+    case "vault":
+    case "cdice": {
+      const stake = parseStake(args[0]);
+      if (stake === null) {
+        await send(message.chat.id, `Use <code>/${command} 100</code>. Stake must be a whole or two-decimal amount from 1–${dailyPlayLimit.toLocaleString("en-IN")} RC.`);
+        break;
+      }
+      await playVsBot(message.chat.id, user.id, command, stake, args[1]);
       break;
+    }
     case "battle":
       await createBattle(message.chat.id, user.id, Number(args[0]));
       break;
@@ -407,7 +531,7 @@ async function handleMessage(message: TgMessage) {
     case "help":
       await send(
         message.chat.id,
-        "<b>📚 COMMAND DIRECTORY</b>\n\n/start — premium dashboard\n/games — game arena\n/wallet — play-credit vault\n/coin 100 — coin game\n/dice 100 — dice game\n/battle 100 — PvP challenge\n/mystats — player record\n/rank — leaderboard\n/refer — invite link\n/escrow — protected matches\n/support — support desk\n\n⚠️ Prototype credits have no monetary value.",
+        "<b>📚 COMMAND DIRECTORY</b>\n\n<b>Bot games (stake in RC)</b>\n/rps 100 rock — win +1x; tie returned\n/coin 100 heads — correct call +1x\n/dice 100 · /darts 100 · /basket 100 · /football 100 · /bowling 100 — beat bot; ties returned\n/slots 100 — 2 matching +0.5x, 3 +8x\n/towers 100 2 — find safe floor 1–3 for +2x\n/limbo 100 2 — reach target 1.1x–10x\n/dr 100 — Dice Rush, beat bot for +1.5x\n/7up 100 up — up/down +0.9x, exact 7 +4x\n/bj 100 — blackjack duel, +1x\n/mines 100 3 — safe tile 1–5 for +0.2x\n/vault 100 4 — guess code 1–5 for +4x\n/cdice 100 — cricket dice duel, +1x\n\n/games — game arena\n/wallet — play-credit vault\n/mystats — player record\n/rank — leaderboard\n/battle 100 — PvP challenge\n/support — support desk\n\nDaily game stakes are capped at 5,000 RC and reset at midnight IST. ⚠️ Prototype credits have no monetary value.",
       );
       break;
     default:
@@ -420,6 +544,11 @@ async function handleCallback(callback: TgCallback) {
   if (!chatId) return;
   await callTelegram("answerCallbackQuery", { callback_query_id: callback.id });
   await ensureUser(callback.from);
+  const record = await getUser(callback.from.id);
+  if (record?.banned) {
+    await send(chatId, "Your access is restricted. Contact support.");
+    return;
+  }
   const data = callback.data ?? "";
   if (data === "verify_join") await welcome(chatId, callback.from);
   else if (data === "games") await showGames(chatId);
@@ -431,9 +560,10 @@ async function handleCallback(callback: TgCallback) {
   } else if (data === "support") {
     await send(chatId, `<b>🛟 SUPPORT</b>\nContact administrators through ${requiredChannel}.`);
   } else if (data.startsWith("replay_")) {
-    const [, game, amount] = data.split("_");
-    if (game === "coin" || game === "dice") {
-      await playVsBot(chatId, callback.from.id, game, Number(amount));
+    const [, game, amount, option] = data.split("_");
+    if (game && game in gameNames) {
+      const stake = parseStake(amount);
+      if (stake !== null) await playVsBot(chatId, callback.from.id, game as GameId, stake, option || undefined);
     }
   }
 }
@@ -468,10 +598,32 @@ export async function startTelegramBot() {
     commands: [
       { command: "start", description: "Open the Rolex Casino dashboard" },
       { command: "games", description: "Browse the game arena" },
+      { command: "play", description: "Alias for the game arena" },
       { command: "wallet", description: "View your play-credit vault" },
+      { command: "balance", description: "Alias for your play-credit vault" },
       { command: "mystats", description: "View your gaming record" },
+      { command: "stats", description: "Alias for your gaming record" },
+      { command: "profile", description: "Alias for your gaming record" },
       { command: "rank", description: "View the leaderboard" },
+      { command: "leaderboard", description: "Alias for the leaderboard" },
+      { command: "top", description: "Alias for the leaderboard" },
       { command: "help", description: "Open the command directory" },
+      { command: "rps", description: "Rock paper scissors: /rps stake rock" },
+      { command: "coin", description: "Coin flip: /coin stake heads" },
+      { command: "dice", description: "Dice duel against the bot" },
+      { command: "darts", description: "Darts score duel" },
+      { command: "basket", description: "Basketball score duel" },
+      { command: "football", description: "Football score duel" },
+      { command: "bowling", description: "Bowling pins duel" },
+      { command: "slots", description: "Spin three slot reels" },
+      { command: "towers", description: "Choose a safe tower floor" },
+      { command: "limbo", description: "Set a limbo multiplier target" },
+      { command: "dr", description: "Play Dice Rush" },
+      { command: "7up", description: "Predict up, down, or seven" },
+      { command: "bj", description: "Play one-round blackjack" },
+      { command: "mines", description: "Choose a mine-free tile" },
+      { command: "vault", description: "Guess the vault code" },
+      { command: "cdice", description: "Play cricket dice" },
       { command: "support", description: "Contact support" },
     ],
   });
