@@ -177,7 +177,7 @@ async def maintenance_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     maintenance_mode = not maintenance_mode
-    status = "activated 🔒 (All chats & commands locked)" else "deactivated 🟢 (Fully operational)"
+        status = "activated 🔒 (All chats & commands locked)" if maintenance_mode else "deactivated 🟢 (Fully operational)"
     await update.message.reply_text(f"⚠️ **Maintenance mode has been {status}.**", parse_mode="Markdown")
     await send_log(context, f"🛠️ **MAINTENANCE TOGGLED:** Status -> {status} by @{user.username}")
 
