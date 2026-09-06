@@ -155,6 +155,18 @@ def fmt_money(amount: float, currency: str = "INR") -> str:
 
 BOT_STATE = {"maintenance": False, "house_balance": 0.0}
 
+async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id not in ADMINS:
+        return
+    BOT_STATE["maintenance"] = not BOT_STATE["maintenance"]
+    status_text = "on" if BOT_STATE["maintenance"] else "off (restarted)"
+    if BOT_STATE["maintenance"]:
+        msg = f"<emoji id=4956611513369494230>maintenance mode is on all chats commands balances are locked send /maintenance again to re start bot</emoji> <emoji id=4956721670690702265></emoji>"
+    else:
+        msg = "🚀 Bot maintenance mode is now OFF. All commands and games have been restarted successfully!"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
 (
     DEP_AMOUNT, DEP_PROOF, DEP_PHOTO,
     WD_AMOUNT, WD_ADDRESS,
@@ -206,6 +218,13 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_type = message.chat.type
     is_admin = user.id in ADMINS
 
+    text = message.text or message.caption or ""
+    raw_cmd = text.split()[0].lower() if text.startswith("/") else ""
+    command = raw_cmd.split("@")[0]
+
+    if command == "/maintenance" and is_admin:
+        return True
+
     async with async_session() as session:
         db_user = await session.get(User, user.id)
         if db_user and db_user.is_banned and not is_admin:
@@ -225,10 +244,6 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
             return False
         await message.reply_text("⚠️ <emoji id=4958526153955476488><b>Rolex Casino is currently under scheduled maintenance.</b></emoji> Please check back soon!", parse_mode="HTML")
         return False
-
-    text = message.text or message.caption or ""
-    raw_cmd = text.split()[0].lower() if text.startswith("/") else ""
-    command = raw_cmd.split("@")[0]
 
     admin_commands = {"/panel", "/pending", "/users", "/user", "/creategift", "/balanceadd", "/balancededuct", "/ban", "/unban", "/broadcast", "/admincommands", "/announcement", "/hb", "/maintenance", "/restart", "/rain"}
     if command in admin_commands and chat_type in ["group", "supergroup"]:
@@ -1208,7 +1223,7 @@ async def cmd_dr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_user(session, update.message.from_user.id)
         bet = await parse_stake(user, args[1])
         if not bet or user.balance < bet:
-            return await update.message.reply_text("❌ Invalid bet.")
+            return await message.reply_text("❌ Invalid bet.")
         user.balance -= bet
         user.total_wagered += bet
         user.games_played += 1
@@ -1252,7 +1267,7 @@ async def cmd_odice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_user(session, update.message.from_user.id)
         bet = await parse_stake(user, args[0])
         if not bet or user.balance < bet:
-            return await update.message.reply_text("❌ Invalid bet.")
+            return await message.reply_text("❌ Invalid bet.")
         user.balance -= bet
         user.total_wagered += bet
         user.games_played += 1
@@ -1771,6 +1786,7 @@ def main():
     app.add_handler(CommandHandler("rain", cmd_rain))
     app.add_handler(CommandHandler("creategift", cmd_creategift))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("maintenance", cmd_maintenance))
 
     app.add_handler(deposit_conv)
     app.add_handler(withdraw_conv)
