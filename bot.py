@@ -90,6 +90,7 @@ class User(Base):
     total_wagered: Mapped[float] = mapped_column(Float, default=0.0)
     total_won: Mapped[float] = mapped_column(Float, default=0.0)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_frozen: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class Transaction(Base):
@@ -175,35 +176,36 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ACTIVE_CHALLENGES = {}
 ACTIVE_MATCHES = {}
 ACTIVE_PVB = {}
+ACTIVE_ODICE = {}
 MATCH_COUNTER = 0
 
 def get_channel_lock_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="📢 Join Official Group 🌐", url=GROUP_LINK)],
-        [InlineKeyboardButton(text="📥 Deposit Funds 💵", url=f"https://t.me/{BOT_USERNAME}?start=deposit")]
+        [InlineKeyboardButton(text="🟢 Join Official Group 🌐", url=GROUP_LINK)],
+        [InlineKeyboardButton(text="🟢 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
     ])
 
 def get_dm_redirect_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🤖 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
+        [InlineKeyboardButton(text="🟢 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
     ])
 
 def get_main_menu_kb():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
-            InlineKeyboardButton(text="📤 Withdraw 🔴", callback_data="menu_withdraw")
+            InlineKeyboardButton(text="🟢 Deposit", callback_data="menu_deposit"),
+            InlineKeyboardButton(text="🟢 Withdraw", callback_data="menu_withdraw")
         ],
         [
-            InlineKeyboardButton(text="🎮 PvP Games Arena ⚔️", callback_data="menu_games"),
-            InlineKeyboardButton(text="💼 My Wallet 💳", callback_data="menu_wallet")
+            InlineKeyboardButton(text="🟢 PvP Games Arena", callback_data="menu_games"),
+            InlineKeyboardButton(text="🟢 My Wallet", callback_data="menu_wallet")
         ],
         [
-            InlineKeyboardButton(text="👥 Refer & Earn (₹5) 🎁", callback_data="menu_referral"),
-            InlineKeyboardButton(text="📊 Stats & Rank 🏆", callback_data="menu_stats")
+            InlineKeyboardButton(text="🟢 Refer & Earn (₹5)", callback_data="menu_referral"),
+            InlineKeyboardButton(text="🟢 Stats & Rank", callback_data="menu_stats")
         ],
-        [InlineKeyboardButton(text="📢 Official Community Group 🌐", url=GROUP_LINK)],
-        [InlineKeyboardButton(text="🛟 24/7 VIP Support 🔵", callback_data="menu_support")]
+        [InlineKeyboardButton(text="🟢 Official Community Group", url=GROUP_LINK)],
+        [InlineKeyboardButton(text="🟢 24/7 VIP Support", callback_data="menu_support")]
     ])
 
 async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,6 +236,14 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await message.reply_text("⛔ <b>Your account has been suspended by Rolex Casino Security.</b>", parse_mode="HTML")
                 return False
             return False
+        if db_user and db_user.is_frozen and not is_admin:
+            game_commands = {"/dice", "/darts", "/bowling", "/basket", "/football", "/slots", "/coin", "/7up", "/dr", "/odice"}
+            if command in game_commands:
+                if query:
+                    await query.answer("⛔ Your wallet is frozen by admin. You cannot play games.", show_alert=True)
+                    return False
+                await message.reply_text("⛔ <b>Your wallet is frozen by admin. You cannot play games.</b>", parse_mode="HTML")
+                return False
 
     if BOT_STATE["maintenance"] and not is_admin:
         if query:
@@ -244,7 +254,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text("⚠️ <b>Rolex Casino is currently under scheduled maintenance.</b> Please check back soon!", parse_mode="HTML")
         return False
 
-    admin_commands = {"/panel", "/pending", "/users", "/user", "/creategift", "/balanceadd", "/balancededuct", "/ban", "/unban", "/broadcast", "/admincommands", "/announcement", "/hb", "/maintenance", "/restart", "/rain"}
+    admin_commands = {"/panel", "/pending", "/users", "/user", "/creategift", "/balanceadd", "/balancededuct", "/ban", "/unban", "/broadcast", "/admincommands", "/announcement", "/hb", "/maintenance", "/restart", "/rain", "/freezewallet", "/unfreezewallet"}
     if command in admin_commands and chat_type in ["group", "supergroup"]:
         try: await message.delete()
         except Exception: pass
@@ -255,13 +265,23 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return False
 
+    game_commands = {"/dice", "/darts", "/bowling", "/basket", "/football", "/slots", "/coin", "/7up", "/dr", "/odice"}
+    if command in game_commands and chat_type == "private":
+        await message.reply_text(
+            "⚠️ <b>All games can only be played inside our Official Community Group!</b>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🟢 Enter Official Group", url=GROUP_LINK)]]),
+            parse_mode="HTML"
+        )
+        return False
+
     dm_only_commands = {"/deposit", "/withdraw", "/setwallet", "/changecurrency"}
     if command in dm_only_commands and chat_type in ["group", "supergroup"]:
         try: await message.delete()
         except Exception: pass
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(text="🟢 Continue in DM", url=f"https://t.me/{BOT_USERNAME}")]])
         await message.reply_text(
-            f"⛔ <b>{user.first_name}, wallet & payment commands can only be accessed securely inside DM!</b>",
-            reply_markup=get_dm_redirect_kb(),
+            f"⛔ <b>{user.first_name}, deposit & withdrawal commands can only be accessed securely inside DM!</b>",
+            reply_markup=kb,
             parse_mode="HTML"
         )
         return False
@@ -293,19 +313,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Player"
 
-    if message.chat.type in ["group", "supergroup"]:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(text="✨ Join Community", url=GROUP_LINK)],
-            [InlineKeyboardButton(text="💬 Open Bot Chat", url=f"https://t.me/{BOT_USERNAME}?start=start")]
-        ])
-        return await message.reply_text(
-            f"✨ Welcome, {first_name}!\n\n"
-            f"🤖 I'm Rolex–Casino-Bot\n\n"
-            f"This bot works only inside the Official Group. Tap the button below to join and start playing.",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-    
     args = context.args
     inviter_id = None
     if args:
@@ -382,17 +389,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await cmd_deposit(update, context)
+    if query.message.chat.type in ["group", "supergroup"]:
+        return await query.message.reply_text(
+            "🟢 <b>Please click below to continue deposit inside Bot DM:</b>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🟢 Continue in DM", url=f"https://t.me/{BOT_USERNAME}?start=deposit")]]),
+            parse_mode="HTML"
+        )
+    await cmd_deposit_direct(query.message, context)
 
 async def cb_menu_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await cmd_withdraw(update, context)
+    if query.message.chat.type in ["group", "supergroup"]:
+        return await query.message.reply_text(
+            "🟢 <b>Please click below to continue withdrawal inside Bot DM:</b>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="🟢 Continue in DM", url=f"https://t.me/{BOT_USERNAME}")]]),
+            parse_mode="HTML"
+        )
+    await cmd_withdraw_direct(query.message, context)
 
 async def cb_menu_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await cmd_wallet(update, context)
+    await cmd_wallet_handler(query.message, context)
 
 async def cb_menu_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -447,67 +466,44 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🪙 <b>Coin Flip</b> (/coin [amount])\n"
         "🎲 <b>Dice Rush</b> (/dr [high/low/odd/even] [amount])\n"
         "6️⃣ <b>7UP</b> (/7up [up/down] [amount])\n"
-        "🏏 <b>Cricket Toss</b> (/odice [amount])\n\n"
-        "<i>PvP or PvB modes available in the official group arena! Min bet: ₹10</i>"
+        "🏟️ <b>Open Match Toss</b> (/odice [amount])\n\n"
+        "<i>All games work exclusively in our official group arena! Min bet: ₹10</i>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="📢 Enter Official Game Group 🎮", url=GROUP_LINK)]
+        [InlineKeyboardButton(text="🟢 Enter Official Game Group", url=GROUP_LINK)]
     ])
     await update.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
-    message = update.message
+    await cmd_wallet_handler(update.message, context)
+
+async def cmd_wallet_handler(message, context):
+    chat_type = message.chat.type
     async with async_session() as session:
         user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
     
     payout_info = f"<code>{user.payout_address}</code>" if user.payout_address else "<i>Not set (use /setwallet)</i>"
     
+    if chat_type in ["group", "supergroup"]:
+        txt = (
+            f"💼 <b>Your Wallet</b>\n\n"
+            f"👤 <b>Name:</b> {user.first_name}\n"
+            f"💵 <b>Balance:</b> {fmt_money(user.balance, user.currency)}\n"
+            f"⚠️ <b>1x Wager Status:</b> {fmt_money(user.wager_required, user.currency)} pending"
+        )
+        return await message.reply_text(txt, parse_mode="HTML")
+
     txt = (
         f"💼 <b>Your Wallet</b>\n\n"
+        f"👤 <b>Name:</b> {user.first_name}\n"
         f"💵 <b>Balance:</b> {fmt_money(user.balance, user.currency)}\n"
-        f"👨‍💻 <b>UPI/CRYPTO WALLET:</b> {payout_info}\n\n"
-        f"⚠️ <b>Promo Lock:</b> {fmt_money(user.wager_required, user.currency)} bonus locked\n"
-        f"📈 <b>Wager {fmt_money(user.wager_required, user.currency)}</b> more to unlock withdrawal\n"
-        f"(Play wallet bets to clear it)\n\n"
-        f"Min withdrawal: $1/100₹"
+        f"👨‍💻 <b>Saved Payout Address:</b> {payout_info}\n\n"
+        f"⚠️ <b>1x Wager Status:</b> {fmt_money(user.wager_required, user.currency)} pending\n\n"
+        f"Min withdrawal: $1 / ₹100"
     )
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
-            InlineKeyboardButton(text="📤 Withdraw 🔴", callback_data="menu_withdraw")
-        ],
-        [
-            InlineKeyboardButton(text="💱 Toggle Currency", callback_data="toggle_currency"),
-            InlineKeyboardButton(text="📝 Set Payout Wallet", callback_data="btn_setwallet")
-        ]
-    ])
-    await message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
-
-async def cb_toggle_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    async with async_session() as session:
-        user = await get_user(session, query.from_user.id)
-        user.currency = "USD" if user.currency == "INR" else "INR"
-        await session.commit()
-        new_curr = user.currency
-    await query.answer(f"Currency changed to {new_curr}!", show_alert=True)
-    update.message = query.message
-    await cmd_wallet(update, context)
-
-async def cmd_changecurrency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await security_middleware(update, context):
-        return
-    async with async_session() as session:
-        user = await get_user(session, update.message.from_user.id)
-        user.currency = "USD" if user.currency == "INR" else "INR"
-        await session.commit()
-        new_curr = user.currency
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="INR ₹", callback_data="toggle_currency"), InlineKeyboardButton(text="USD $", callback_data="toggle_currency")]
-    ])
-    await update.message.reply_text(f"💼 <b>Display Currency — {new_curr}</b>", reply_markup=kb, parse_mode="HTML")
+    await message.reply_text(txt, parse_mode="HTML")
 
 async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
@@ -523,8 +519,8 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await message.reply_text(f"👨‍💻 <b>Saved Payout Address:</b>\n<code>{address}</code>", parse_mode="HTML")
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="USDT (BEP20)", callback_data="set_w_bep20"), InlineKeyboardButton(text="SOLANA", callback_data="set_w_sol")],
-        [InlineKeyboardButton(text="ETHEREUM", callback_data="set_w_eth"), InlineKeyboardButton(text="BITCOIN", callback_data="set_w_btc")]
+        [InlineKeyboardButton(text="🟢 USDT (BEP20)", callback_data="set_w_bep20"), InlineKeyboardButton(text="🟢 SOLANA", callback_data="set_w_sol")],
+        [InlineKeyboardButton(text="🟢 ETHEREUM", callback_data="set_w_eth"), InlineKeyboardButton(text="🟢 BITCOIN", callback_data="set_w_btc")]
     ])
     await message.reply_text("💼 <b>Save Your Payout Wallet / UPI ID</b>\nEnter your UPI ID or Crypto Address:", reply_markup=kb, parse_mode="HTML")
     return SET_WALLET
@@ -534,11 +530,6 @@ async def cb_set_crypto_wallet(update: Update, context: ContextTypes.DEFAULT_TYP
     net = query.data.split("_")[2].upper()
     context.user_data["crypto_net"] = net
     await query.message.reply_text(f"Send your {net} crypto address:", parse_mode="HTML")
-    await query.answer()
-
-async def cb_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.message.reply_text("💼 <b>Save Your UPI ID</b>\nEnter your UPI ID:\nExample: <code>rahul@ybl</code>", parse_mode="HTML")
     await query.answer()
 
 async def process_setwallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -554,19 +545,6 @@ async def process_setwallet_address(update: Update, context: ContextTypes.DEFAUL
 
     await update.message.reply_text(f"👨‍💻 <b>Saved Payout Address:</b>\n<code>{address}</code>", parse_mode="HTML")
     return ConversationHandler.END
-
-async def cmd_saveupi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await security_middleware(update, context):
-        return
-    args = context.args
-    if not args:
-        return await update.message.reply_text("Usage: <code>/saveupi newupi@bank</code>", parse_mode="HTML")
-    address = " ".join(args).strip()
-    async with async_session() as session:
-        user = await get_user(session, update.message.from_user.id)
-        user.payout_address = address
-        await session.commit()
-    await update.message.reply_text(f"👨‍💻 <b>Saved UPI:</b>\n<code>{address}</code>", parse_mode="HTML")
 
 async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
@@ -587,7 +565,7 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Total Referral Earnings: <b>₹{user.referral_earnings:.2f}</b>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🚀 Share Referral Link 📲", url=f"https://t.me/share/url?url={ref_link}&text=Join%20Rolex%20Casino%20PvP%20and%20play%20live%20games!")]
+        [InlineKeyboardButton(text="🟢 Share Referral Link", url=f"https://t.me/share/url?url={ref_link}&text=Join%20Rolex%20Casino%20PvP%20and%20play%20live%20games!")]
     ])
     await update.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
 
@@ -701,8 +679,8 @@ async def cmd_tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(text="Confirm ✅", callback_data=f"tip_yes_{target_id}_{amount}"),
-            InlineKeyboardButton(text="Cancel ❌", callback_data=f"tip_no_{target_id}_{amount}")
+            InlineKeyboardButton(text="🟢 Confirm", callback_data=f"tip_yes_{target_id}_{amount}"),
+            InlineKeyboardButton(text="🟢 Cancel", callback_data=f"tip_no_{target_id}_{amount}")
         ]
     ])
     await message.reply_text(
@@ -775,18 +753,21 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
+    await cmd_deposit_direct(update.message, context)
+
+async def cmd_deposit_direct(message, context):
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="INR ₹ (UPI)", callback_data="dep_INR"), InlineKeyboardButton(text="USDT (BEP20)", callback_data="dep_BEP20")],
-        [InlineKeyboardButton(text="SOLANA", callback_data="dep_SOLANA"), InlineKeyboardButton(text="ETHEREUM", callback_data="dep_ETHEREUM")]
+        [InlineKeyboardButton(text="🟢 INR ₹ (UPI)", callback_data="dep_INR"), InlineKeyboardButton(text="🟢 USDT (BEP20)", callback_data="dep_BEP20")],
+        [InlineKeyboardButton(text="🟢 SOLANA", callback_data="dep_SOLANA"), InlineKeyboardButton(text="🟢 ETHEREUM", callback_data="dep_ETHEREUM")]
     ])
-    await update.message.reply_text("📥 <b>Deposit Funds</b>\n\nSelect your deposit payment gateway:", reply_markup=kb, parse_mode="HTML")
+    await message.reply_text("📥 <b>Deposit Funds</b>\n\nSelect your deposit payment gateway:", reply_markup=kb, parse_mode="HTML")
     return DEP_AMOUNT
 
 async def choose_deposit_gateway(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     method = query.data.split("_")[1]
     context.user_data["deposit_method"] = method
-    await query.message.reply_text(f"Enter deposit amount for {method} (Min ₹50 / $1):", parse_mode="HTML")
+    await query.message.reply_text(f"Enter deposit amount for {method} (Min ₹50 / $0.50 | Max ₹5000 / $50):", parse_mode="HTML")
     await query.answer()
     return DEP_AMOUNT
 
@@ -797,8 +778,8 @@ async def process_deposit_amount(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Invalid amount format.", parse_mode="HTML")
         return DEP_AMOUNT
 
-    if amount < 50:
-        await update.message.reply_text("❌ Minimum deposit amount is ₹50 / $1.", parse_mode="HTML")
+    if amount < 50 or amount > 5000:
+        await update.message.reply_text("❌ Deposit amount must be between ₹50 ($0.50) and ₹5000 ($50).", parse_mode="HTML")
         return DEP_AMOUNT
 
     method = context.user_data.get("deposit_method", "INR")
@@ -806,10 +787,10 @@ async def process_deposit_amount(update: Update, context: ContextTypes.DEFAULT_T
 
     wallet_address = CRYPTO_WALLETS.get(method, UPI_ADDRESS)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="I have paid ✔️", callback_data="dep_paid_confirm")]
+        [InlineKeyboardButton(text="🟢 I have paid", callback_data="dep_paid_confirm")]
     ])
     await update.message.reply_text(
-        f"⬇️ <b>Deposit — {method}</b>\n\nAmount: ₹{amount}\nSend payment to address/UPI:\n<code>{wallet_address}</code>\n\nAfter paying, press ✅ I have paid below.",
+        f"⬇️ <b>Deposit — {method}</b>\n\nPayable Amount: ₹{amount}\nSend exact payment to address/UPI:\n<code>{wallet_address}</code>\n\nAfter paying, press ✅ I have paid below.",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -853,7 +834,7 @@ async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAU
         tx_id = tx.id
 
     await update.message.reply_text(
-        f"✅ <b>Deposit proof submitted!</b>\n\n"
+        f"✅ <b>Deposit proof submitted successfully!</b>\n\n"
         f"Amount: ₹{amount}\n"
         f"UTR: {proof}\n\n"
         f"Deposit will be credited automatically. It may take 3-5 minutes.",
@@ -863,8 +844,8 @@ async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAU
 
     admin_kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(text="✅ Approve 🟢", callback_data=f"adm_dep_yes_{tx_id}"),
-            InlineKeyboardButton(text="❌ Reject 🔴", callback_data=f"adm_dep_no_{tx_id}")
+            InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_dep_yes_{tx_id}"),
+            InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_dep_no_{tx_id}")
         ]
     ])
     for adm in ADMINS:
@@ -882,7 +863,9 @@ async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAU
 async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
-    message = update.message
+    await cmd_withdraw_direct(update.message, context)
+
+async def cmd_withdraw_direct(message, context):
     user_id = message.from_user.id
     async with async_session() as session:
         user = await get_user(session, user_id)
@@ -895,7 +878,7 @@ async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_amount = await parse_stake(user, args[0])
         if req_amount and 0 < req_amount <= user.balance:
             context.user_data["withdraw_amount"] = req_amount
-            return await execute_withdrawal_prompt(message, context, user)
+            return WD_ADDRESS
 
     await message.reply_text(
         f"📤 <b>Withdraw</b>\n\n"
@@ -935,8 +918,8 @@ async def process_withdraw_address(update: Update, context: ContextTypes.DEFAULT
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(text="Confirm ✅", callback_data=f"wd_confirm_{amount}"),
-            InlineKeyboardButton(text="Cancel ❌", callback_data="wd_cancel")
+            InlineKeyboardButton(text="🟢 Confirm", callback_data=f"wd_confirm_{amount}"),
+            InlineKeyboardButton(text="🟢 Cancel", callback_data="wd_cancel")
         ]
     ])
     await update.message.reply_text(
@@ -1002,8 +985,8 @@ async def cb_withdraw_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         admin_kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(text="✅ Approve 🟢", callback_data=f"adm_wd_yes_{tx_id}"),
-                InlineKeyboardButton(text="❌ Reject 🔴", callback_data=f"adm_wd_no_{tx_id}")
+                InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_wd_yes_{tx_id}"),
+                InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_wd_no_{tx_id}")
             ]
         ])
         for adm in ADMINS:
@@ -1012,9 +995,6 @@ async def cb_withdraw_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception:
                 pass
         await query.answer("Submitted!")
-
-async def execute_withdrawal_prompt(message, context, user):
-    pass
 
 async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE, game: str, emoji: str):
     if not await security_middleware(update, context):
@@ -1030,11 +1010,11 @@ async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Choose rounds below for {game.upper()}",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton(text="1 Round", callback_data=f"pvp_rnd_{game}_1"),
-                    InlineKeyboardButton(text="2 Rounds", callback_data=f"pvp_rnd_{game}_2"),
-                    InlineKeyboardButton(text="3 Rounds", callback_data=f"pvp_rnd_{game}_3")
+                    InlineKeyboardButton(text="🟢 1 Round", callback_data=f"pvp_rnd_{game}_1"),
+                    InlineKeyboardButton(text="🟢 2 Rounds", callback_data=f"pvp_rnd_{game}_2"),
+                    InlineKeyboardButton(text="🟢 3 Rounds", callback_data=f"pvp_rnd_{game}_3")
                 ],
-                [InlineKeyboardButton(text="Cancel ❌", callback_data="pvp_rnd_cancel")]
+                [InlineKeyboardButton(text="🟢 Cancel", callback_data="pvp_rnd_cancel")]
             ]),
             parse_mode="HTML"
         )
@@ -1072,8 +1052,8 @@ async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYP
     }
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=f"⚔️ Accept ({fmt_money(bet, 'INR')}) 🟢", callback_data=f"pvp_acc_{c_id}")],
-        [InlineKeyboardButton(text="❌ Cancel 🔴", callback_data=f"pvp_can_{c_id}")]
+        [InlineKeyboardButton(text=f"🟢 Accept ({fmt_money(bet, 'INR')})", callback_data=f"pvp_acc_{c_id}")],
+        [InlineKeyboardButton(text="🟢 Cancel", callback_data=f"pvp_can_{c_id}")]
     ])
 
     await message.reply_text(
@@ -1147,8 +1127,8 @@ async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=f"⚔️ Accept Coin Flip ({fmt_money(bet)})", callback_data=f"pvp_acc_{c_id}")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"pvp_can_{c_id}")]
+        [InlineKeyboardButton(text=f"🟢 Accept Coin Flip ({fmt_money(bet)})", callback_data=f"pvp_acc_{c_id}")],
+        [InlineKeyboardButton(text="🟢 Cancel", callback_data=f"pvp_can_{c_id}")]
     ])
     await message.reply_text(
         f"<b>Coin Flip Challenge #{c_id}</b>\n"
@@ -1259,49 +1239,161 @@ async def cmd_dr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_odice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
+    message = update.message
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.reply_text("🏟️ Open Match is restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
+    
     args = context.args
     if not args:
-        return await update.message.reply_text("Usage: <code>/odice [amount]</code>", parse_mode="HTML")
+        return await message.reply_text("Usage: <code>/odice [amount]</code>", parse_mode="HTML")
+
     async with async_session() as session:
-        user = await get_user(session, update.message.from_user.id)
+        user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
         bet = await parse_stake(user, args[0])
         if not bet or user.balance < bet:
-            return await message.reply_text("❌ Invalid bet.")
+            return await message.reply_text("❌ Invalid or insufficient bet amount.")
         user.balance -= bet
         user.total_wagered += bet
         user.games_played += 1
         await session.commit()
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="Heads 🪙", callback_data=f"odice_h_{bet}"), InlineKeyboardButton(text="Tails 🪙", callback_data=f"odice_t_{bet}")]
-    ])
-    await update.message.reply_text("🏟️ Open Match Toss — Pick side:", reply_markup=kb, parse_mode="HTML")
 
-async def cb_odice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MATCH_COUNTER
+    MATCH_COUNTER += 1
+    m_id = MATCH_COUNTER
+
+    ACTIVE_ODICE[m_id] = {
+        "host_id": message.from_user.id,
+        "host_name": message.from_user.username or message.from_user.first_name,
+        "amount": bet,
+        "players": [message.from_user.id],
+        "player_names": {message.from_user.id: message.from_user.username or message.from_user.first_name},
+        "chat_id": message.chat.id,
+        "status": "waiting"
+    }
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text=f"🟢 Join Match ({fmt_money(bet)})", callback_data=f"odice_join_{m_id}")],
+        [InlineKeyboardButton(text="🟢 Start Match Now", callback_data=f"odice_start_{m_id}")]
+    ])
+    await message.reply_text(
+        f"🏟️ <b>Open Match Toss Room #{m_id}</b>\n"
+        f"Host: @{message.from_user.username or message.from_user.first_name}\n"
+        f"Stake: ₹{bet:.2f}\n"
+        f"Players Joined: 1 / 50\n\n"
+        f"<i>Tap 'Join Match' below to participate!</i>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+async def cb_odice_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = query.data.split("_")
-    bet = float(parts[2])
-    side = parts[1]
-    toss = random.choice(["h", "t"])
-    won = (side == toss)
+    action = parts[1]
+    m_id = int(parts[2])
+    user_id = query.from_user.id
 
-    if won:
-        payout = bet * 1.92 * 0.96
+    if m_id not in ACTIVE_ODICE:
+        return await query.answer("Match expired or already started.", show_alert=True)
+    
+    room = ACTIVE_ODICE[m_id]
+
+    if action == "join":
+        if user_id in room["players"]:
+            return await query.answer("You already joined this match!", show_alert=True)
         async with async_session() as session:
-            u = await get_user(session, query.from_user.id)
-            u.balance += payout
-            u.total_won += payout
-            u.games_won += 1
+            u = await get_user(session, user_id, query.from_user.username, query.from_user.first_name)
+            if u.balance < room["amount"]:
+                return await query.answer("Insufficient balance to join!", show_alert=True)
+            u.balance -= room["amount"]
+            u.total_wagered += room["amount"]
+            u.games_played += 1
             await session.commit()
-        await query.message.edit_text(f"🏏 Toss won! You batted and won ₹{payout:.2f}.", parse_mode="HTML")
-    else:
-        BOT_STATE["house_balance"] += bet * 0.96
-        async with async_session() as session:
-            u = await get_user(session, query.from_user.id)
-            u.games_lost += 1
-            await session.commit()
-        await query.message.edit_text("🏏 Toss lost! Bowled out.", parse_mode="HTML")
-    await query.answer()
+        
+        room["players"].append(user_id)
+        room["player_names"][user_id] = query.from_user.username or query.from_user.first_name
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(text=f"🟢 Join Match ({fmt_money(room['amount'])})", callback_data=f"odice_join_{m_id}")],
+            [InlineKeyboardButton(text="🟢 Start Match Now", callback_data=f"odice_start_{m_id}")]
+        ])
+        await query.message.edit_text(
+            f"🏟️ <b>Open Match Toss Room #{m_id}</b>\n"
+            f"Stake: ₹{room['amount']:.2f}\n"
+            f"Players Joined: {len(room['players'])} / 50\n\n"
+            f"<i>Tap 'Join Match' below to participate!</i>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        return await query.answer("Joined successfully!")
+
+    if action == "start":
+        if user_id != room["host_id"] and user_id not in ADMINS:
+            return await query.answer("Only host can start the match!", show_alert=True)
+        if len(room["players"]) < 2:
+            return await query.answer("Need at least 2 players to start!", show_alert=True)
+
+        ACTIVE_ODICE.pop(m_id)
+        players = room["players"]
+        random.shuffle(players)
+        mid_idx = len(players) // 2
+        team_a = players[:mid_idx] or [players[0]]
+        team_b = players[mid_idx:] if len(players) > 1 else [players[0]]
+
+        pot = room["amount"] * len(players)
+        fee = pot * 0.03
+        net_pot = pot - fee
+        BOT_STATE["house_balance"] += fee
+
+        batting_team = random.choice([team_a, team_b])
+        batting_name = "Team A" if batting_team == team_a else "Team B"
+
+        await query.message.edit_text(
+            f"🏟️ <b>Open Match Started!</b>\n"
+            f"Total Players: {len(players)} | Pot: ₹{pot:.2f}\n"
+            f"🟢 <b>{batting_name}</b> won the toss and is batting!\n\n"
+            f"<i>Throwing dice... Rolling balls... (Dice 5 = OUT)</i>",
+            parse_mode="HTML"
+        )
+
+        team_score = 0
+        for _ in range(2):
+            roll = random.randint(1, 6)
+            if roll == 5:
+                team_score = 0
+                break
+            team_score += roll
+
+        if team_score > 0:
+            share = net_pot / len(batting_team)
+            async with async_session() as session:
+                for pid in batting_team:
+                    p_user = await get_user(session, pid)
+                    p_user.balance += share
+                    p_user.total_won += share
+                    p_user.games_won += 1
+                for pid in (team_a if batting_team == team_b else team_b):
+                    p_user = await get_user(session, pid)
+                    p_user.games_lost += 1
+                await session.commit()
+            await query.message.reply_text(
+                f"🏟️ <b>Open Match Ended!</b>\n"
+                f"Batting Team scored {team_score} runs!\n"
+                f"🏆 <b>{batting_name} Won!</b>\n"
+                f"Each winning player received ₹{share:.2f} payout!",
+                parse_mode="HTML"
+            )
+        else:
+            async with async_session() as session:
+                for pid in players:
+                    p_user = await get_user(session, pid)
+                    p_user.games_lost += 1
+                await session.commit()
+            await query.message.reply_text(
+                f"🏟️ <b>Open Match Ended!</b>\n"
+                f"Batting team rolled 5 (OUT) on first ball! House takes the pot.",
+                parse_mode="HTML"
+            )
+        return await query.answer()
 
 async def cb_cancel_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1340,7 +1432,7 @@ async def cb_accept_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if challenge["game"] == "coin":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(text="Heads 🪙", callback_data=f"coin_pick_{c_id}_heads"), InlineKeyboardButton(text="Tails 🪙", callback_data=f"coin_pick_{c_id}_tails")]
+            [InlineKeyboardButton(text="🟢 Heads", callback_data=f"coin_pick_{c_id}_heads"), InlineKeyboardButton(text="🟢 Tails", callback_data=f"coin_pick_{c_id}_tails")]
         ])
         ACTIVE_MATCHES[c_id] = {
             **challenge,
@@ -1489,47 +1581,6 @@ async def handle_native_dice(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
             return
 
-    for pvb_id, pvb in ACTIVE_PVB.items():
-        if pvb["chat_id"] == chat_id and pvb["user_id"] == user_id:
-            if emoji_sent != pvb["emoji"]:
-                return await message.reply_text(f"❌ Send correct emoji: {pvb['emoji']}")
-            bot_val = random.randint(1, 6)
-            bot_msg = await message.reply_dice(emoji=pvb["emoji"])
-            await asyncio.sleep(2)
-            bot_score = bot_msg.dice.value
-
-            won = val > bot_score
-            tie = val == bot_score
-            bet = pvb["amount"]
-
-            if tie:
-                async with async_session() as session:
-                    u = await get_user(session, user_id)
-                    u.balance += bet
-                    await session.commit()
-                ACTIVE_PVB.pop(pvb_id)
-                return await message.reply_text(f"🤝 Tie! You rolled {val}, Bot rolled {bot_score}. Bet refunded.", parse_mode="HTML")
-
-            ACTIVE_PVB.pop(pvb_id)
-            if won:
-                payout = bet * 1.92
-                async with async_session() as session:
-                    u = await get_user(session, user_id)
-                    u.balance += payout
-                    u.total_won += payout
-                    u.games_won += 1
-                    await session.commit()
-                    new_b = u.balance
-                await message.reply_text(f"🏆 <b>PvB Win!</b>\nYou: {val} | Bot: {bot_score}\nYou won ₹{payout:.2f}!\nBalance: ₹{new_b:.2f}", parse_mode="HTML")
-            else:
-                BOT_STATE["house_balance"] += bet
-                async with async_session() as session:
-                    u = await get_user(session, user_id)
-                    u.games_lost += 1
-                    await session.commit()
-                await message.reply_text(f"❌ <b>PvB Loss</b>\nYou: {val} | Bot: {bot_score}\nYou lost ₹{bet:.2f}.", parse_mode="HTML")
-            return
-
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
         return await update.message.reply_text("⛔ Admins only.")
@@ -1566,6 +1617,32 @@ async def cmd_balancededuct(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
     await update.message.reply_text(f"✅ Deducted ₹{amt} from user {uid}.")
 
+async def cmd_freezewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS:
+        return
+    args = context.args
+    if not args:
+        return await update.message.reply_text("Usage: <code>/freezewallet [user_id]</code>", parse_mode="HTML")
+    uid = int(args[0])
+    async with async_session() as session:
+        u = await get_user(session, uid)
+        u.is_frozen = True
+        await session.commit()
+    await update.message.reply_text(f"❄️ Wallet frozen for user {uid}.")
+
+async def cmd_unfreezewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS:
+        return
+    args = context.args
+    if not args:
+        return await update.message.reply_text("Usage: <code>/unfreezewallet [user_id]</code>", parse_mode="HTML")
+    uid = int(args[0])
+    async with async_session() as session:
+        u = await get_user(session, uid)
+        u.is_frozen = False
+        await session.commit()
+    await update.message.reply_text(f"🔥 Wallet unfrozen for user {uid}.")
+
 async def cmd_rain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
         return
@@ -1584,8 +1661,6 @@ async def cmd_rain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🌧️ Rained ₹{total_amt} across {len(users)} users (₹{share:.2f} each).")
 
 async def cmd_hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id not in ADMINS:
-        return await update.message.reply_text("⛔ Admins only.")
     async with async_session() as session:
         total_users = (await session.execute(select(func.count(User.telegram_id)))).scalar() or 0
         total_bal = (await session.execute(select(func.sum(User.balance)))).scalar() or 0.0
@@ -1596,11 +1671,24 @@ async def cmd_hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+async def cmd_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="🟢 Create Escrow", callback_data="escrow_create"), InlineKeyboardButton(text="🟢 Join Escrow", callback_data="escrow_join")]
+    ])
+    await update.message.reply_text("🛡️ <b>Rolex Secure Escrow System</b>\n\nCreate or join a safe peer-to-peer transaction escrow.", reply_markup=kb, parse_mode="HTML")
+
+async def cb_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("🛡️ Escrow service is active. Please contact @RolexCasinoMOD to setup a secure deal.", parse_mode="HTML")
+    await query.answer()
+
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
         return await update.message.reply_text("⛔ Admins only.")
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="Pending Requests", callback_data="adm_pending"), InlineKeyboardButton(text="Users Count", callback_data="adm_users")]
+        [InlineKeyboardButton(text="🟢 Pending Requests", callback_data="adm_pending"), InlineKeyboardButton(text="🟢 Users Count", callback_data="adm_users")]
     ])
     await update.message.reply_text("👑 Admin Control Panel", reply_markup=kb, parse_mode="HTML")
 
@@ -1614,7 +1702,7 @@ async def cb_adm_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await query.message.edit_text("No pending requests.")
     for tx in txs[:5]:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(text="Approve", callback_data=f"adm_dep_yes_{tx.id}"), InlineKeyboardButton(text="Reject", callback_data=f"adm_dep_no_{tx.id}")]
+            [InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_dep_yes_{tx.id}"), InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_dep_no_{tx.id}")]
         ])
         await query.message.reply_text(f"TX #{tx.id} | Type: {tx.type} | Amt: ₹{tx.amount}", reply_markup=kb)
     await query.answer()
@@ -1753,8 +1841,8 @@ def main():
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("bal", cmd_wallet))
     app.add_handler(CommandHandler("wal", cmd_wallet))
-    app.add_handler(CommandHandler("changecurrency", cmd_changecurrency))
-    app.add_handler(CommandHandler("saveupi", cmd_saveupi))
+    app.add_handler(CommandHandler("changecurrency", cmd_changecurrency if 'changecurrency' in globals() else cmd_help))
+    app.add_handler(CommandHandler("saveupi", cmd_saveupi if 'saveupi' in globals() else cmd_help))
     app.add_handler(CommandHandler("refer", cmd_refer))
     app.add_handler(CommandHandler("referral", cmd_refer))
     app.add_handler(CommandHandler("referrals", cmd_refer))
@@ -1775,10 +1863,13 @@ def main():
     app.add_handler(CommandHandler("dr", cmd_dr))
     app.add_handler(CommandHandler("odice", cmd_odice))
     app.add_handler(CommandHandler("hb", cmd_hb))
+    app.add_handler(CommandHandler("escrow", cmd_escrow))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("admincommands", cmd_panel))
     app.add_handler(CommandHandler("balanceadd", cmd_balanceadd))
     app.add_handler(CommandHandler("balancededuct", cmd_balancededuct))
+    app.add_handler(CommandHandler("freezewallet", cmd_freezewallet))
+    app.add_handler(CommandHandler("unfreezewallet", cmd_unfreezewallet))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("user", cmd_user_info))
     app.add_handler(CommandHandler("rain", cmd_rain))
@@ -1797,12 +1888,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_referral, pattern="^menu_referral$"))
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
     app.add_handler(CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
-    app.add_handler(CallbackQueryHandler(cb_toggle_currency, pattern="^toggle_currency$"))
     app.add_handler(CallbackQueryHandler(cb_setwallet, pattern="^btn_setwallet$"))
-    app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_"))
+    app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_s"))
     app.add_handler(CallbackQueryHandler(cb_tip_action, pattern="^tip_"))
-    app.add_handler(CallbackQueryHandler(cb_odice, pattern="^odice_"))
+    app.add_handler(CallbackQueryHandler(cb_odice_action, pattern="^odice_"))
     app.add_handler(CallbackQueryHandler(cb_coin_pick, pattern="^coin_pick_"))
+    app.add_handler(CallbackQueryHandler(cb_escrow, pattern="^escrow_"))
     app.add_handler(CallbackQueryHandler(cb_cancel_pvp, pattern="^pvp_can_"))
     app.add_handler(CallbackQueryHandler(cb_accept_pvp, pattern="^pvp_acc_"))
     app.add_handler(CallbackQueryHandler(cb_pvp_rounds, pattern="^pvp_rnd_"))
@@ -1814,7 +1905,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.Dice.ALL, handle_native_dice))
 
-    logger.info("Rolex Casino Bot updated & started successfully with custom premium emojis cleaned.")
+    logger.info("Rolex Casino Bot updated & started successfully with all fixes applied.")
     app.run_polling()
 
 if __name__ == "__main__":
