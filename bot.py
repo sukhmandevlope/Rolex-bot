@@ -36,7 +36,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "Rolex_C_BOT")
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5.0"))
 DEFAULT_START_BALANCE = 0.0
 USDT_RATE = float(os.getenv("USDT_RATE", "94.47"))
-WITHDRAWAL_FEE_PCT = 0.04  # 4% fee on withdrawals
+WITHDRAWAL_FEE_PCT = 0.04
 MIN_BET = 10.0
 MIN_TIP = 1.0
 
@@ -144,7 +144,7 @@ async def get_user(session: AsyncSession, telegram_id: int, username: str = None
 
 async def send_log(bot: Bot, text: str):
     try:
-        await bot.send_message(LOG_CHANNEL_ID, f"📋 <emoji id=4956601935592424315><b>ROLEX CASINO LOG SYSTEM</b></emoji>\n\n{text}", parse_mode="HTML")
+        await bot.send_message(LOG_CHANNEL_ID, f"📋 <b>ROLEX CASINO LOG SYSTEM</b>\n\n{text}", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Failed to push log: {e}")
 
@@ -160,9 +160,8 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id not in ADMINS:
         return
     BOT_STATE["maintenance"] = not BOT_STATE["maintenance"]
-    status_text = "on" if BOT_STATE["maintenance"] else "off (restarted)"
     if BOT_STATE["maintenance"]:
-        msg = f"<emoji id=4956611513369494230>maintenance mode is on all chats commands balances are locked send /maintenance again to re start bot</emoji> <emoji id=4956721670690702265></emoji>"
+        msg = "⚠️ <b>Maintenance mode is ON.</b> All chats, commands, and balances are locked. Send /maintenance again to turn it off."
     else:
         msg = "🚀 Bot maintenance mode is now OFF. All commands and games have been restarted successfully!"
     await update.message.reply_text(msg, parse_mode="HTML")
@@ -232,7 +231,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("⛔ Your account has been suspended by Rolex Security.", show_alert=True)
                 return False
             if chat_type == "private":
-                await message.reply_text("⛔ <emoji id=4958526153955476488><b>Your account has been suspended by Rolex Casino Security.</b></emoji>", parse_mode="HTML")
+                await message.reply_text("⛔ <b>Your account has been suspended by Rolex Casino Security.</b>", parse_mode="HTML")
                 return False
             return False
 
@@ -242,7 +241,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
             return False
         if chat_type in ["group", "supergroup"]:
             return False
-        await message.reply_text("⚠️ <emoji id=4958526153955476488><b>Rolex Casino is currently under scheduled maintenance.</b></emoji> Please check back soon!", parse_mode="HTML")
+        await message.reply_text("⚠️ <b>Rolex Casino is currently under scheduled maintenance.</b> Please check back soon!", parse_mode="HTML")
         return False
 
     admin_commands = {"/panel", "/pending", "/users", "/user", "/creategift", "/balanceadd", "/balancededuct", "/ban", "/unban", "/broadcast", "/admincommands", "/announcement", "/hb", "/maintenance", "/restart", "/rain"}
@@ -250,7 +249,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
         try: await message.delete()
         except Exception: pass
         await message.reply_text(
-            f"⛔ <emoji id=4958526153955476488><b>{user.first_name}, administrative commands can only be executed securely inside our DM inbox!</b></emoji>",
+            f"⛔ <b>{user.first_name}, administrative commands can only be executed securely inside our DM inbox!</b>",
             reply_markup=get_dm_redirect_kb(),
             parse_mode="HTML"
         )
@@ -261,7 +260,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
         try: await message.delete()
         except Exception: pass
         await message.reply_text(
-            f"⛔ <emoji id=4958526153955476488><b>{user.first_name}, wallet & payment commands can only be accessed securely inside DM!</b></emoji>",
+            f"⛔ <b>{user.first_name}, wallet & payment commands can only be accessed securely inside DM!</b>",
             reply_markup=get_dm_redirect_kb(),
             parse_mode="HTML"
         )
@@ -300,8 +299,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(text="💬 Open Bot Chat", url=f"https://t.me/{BOT_USERNAME}?start=start")]
         ])
         return await message.reply_text(
-            f"<emoji id=4956222745814762495>Welcome, {first_name}!</emoji>\n\n"
-            f"<emoji id=4958534696645428119>I'm Rolex–Casino-Bot</emoji>\n\n"
+            f"✨ Welcome, {first_name}!\n\n"
+            f"🤖 I'm Rolex–Casino-Bot\n\n"
             f"This bot works only inside the Official Group. Tap the button below to join and start playing.",
             reply_markup=kb,
             parse_mode="HTML"
@@ -368,8 +367,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.commit()
 
     welcome_text = (
-        f"<emoji id=4956222745814762495><b>Welcome, {first_name}!</b></emoji>\n\n"
-        f"<emoji id=4958534696645428119><b>I'm Rolex–Casino-Bot</b></emoji>\n\n"
+        f"✨ <b>Welcome, {first_name}!</b>\n\n"
+        f"🤖 <b>I'm Rolex–Casino-Bot</b>\n\n"
         f"👤 <b>Player:</b> {first_name} (@{username or 'N/A'})\n"
         f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
         f"💰 <b>Main Balance:</b> {fmt_money(user.balance, user.currency)}\n"
@@ -419,7 +418,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
     txt = (
-        "<emoji id=4958926882994127612><b>CUSTOMER SUPPORT</b></emoji>\n"
+        "🔵 <b>CUSTOMER SUPPORT</b>\n"
         "Need help? Our support team is here to assist you.\n\n"
         "📩 For Customer Support:\n"
         "Please contact @RolexCasinoMOD\n\n"
@@ -438,7 +437,7 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
     txt = (
-        "<emoji id=4956721670690702265><b>AVAILABLE GAMES</b></emoji>\n\n"
+        "🎯 <b>AVAILABLE GAMES</b>\n\n"
         "🎲 <b>Dice</b> (/dice [amount] [rounds])\n"
         "🎯 <b>Darts</b> (/darts [amount] [rounds])\n"
         "🏀 <b>Basketball</b> (/basket [amount] [rounds])\n"
@@ -466,7 +465,7 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payout_info = f"<code>{user.payout_address}</code>" if user.payout_address else "<i>Not set (use /setwallet)</i>"
     
     txt = (
-        f"<emoji id=4956601935592424315><b>Your Wallet</b></emoji>\n\n"
+        f"💼 <b>Your Wallet</b>\n\n"
         f"💵 <b>Balance:</b> {fmt_money(user.balance, user.currency)}\n"
         f"👨‍💻 <b>UPI/CRYPTO WALLET:</b> {payout_info}\n\n"
         f"⚠️ <b>Promo Lock:</b> {fmt_money(user.wager_required, user.currency)} bonus locked\n"
@@ -506,9 +505,9 @@ async def cmd_changecurrency(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await session.commit()
         new_curr = user.currency
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=f"INR ₹", callback_data="toggle_currency"), InlineKeyboardButton(text=f"USD $", callback_data="toggle_currency")]
+        [InlineKeyboardButton(text="INR ₹", callback_data="toggle_currency"), InlineKeyboardButton(text="USD $", callback_data="toggle_currency")]
     ])
-    await update.message.reply_text(f"<emoji id=4956601935592424315><b>Display Currency — {new_curr}</b></emoji>", reply_markup=kb, parse_mode="HTML")
+    await update.message.reply_text(f"💼 <b>Display Currency — {new_curr}</b>", reply_markup=kb, parse_mode="HTML")
 
 async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
@@ -527,7 +526,7 @@ async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(text="USDT (BEP20)", callback_data="set_w_bep20"), InlineKeyboardButton(text="SOLANA", callback_data="set_w_sol")],
         [InlineKeyboardButton(text="ETHEREUM", callback_data="set_w_eth"), InlineKeyboardButton(text="BITCOIN", callback_data="set_w_btc")]
     ])
-    await message.reply_text("<emoji id=4956601935592424315><b>Save Your Payout Wallet / UPI ID</b></emoji>\nEnter your UPI ID or Crypto Address:", reply_markup=kb, parse_mode="HTML")
+    await message.reply_text("💼 <b>Save Your Payout Wallet / UPI ID</b>\nEnter your UPI ID or Crypto Address:", reply_markup=kb, parse_mode="HTML")
     return SET_WALLET
 
 async def cb_set_crypto_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -539,7 +538,7 @@ async def cb_set_crypto_wallet(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cb_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.message.reply_text("<emoji id=4956601935592424315><b>Save Your UPI ID</b></emoji>\nEnter your UPI ID:\nExample: <code>rahul@ybl</code>", parse_mode="HTML")
+    await query.message.reply_text("💼 <b>Save Your UPI ID</b>\nEnter your UPI ID:\nExample: <code>rahul@ybl</code>", parse_mode="HTML")
     await query.answer()
 
 async def process_setwallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,7 +578,7 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_user(session, user_id, update.message.from_user.username, update.message.from_user.first_name)
 
     txt = (
-        f"<emoji id=4956721670690702265><b>Rolex Casino Referral Program</b></emoji>\n\n"
+        f"🎁 <b>Rolex Casino Referral Program</b>\n\n"
         f"Earn <b>₹{REFERRAL_BONUS:.2f}</b> instantly for every friend you invite!\n\n"
         f"🔗 <b>Your Exclusive Referral Link:</b>\n"
         f"<code>{ref_link}</code>\n\n"
@@ -606,7 +605,7 @@ async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     net_profit = user.total_won - user.total_wagered
 
     txt = (
-        f"<emoji id=4956721670690702265><b>Personal Gaming Statistics — {user.first_name}</b></emoji>\n\n"
+        f"📊 <b>Personal Gaming Statistics — {user.first_name}</b>\n\n"
         f"🏆 <b>Casino Rank:</b> #{user_rank}\n"
         f"🎮 <b>Total Matches Played:</b> {user.games_played}\n"
         f"🟢 <b>Matches Won:</b> {user.games_won}\n"
@@ -626,7 +625,7 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             select(User).order_by(desc(User.total_wagered)).limit(10)
         )).scalars().all()
 
-    txt = "<emoji id=4956721670690702265><b>Top 10 High Rollers Leaderboard</b></emoji>\n\n"
+    txt = "🏆 <b>Top 10 High Rollers Leaderboard</b>\n\n"
     if not top_players:
         txt += "<i>No player records found yet.</i>"
     else:
@@ -646,7 +645,7 @@ async def cmd_wager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_icon = "🟢 Clear" if user.wager_required <= 0 else "⚠️ Locked"
     txt = (
-        f"<emoji id=4956601935592424315><b>Rolex Casino — Wagering Status</b></emoji>\n\n"
+        f"💼 <b>Rolex Casino — Wagering Status</b>\n\n"
         f"• Status: {status_icon}\n"
         f"• Pending Wager Requirement: <b>{fmt_money(user.wager_required, user.currency)}</b>\n"
         f"• Total Wager Completed: <b>{fmt_money(user.wager_completed, user.currency)}</b>"
@@ -755,7 +754,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = context.args
     if not args:
-        return await update.message.reply_text("Usage: <code>/claim [GIFT_CODE]</code>", parse_mode="HTML")
+        return await message.reply_text("Usage: <code>/claim [GIFT_CODE]</code>", parse_mode="HTML")
     code = args[0].strip()
 
     async with async_session() as session:
@@ -780,7 +779,7 @@ async def cmd_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(text="INR ₹ (UPI)", callback_data="dep_INR"), InlineKeyboardButton(text="USDT (BEP20)", callback_data="dep_BEP20")],
         [InlineKeyboardButton(text="SOLANA", callback_data="dep_SOLANA"), InlineKeyboardButton(text="ETHEREUM", callback_data="dep_ETHEREUM")]
     ])
-    await update.message.reply_text("<emoji id=4956601935592424315><b>Deposit Funds</b></emoji>\n\nSelect your deposit payment gateway:", reply_markup=kb, parse_mode="HTML")
+    await update.message.reply_text("📥 <b>Deposit Funds</b>\n\nSelect your deposit payment gateway:", reply_markup=kb, parse_mode="HTML")
     return DEP_AMOUNT
 
 async def choose_deposit_gateway(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,10 +853,10 @@ async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAU
         tx_id = tx.id
 
     await update.message.reply_text(
-        f"<emoji id=4958610528588008305><b>Deposit proof submitted!</b></emoji>\n\n"
-        f"<emoji id=4958479549265347295>Amount: ₹{amount}</emoji>\n"
-        f"<emoji id=4956282853882069908>UTR: {proof}</emoji>\n\n"
-        f"<emoji id=4958534696645428119>Deposit will be credited automatically. It may take 3-5 minutes.</emoji>",
+        f"✅ <b>Deposit proof submitted!</b>\n\n"
+        f"Amount: ₹{amount}\n"
+        f"UTR: {proof}\n\n"
+        f"Deposit will be credited automatically. It may take 3-5 minutes.",
         parse_mode="HTML"
     )
     await send_log(context.bot, f"📥 <b>New Deposit #{tx_id}</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount} ({method})\nRef: `{proof}`")
@@ -899,8 +898,8 @@ async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await execute_withdrawal_prompt(message, context, user)
 
     await message.reply_text(
-        f"<emoji id=4956601935592424315><b>Withdraw</b></emoji>\n\n"
-        f"<emoji id=4958926882994127612>Balance: {fmt_money(user.balance, user.currency)}</emoji>\n\n"
+        f"📤 <b>Withdraw</b>\n\n"
+        f"Balance: {fmt_money(user.balance, user.currency)}\n\n"
         f"Enter amount to withdraw (e.g. 100, or 5 for USD):",
         parse_mode="HTML"
     )
@@ -916,7 +915,7 @@ async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_
     
     context.user_data["withdraw_amount"] = amount
     await update.message.reply_text(
-        f"<emoji id=4958725487682650920><b>Withdraw via UPI/Crypto</b></emoji>\n\n"
+        f"📤 <b>Withdraw via UPI/Crypto</b>\n\n"
         f"Amount: ₹{amount}\n\n"
         f"Enter your payout UPI ID or Crypto Address (e.g., rahul@ybl):",
         parse_mode="HTML"
@@ -942,10 +941,10 @@ async def process_withdraw_address(update: Update, context: ContextTypes.DEFAULT
     ])
     await update.message.reply_text(
         f"🧾 <b>Withdrawal Summary</b>\n\n"
-        f"<emoji id=4956601935592424315>Currency: {user.currency}</emoji>\n"
+        f"Currency: {user.currency}\n"
         f"Requested Amount: ₹{amount}\n"
-        f"<emoji id=4956611513369494230>Fee (4%): ₹{fee:.2f}</emoji>\n"
-        f"<emoji id=4956721670690702265>You Will Receive: ₹{net_receive:.2f}</emoji>\n"
+        f"Fee (4%): ₹{fee:.2f}\n"
+        f"You Will Receive: ₹{net_receive:.2f}\n"
         f"👨‍💻 To: <code>{address}</code>",
         reply_markup=kb,
         parse_mode="HTML"
@@ -991,12 +990,12 @@ async def cb_withdraw_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await query.message.edit_text(
             f"✅ <b>Withdrawal #{tx_id} Submitted</b>\n\n"
-            f"<emoji id=4958725487682650920>Amount: ₹{amount}</emoji>\n"
-            f"<emoji id=4958526153955476488>Fee: ₹{fee:.2f}</emoji>\n"
-            f"<emoji id=4956601935592424315>You'll Receive: ₹{net_receive:.2f}</emoji>\n"
-            f"<emoji id=4956582500865410174>Network: UPI/Crypto</emoji>\n"
-            f"<emoji id=4958926882994127612>Address: {address}</emoji>\n\n"
-            f"<emoji id=4958920483492857102>Your withdrawal request is being processed...</emoji>",
+            f"Amount: ₹{amount}\n"
+            f"Fee: ₹{fee:.2f}\n"
+            f"You'll Receive: ₹{net_receive:.2f}\n"
+            f"Network: UPI/Crypto\n"
+            f"Address: {address}\n\n"
+            f"Your withdrawal request is being processed...",
             parse_mode="HTML"
         )
         await send_log(context.bot, f"📤 <b>Withdrawal Request [#{tx_id}]</b>\nUser: @{username}\nAmount: ₹{net_receive:.2f} (Fee: ₹{fee:.2f})")
@@ -1028,7 +1027,7 @@ async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYP
     args = context.args
     if not args:
         await message.reply_text(
-            f"<emoji id=4958920483492857102>Choose rounds below for {game.upper()}</emoji>",
+            f"Choose rounds below for {game.upper()}",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(text="1 Round", callback_data=f"pvp_rnd_{game}_1"),
@@ -1349,8 +1348,8 @@ async def cb_accept_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "acceptor_name": query.from_user.username or query.from_user.first_name,
         }
         await query.message.edit_text(
-            f"<emoji id=4956214478002717877><b>Coin Flip</b></emoji>\n"
-            f"<emoji id=4956721670690702265>@s: {challenge['challenger_name']} vs @{query.from_user.username or query.from_user.first_name}</emoji>\n\n"
+            f"<b>Coin Flip</b>\n"
+            f"👤 @{challenge['challenger_name']} vs @{query.from_user.username or query.from_user.first_name}\n\n"
             f"@{query.from_user.username or query.from_user.first_name}, pick your side below:",
             reply_markup=kb,
             parse_mode="HTML"
@@ -1387,7 +1386,7 @@ async def cb_coin_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     opp_pick = pick
     chal_pick = "tails" if opp_pick == "heads" else "heads"
 
-    await query.message.edit_text("🪙 Flipping the coin... coin in the air..... <emoji id=4958617898751886363>⏳</emoji>", parse_mode="HTML")
+    await query.message.edit_text("🪙 Flipping the coin... coin in the air..... ⏳", parse_mode="HTML")
     await asyncio.sleep(2)
 
     result = random.choice(["heads", "tails"])
@@ -1406,16 +1405,15 @@ async def cb_coin_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         l = await get_user(session, loser_id)
         l.games_lost += 1
         await session.commit()
-        new_b = w.balance
 
     await query.message.reply_text(
         f"🪙 <b>Coin Flip Result!</b>\n\n"
-        f"Coin landed on... <emoji id=4958725487682650920>{result.upper()}</emoji>\n\n"
+        f"Coin landed on... <b>{result.upper()}</b>\n\n"
         f"@{match['challenger_name']}: {chal_pick}\n"
         f"@{match['acceptor_name']}: {opp_pick}\n\n"
         f"🏆 Winner: @{winner_name}\n"
         f"👻 Loser: @{loser_name}\n"
-        f"🏦 Prize: ₹{payout:.2f} credited to wallet.\n<emoji id=4958920483492857102>Credited to wallet.</emoji>",
+        f"🏦 Prize: ₹{payout:.2f} credited to wallet.",
         parse_mode="HTML"
     )
     await query.answer()
@@ -1642,16 +1640,16 @@ async def cb_approve_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tx.type == "DEPOSIT":
             await context.bot.send_message(
                 uid,
-                f"<emoji id=4956420911310832630><b>Deposit Approved!</b></emoji>\n\n"
-                f"<emoji id=4956601935592424315>Credited: ₹{amt}</emoji>\n"
-                f"<emoji id=4956214478002717877>Balance: ₹{new_b:.2f}</emoji>\n\n"
+                f"✅ <b>Deposit Approved!</b>\n\n"
+                f"Credited: ₹{amt}\n"
+                f"Balance: ₹{new_b:.2f}\n\n"
                 f"Wager ₹{amt} before withdrawing (1x deposit rule)\nPlay any game to clear it — /wagerstatus to track",
                 parse_mode="HTML"
             )
         else:
             await context.bot.send_message(
                 uid,
-                f"<emoji id=4958920483492857102>Your withdrawal request has been successfully sent/processed! Check your wallet or contact /support</emoji>",
+                "✅ Your withdrawal request has been successfully sent/processed! Check your wallet or contact /support",
                 parse_mode="HTML"
             )
     except Exception:
@@ -1673,7 +1671,7 @@ async def cb_reject_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             uid,
-            f"<emoji id=4958526153955476488>Your withdrawal/deposit is rejected kindly contact support by sending /support or /help below</emoji>",
+            "❌ Your withdrawal/deposit is rejected. Kindly contact support by sending /support or /help below",
             parse_mode="HTML"
         )
     except Exception:
@@ -1783,7 +1781,7 @@ def main():
     app.add_handler(CommandHandler("balancededuct", cmd_balancededuct))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("user", cmd_user_info))
-    app.add_handler(CommandHandler("rain", cmd_rain))
+    app.add_handler(CommandHandler->CommandHandler if False else CommandHandler("rain", cmd_rain))
     app.add_handler(CommandHandler("creategift", cmd_creategift))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("maintenance", cmd_maintenance))
@@ -1798,7 +1796,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_games, pattern="^menu_games$"))
     app.add_handler(CallbackQueryHandler(cb_menu_referral, pattern="^menu_referral$"))
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
-    app.add_handler(CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
+    app.add_handler(Callback_query_handler := CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_currency, pattern="^toggle_currency$"))
     app.add_handler(CallbackQueryHandler(cb_setwallet, pattern="^btn_setwallet$"))
     app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_"))
@@ -1816,7 +1814,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.Dice.ALL, handle_native_dice))
 
-    logger.info("Rolex Casino Bot updated & started successfully with custom premium emojis.")
+    logger.info("Rolex Casino Bot updated & started successfully with custom premium emojis cleaned.")
     app.run_polling()
 
 if __name__ == "__main__":
