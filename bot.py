@@ -444,6 +444,11 @@ async def cb_menu_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await cmd_help(update, context)
 
+async def cb_pvp_rounds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # Callback handler logic for pvp rounds selection
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
@@ -931,7 +936,7 @@ async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_
             return WD_AMOUNT
     
     context.user_data["withdraw_amount"] = amount
-    await update.message.reply_text(
+    await message.reply_text(
         f"📤 <b>Withdraw via UPI/Crypto</b>\n\n"
         f"Amount: ₹{amount}\n\n"
         f"Enter your payout UPI ID or Crypto Address (e.g., rahul@ybl):",
@@ -1733,7 +1738,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pvp_rounds, pattern="^pvp_rnd_"))
     app.add_handler(CallbackQueryHandler(cb_adm_pending, pattern="^adm_pending$"))
     app.add_handler(CallbackQueryHandler(cb_approve_dep, pattern="^adm_dep_yes_"))
-    app.add_handler(CallbackHandler(cb_reject_dep, pattern="^adm_dep_no_"))
+    app.add_handler(CallbackQueryHandler(cb_reject_dep, pattern="^adm_dep_no_"))
     app.add_handler(CallbackQueryHandler(cb_approve_dep, pattern="^adm_wd_yes_"))
     app.add_handler(CallbackQueryHandler(cb_reject_dep, pattern="^adm_wd_no_"))
 
