@@ -26,7 +26,7 @@ from sqlalchemy import BigInteger, String, Float, Boolean, Column, DateTime, Int
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8673935058:AAHiwc-cigA_-XuAzhj-0i0u1iIQTVp4K3w")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8673935058:AAGZW6DhT1jgi7y2x3uWwLqSezOl-mKiDms")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:////data/rolex_casino.db")
 GROUP_ID = int(os.getenv("GROUP_ID", "-1004458883943"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1004458883943"))
@@ -754,7 +754,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = context.args
     if not args:
-        return await message.reply_text("Usage: <code>/claim [GIFT_CODE]</code>", parse_mode="HTML")
+        return await update.message.reply_text("Usage: <code>/claim [GIFT_CODE]</code>", parse_mode="HTML")
     code = args[0].strip()
 
     async with async_session() as session:
@@ -1781,7 +1781,7 @@ def main():
     app.add_handler(CommandHandler("balancededuct", cmd_balancededuct))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("user", cmd_user_info))
-    app.add_handler(CommandHandler->CommandHandler if False else CommandHandler("rain", cmd_rain))
+    app.add_handler(CommandHandler("rain", cmd_rain))
     app.add_handler(CommandHandler("creategift", cmd_creategift))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("maintenance", cmd_maintenance))
@@ -1796,7 +1796,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_games, pattern="^menu_games$"))
     app.add_handler(CallbackQueryHandler(cb_menu_referral, pattern="^menu_referral$"))
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
-    app.add_handler(Callback_query_handler := CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
     app.add_handler(CallbackQueryHandler(cb_toggle_currency, pattern="^toggle_currency$"))
     app.add_handler(CallbackQueryHandler(cb_setwallet, pattern="^btn_setwallet$"))
     app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_"))
