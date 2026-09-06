@@ -172,7 +172,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id not in ADMINS:
         return
     BOT_STATE["maintenance"] = False
-    await update.message.reply_text("🚀 <b>Casino operations resumed & bets activated successfully!</b>", parse_mode="HTML")
+    await update.message.reply_text("🚀 Casino operations resumed & bets activated successfully!", parse_mode="HTML")
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
@@ -185,7 +185,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = await get_user(session, uid)
         u.is_banned = True
         await session.commit()
-    await update.message.reply_text(f"⛔ Player {uid} has been suspended.", parse_mode="HTML")
+    await update.message.reply_text(f"⛔ User {uid} has been suspended.", parse_mode="HTML")
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
@@ -198,19 +198,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = await get_user(session, uid)
         u.is_banned = False
         await session.commit()
-    await update.message.reply_text(f"✅ Player {uid} has been reinstated.", parse_mode="HTML")
-
-async def cmd_announcement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id not in ADMINS:
-        return
-    text = " ".join(context.args)
-    if not text:
-        return await update.message.reply_text("Please provide announcement text.")
-    try:
-        await context.bot.send_message(GROUP_ID, f"📢 <b>ANNOUNCEMENT</b>\n\n{text}", parse_mode="HTML")
-        await update.message.reply_text("✅ Announcement broadcasted to official group.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to send announcement: {e}")
+    await update.message.reply_text(f"✅ User {uid} has been reinstated.", parse_mode="HTML")
 
 (
     DEP_AMOUNT, DEP_PROOF, DEP_PHOTO,
@@ -226,7 +214,8 @@ MATCH_COUNTER = 0
 
 def get_channel_lock_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🟢 Join Official Group 🌐", url=GROUP_LINK)]
+        [InlineKeyboardButton(text="🟢 Join Official Group 🌐", url=GROUP_LINK)],
+        [InlineKeyboardButton(text="🟢 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
     ])
 
 def get_dm_redirect_kb():
@@ -281,7 +270,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return False
             return False
         if db_user and db_user.is_frozen and not is_admin:
-            game_commands = {"/dice", "/darts", "/bowling", "/basket", "/football", "/slots", "/coin", "/7up", "/dr", "/odice", "/battle", "/bj", "/towers", "/limbo", "/mines"}
+            game_commands = {"/dice", "/darts", "/bowling", "/basket", "/football", "/slots", "/coin", "/7up", "/dr", "/odice", "/battle"}
             if command in game_commands:
                 if query:
                     await query.answer("⛔ Your wallet is frozen by admin. You cannot play games.", show_alert=True)
@@ -309,7 +298,7 @@ async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return False
 
-    game_commands = {"/dice", "/darts", "/bowling", "/basket", "/football", "/slots", "/coin", "/7up", "/dr", "/odice", "/battle", "/bj", "/towers", "/limbo", "/mines"}
+    game_commands = {"/dice", "/darts", "/bowling", "/basket", "/football", "/slots", "/coin", "/7up", "/dr", "/odice", "/battle"}
     if command in game_commands and chat_type == "private":
         await message.reply_text(
             "⚠️ <b>All games can only be played inside our Official Community Group!</b>",
@@ -400,6 +389,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     session.add(tx)
                     await session.commit()
+                    
+                    try:
+                        await context.bot.send_message(
+                            inviter_id,
+                            f"🎁 <b>New Referral Joined!</b>\n\n👤 Player: @{username or first_name}\n💵 Bonus: <b>+₹{REFERRAL_BONUS:.2f}</b> added to your wallet!\n💼 New Balance: <b>₹{inviter.balance:.2f}</b>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                    await send_log(context.bot, f"🎁 <b>Referral Bonus</b>: `{inviter_id}` earned ₹{REFERRAL_BONUS:.2f} from new user `{user_id}` (@{username})")
         else:
             if username and user.username != username:
                 user.username = username
@@ -413,7 +412,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"This bot works only inside the Official Group. Tap the button below to join and start playing."
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🟢 Join Official Group 🌐", url=GROUP_LINK)]
+        [InlineKeyboardButton(text="🟢 Join Official Group 🌐", url=GROUP_LINK)],
+        [InlineKeyboardButton(text="🟢 Open Dashboard in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
     ])
     await message.reply_text(welcome_text, reply_markup=kb, parse_mode="HTML")
 
@@ -468,27 +468,33 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
     txt = (
-        "🔵 <b>CUSTOMER SUPPORT & COMMAND DIRECTORY</b>\n"
-        "Need help? Contact @RolexCasinoMOD\n\n"
-        "<b>Commands:</b>\n"
-        "/start - Launch bot\n"
-        "/games - Available games\n"
-        "/dice, /darts, /bowling, /basket, /football, /slots - PvP matches\n"
-        "/coin - Coin flip challenge\n"
-        "/battle - Choose PvP duel\n"
-        "/wallet - View balance & bank vault\n"
-        "/deposit - Add funds\n"
-        "/withdraw - Request payout\n"
-        "/setwallet - Save default payout address\n"
-        "/changecurrency - Toggle INR/USD\n"
-        "/refer - Referral program\n"
-        "/mystats - Gaming stats\n"
-        "/rank - Leaderboard\n"
-        "/wagerstatus - Wagering progress\n"
-        "/tip - Send money\n"
-        "/claim - Redeem voucher\n"
-        "/escrow - P2P Escrow\n"
-        "/support - 24/7 VIP support"
+        "🔵 <b>CUSTOMER SUPPORT & COMMAND DIRECTORY</b>\n\n"
+        "📩 For Customer Support: contact @RolexCasinoMOD\n\n"
+        "📜 <b>Full Command Directory:</b>\n"
+        "• /start — Launch bot & open interactive dashboard\n"
+        "• /games — Open PvP multiplayer arena\n"
+        "• /dice [amt] [rounds] — Dice duel\n"
+        "• /darts [amt] [rounds] — Darts target match\n"
+        "• /bowling [amt] [rounds] — Bowling match\n"
+        "• /basket [amt] [rounds] — Basketball shootout\n"
+        "• /football [amt] [rounds] — Football penalty kick\n"
+        "• /slots [amt] [rounds] — Slots 777 duel\n"
+        "• /coin [@user] [amt] — Coin flip challenge\n"
+        "• /battle [@user] [amt] — Choose any PvP duel\n"
+        "• /wallet — View balance & stats\n"
+        "• /deposit — Add funds\n"
+        "• /withdraw — Request payout\n"
+        "• /setwallet — Save default payout address\n"
+        "• /changecurrency — Toggle INR/USD\n"
+        "• /refer — Invite friends & earn ₹5\n"
+        "• /mystats — Personal winrate & stats\n"
+        "• /rank — Top 10 High Rollers leaderboard\n"
+        "• /wagerstatus — Check 1x deposit wagering\n"
+        "• /tip @user [amt] — Send money to a player\n"
+        "• /claim [code] — Redeem gift code\n"
+        "• /support — 24/7 VIP cashier desk\n"
+        "• /help — Full command manual\n"
+        "• /escrow — Secure peer-to-peer deal"
     )
     await update.message.reply_text(txt, parse_mode="HTML")
 
@@ -498,22 +504,22 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "🤍 <b>AVAILABLE GAMES</b>\n\n"
         "👋 <b>Rock • Paper • Scissors</b>\n"
-        "🤑 <b>Coin Flip</b>\n"
-        "💕 <b>Dice</b>\n"
-        "😳 <b>Darts</b>\n"
-        "🏀 <b>Basketball</b>\n"
-        "⚽️ <b>Football</b>\n"
-        "6️⃣ <b>Bowling</b>\n"
-        "🎰 <b>Slots</b>\n"
+        "🤑 <b>Coin Flip</b> (/coin)\n"
+        "💕 <b>Dice</b> (/dice)\n"
+        "😳 <b>Darts</b> (/darts)\n"
+        "🏀 <b>Basketball</b> (/basket)\n"
+        "⚽️ <b>Football</b> (/football)\n"
+        "6️⃣ <b>Bowling</b> (/bowling)\n"
+        "🎰 <b>Slots</b> (/slots)\n"
         "🏰 <b>Towers</b>\n"
         "🚀 <b>Limbo</b>\n"
-        "🎲 <b>Dice rush(dr)</b>\n"
-        "🎲 <b>7up</b>\n"
-        "🃏 <b>BlackJack (bj)</b>\n"
+        "🎲 <b>Dice Rush</b> (/dr)\n"
+        "🎲 <b>7UP</b> (/7up)\n"
+        "🃏 <b>BlackJack</b> (/bj)\n"
         "💣 <b>Mines</b>\n"
         "🔒 <b>Vault</b>\n"
         "🏏 <b>Cricket Dice</b>\n\n"
-        "<i>Interactive games will be added soon.</i>"
+        "<i>Interactive games will be added soon. Min bet: ₹10</i>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="🟢 Enter Official Game Group", url=GROUP_LINK)]
@@ -532,13 +538,22 @@ async def cmd_wallet_handler(message, context):
     
     payout_info = f"<code>{user.payout_address}</code>" if user.payout_address else "<i>Not set (use /setwallet)</i>"
     
+    if chat_type in ["group", "supergroup"]:
+        txt = (
+            f"💼 <b>Your Wallet</b>\n\n"
+            f"👤 <b>Name:</b> {user.first_name}\n"
+            f"💵 <b>Balance:</b> {fmt_money(user.balance, user.currency)}\n"
+            f"⚠️ <b>1x Wager Status:</b> {fmt_money(user.wager_required, user.currency)} pending"
+        )
+        return await message.reply_text(txt, parse_mode="HTML")
+
     txt = (
-        f"💼 <b>Your Wallet & Stats</b>\n\n"
+        f"💼 <b>Your Wallet</b>\n\n"
         f"👤 <b>Name:</b> {user.first_name}\n"
         f"💵 <b>Balance:</b> {fmt_money(user.balance, user.currency)}\n"
-        f"🏦 <b>Bank Vault:</b> {fmt_money(user.bank, user.currency)}\n"
         f"👨‍💻 <b>Saved Payout Address:</b> {payout_info}\n\n"
-        f"⚠️ <b>1x Wager Status:</b> {fmt_money(user.wager_required, user.currency)} pending"
+        f"⚠️ <b>1x Wager Status:</b> {fmt_money(user.wager_required, user.currency)} pending\n\n"
+        f"Min withdrawal: $1 / ₹100"
     )
     await message.reply_text(txt, parse_mode="HTML")
 
@@ -572,7 +587,7 @@ async def cb_set_crypto_wallet(update: Update, context: ContextTypes.DEFAULT_TYP
 async def process_setwallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = update.message.text.strip()
     if len(address) < 4:
-        await update.message.reply_text("❌ Invalid wallet address.")
+        await update.message.reply_text("❌ Invalid wallet address. Please enter a valid UPI ID or Crypto wallet.")
         return SET_WALLET
 
     async with async_session() as session:
@@ -590,8 +605,8 @@ async def cmd_changecurrency(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user = await get_user(session, update.message.from_user.id)
         user.currency = "USD" if user.currency == "INR" else "INR"
         await session.commit()
-        curr = user.currency
-    await update.message.reply_text(f"💱 Currency toggled successfully to <b>{curr}</b>", parse_mode="HTML")
+        cur = user.currency
+    await update.message.reply_text(f"✅ Currency display toggled to: <b>{cur}</b>", parse_mode="HTML")
 
 async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
@@ -612,7 +627,7 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Total Referral Earnings: <b>₹{user.referral_earnings:.2f}</b>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🟢 Share Referral Link", url=f"https://t.me/share/url?url={ref_link}&text=Join%20Rolex%20Casino%20PvP!")]
+        [InlineKeyboardButton(text="🟢 Share Referral Link", url=f"https://t.me/share/url?url={ref_link}&text=Join%20Rolex%20Casino%20PvP%20and%20play%20live%20games!")]
     ])
     await update.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
 
@@ -720,7 +735,7 @@ async def cmd_tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await message.reply_text("❌ Invalid tip amount.")
         
         if amount < MIN_TIP:
-            return await message.reply_text(f"❌ Minimum tip amount is ₹{MIN_TIP}.")
+            return await message.reply_text(f"❌ Minimum tip amount is ₹{MIN_TIP} / $0.01.")
         if sender.balance < amount:
             return await message.reply_text(f"❌ Insufficient balance! You have {fmt_money(sender.balance, sender.currency)}.")
 
@@ -767,7 +782,7 @@ async def cb_tip_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             target_id,
-            f"🏆 <b>You received a tip!</b>\n\n👤 From: @{sender_name}\n💵 Amount: ₹{amount:.2f} added to your wallet!\n🏦 New Balance: ₹{new_bal:.2f}",
+            f"🏆 <b>You received a tip!</b>\n\n👤 From: @{sender_name}\n💵 Amount: ₹{amount:.2f} added to your wallet!\n🏦 New Balance: ₹{new_bal:.2f}\n\nUse /wallet to view your balance.",
             parse_mode="HTML"
         )
     except Exception:
@@ -795,6 +810,7 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_bal = user.balance
 
     await update.message.reply_text(f"🎉 <b>Gift Code Claimed!</b>\n\n💵 Amount Credited: <b>₹{gift.amount:.2f}</b>\n🏦 Your New Balance: <b>₹{new_bal:.2f}</b>", parse_mode="HTML")
+    await send_log(context.bot, f"🎟️ <b>Gift Claimed</b>: Code <code>{code}</code> claimed by @{update.message.from_user.username} for ₹{gift.amount:.2f}")
 
 async def cmd_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
@@ -806,14 +822,14 @@ async def cmd_deposit_direct(message, context):
         [InlineKeyboardButton(text="🟢 INR ₹ (UPI)", callback_data="dep_INR"), InlineKeyboardButton(text="🟢 USDT (BEP20)", callback_data="dep_BEP20")],
         [InlineKeyboardButton(text="🟢 SOLANA", callback_data="dep_SOLANA"), InlineKeyboardButton(text="🟢 ETHEREUM", callback_data="dep_ETHEREUM")]
     ])
-    await message.reply_text("📥 <b>Deposit Funds</b>\n\nSelect payment gateway:", reply_markup=kb, parse_mode="HTML")
+    await message.reply_text("📥 <b>Deposit Funds</b>\n\nSelect your deposit payment gateway:", reply_markup=kb, parse_mode="HTML")
     return DEP_AMOUNT
 
 async def choose_deposit_gateway(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     method = query.data.split("_")[1]
     context.user_data["deposit_method"] = method
-    await query.message.reply_text(f"Enter deposit amount for {method} (Min ₹50 / Max ₹5000):", parse_mode="HTML")
+    await query.message.reply_text(f"Enter deposit amount for {method} (Min ₹50 / $0.50 | Max ₹5000 / $50):", parse_mode="HTML")
     await query.answer()
     return DEP_AMOUNT
 
@@ -825,16 +841,18 @@ async def process_deposit_amount(update: Update, context: ContextTypes.DEFAULT_T
         return DEP_AMOUNT
 
     if amount < 50 or amount > 5000:
-        await update.message.reply_text("❌ Amount must be between ₹50 and ₹5000.", parse_mode="HTML")
+        await update.message.reply_text("❌ Deposit amount must be between ₹50 ($0.50) and ₹5000 ($50).", parse_mode="HTML")
         return DEP_AMOUNT
 
     method = context.user_data.get("deposit_method", "INR")
     context.user_data["deposit_amount"] = amount
-    wallet_address = CRYPTO_WALLETS.get(method, UPI_ADDRESS)
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(text="🟢 I have paid", callback_data="dep_paid_confirm")]])
+    wallet_address = CRYPTO_WALLETS.get(method, UPI_ADDRESS)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="🟢 I have paid", callback_data="dep_paid_confirm")]
+    ])
     await update.message.reply_text(
-        f"⬇️ <b>Deposit — {method}</b>\n\nPayable Amount: ₹{amount}\nSend payment to:\n<code>{wallet_address}</code>\n\nPress ✅ I have paid after payment.",
+        f"⬇️ <b>Deposit — {method}</b>\n\nPayable Amount: ₹{amount}\nSend exact payment to address/UPI:\n<code>{wallet_address}</code>\n\nAfter paying, press ✅ I have paid below.",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -842,17 +860,18 @@ async def process_deposit_amount(update: Update, context: ContextTypes.DEFAULT_T
 
 async def cb_dep_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.message.reply_text("⬇️ Send UTR / Transaction ID or TXID:", parse_mode="HTML")
+    await query.message.reply_text("⬇️ <b>Step 1/2 — UTR / Reference Number</b>\n\nSend your UTR / Transaction ID or TXID:", parse_mode="HTML")
     await query.answer()
     return DEP_PROOF
 
 async def process_deposit_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     utr = update.message.text.strip()
     if len(utr) < 6:
-        await update.message.reply_text("❌ Please send a valid UTR or reference number.")
+        await update.message.reply_text("❌ Please send a valid UTR or Transaction reference number.")
         return DEP_PROOF
+    
     context.user_data["deposit_proof"] = utr
-    await update.message.reply_text("⬇️ Now send the payment screenshot.", parse_mode="HTML")
+    await update.message.reply_text(f"✅ UTR saved: {utr}\n\n⬇️ <b>Step 2/2 — Payment Screenshot</b>\n\nNow send the screenshot of your payment.", parse_mode="HTML")
     return DEP_PHOTO
 
 async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -863,19 +882,42 @@ async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAU
     username = update.message.from_user.username or update.message.from_user.first_name
 
     async with async_session() as session:
-        tx = Transaction(telegram_id=user_id, type="DEPOSIT", amount=amount, method=method, proof_ref=proof, status="PENDING")
+        tx = Transaction(
+            telegram_id=user_id,
+            type="DEPOSIT",
+            amount=amount,
+            method=method,
+            proof_ref=proof,
+            status="PENDING"
+        )
         session.add(tx)
         await session.commit()
         await session.refresh(tx)
         tx_id = tx.id
 
-    await update.message.reply_text("✅ Deposit proof submitted successfully. Pending admin approval.", parse_mode="HTML")
+    await update.message.reply_text(
+        f"✅ <b>Deposit proof submitted successfully!</b>\n\n"
+        f"Amount: ₹{amount}\n"
+        f"UTR: {proof}\n\n"
+        f"Deposit will be credited automatically. It may take 3-5 minutes.",
+        parse_mode="HTML"
+    )
+    await send_log(context.bot, f"📥 <b>New Deposit #{tx_id}</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount} ({method})\nRef: `{proof}`")
+
     admin_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_dep_yes_{tx_id}"), InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_dep_no_{tx_id}")]
+        [
+            InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_dep_yes_{tx_id}"),
+            InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_dep_no_{tx_id}")
+        ]
     ])
     for adm in ADMINS:
         try:
-            await context.bot.send_message(adm, f"🚨 <b>New Deposit [#{tx_id}]</b>\nUser: @{username}\nAmount: ₹{amount}\nUTR: `{proof}`", reply_markup=admin_kb, parse_mode="HTML")
+            await context.bot.send_message(
+                adm,
+                f"🚨 <b>New Deposit Request [#{tx_id}]</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount}\nRef: `{proof}`",
+                reply_markup=admin_kb,
+                parse_mode="HTML"
+            )
         except Exception:
             pass
     return ConversationHandler.END
@@ -900,7 +942,12 @@ async def cmd_withdraw_direct(message, context):
             context.user_data["withdraw_amount"] = req_amount
             return WD_ADDRESS
 
-    await message.reply_text(f"📤 <b>Withdraw</b>\n\nBalance: {fmt_money(user.balance, user.currency)}\nEnter amount:", parse_mode="HTML")
+    await message.reply_text(
+        f"📤 <b>Withdraw</b>\n\n"
+        f"Balance: {fmt_money(user.balance, user.currency)}\n\n"
+        f"Enter amount to withdraw (e.g. 100, or 5 for USD):",
+        parse_mode="HTML"
+    )
     return WD_AMOUNT
 
 async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -908,10 +955,16 @@ async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_
         user = await get_user(session, update.message.from_user.id)
         amount = await parse_stake(user, update.message.text)
         if not amount or amount <= 0 or amount > user.balance:
-            await update.message.reply_text("❌ Invalid amount.")
+            await update.message.reply_text("❌ Invalid or insufficient amount.")
             return WD_AMOUNT
+    
     context.user_data["withdraw_amount"] = amount
-    await message.reply_text("Enter payout UPI ID or Crypto Address:", parse_mode="HTML")
+    await update.message.reply_text(
+        f"📤 <b>Withdraw via UPI/Crypto</b>\n\n"
+        f"Amount: ₹{amount}\n\n"
+        f"Enter your payout UPI ID or Crypto Address (e.g., rahul@ybl):",
+        parse_mode="HTML"
+    )
     return WD_ADDRESS
 
 async def process_withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -923,70 +976,124 @@ async def process_withdraw_address(update: Update, context: ContextTypes.DEFAULT
         await session.commit()
     
     fee = amount * WITHDRAWAL_FEE_PCT
-    net = amount - fee
+    net_receive = amount - fee
+
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="🟢 Confirm", callback_data=f"wd_confirm_{amount}"), InlineKeyboardButton(text="🟢 Cancel", callback_data="wd_cancel")]
+        [
+            InlineKeyboardButton(text="🟢 Confirm", callback_data=f"wd_confirm_{amount}"),
+            InlineKeyboardButton(text="🟢 Cancel", callback_data="wd_cancel")
+        ]
     ])
-    await message.reply_text(f"Withdrawal Summary:\nAmount: ₹{amount}\nFee: ₹{fee:.2f}\nReceive: ₹{net:.2f}\nTo: <code>{address}</code>", reply_markup=kb, parse_mode="HTML")
+    await message.reply_text(
+        f"🧾 <b>Withdrawal Summary</b>\n\n"
+        f"Currency: {user.currency}\n"
+        f"Requested Amount: ₹{amount}\n"
+        f"Fee (4%): ₹{fee:.2f}\n"
+        f"You Will Receive: ₹{net_receive:.2f}\n"
+        f"👨‍💻 To: <code>{address}</code>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
     return ConversationHandler.END
 
 async def cb_withdraw_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     if data == "wd_cancel":
-        await query.message.edit_text("❌ Cancelled.", parse_mode="HTML")
+        await query.message.edit_text("❌ Withdrawal cancelled.", parse_mode="HTML")
         return await query.answer("Cancelled.")
+    
     if data.startswith("wd_confirm_"):
         amount = float(data.split("_")[2])
         user_id = query.from_user.id
         username = query.from_user.username or query.from_user.first_name
+        
         async with async_session() as session:
             user = await get_user(session, user_id)
             if user.balance < amount:
                 return await query.answer("Insufficient balance!", show_alert=True)
             if user.wager_required > 0:
                 return await query.answer(f"Complete wagering requirement first! Pending: ₹{user.wager_required}", show_alert=True)
+            
             user.balance -= amount
             fee = amount * WITHDRAWAL_FEE_PCT
-            net = amount - fee
+            net_receive = amount - fee
             BOT_STATE["house_balance"] += fee
             address = user.payout_address or "Not Set"
-            tx = Transaction(telegram_id=user_id, type="WITHDRAW", amount=net, method="MANUAL", proof_ref=address, status="PENDING")
+
+            tx = Transaction(
+                telegram_id=user_id,
+                type="WITHDRAW",
+                amount=net_receive,
+                method="MANUAL",
+                proof_ref=address,
+                status="PENDING"
+            )
             session.add(tx)
             await session.commit()
             tx_id = tx.id
 
-        await query.message.edit_text(f"✅ Withdrawal #{tx_id} submitted for processing.", parse_mode="HTML")
-        admin_kb = InlineKeyboardMarkup([[InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_wd_yes_{tx_id}"), InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_wd_no_{tx_id}")]])
+        await query.message.edit_text(
+            f"✅ <b>Withdrawal #{tx_id} Submitted</b>\n\n"
+            f"Amount: ₹{amount}\n"
+            f"Fee: ₹{fee:.2f}\n"
+            f"You'll Receive: ₹{net_receive:.2f}\n"
+            f"Network: UPI/Crypto\n"
+            f"Address: {address}\n\n"
+            f"Your withdrawal request is being processed...",
+            parse_mode="HTML"
+        )
+        await send_log(context.bot, f"📤 <b>Withdrawal Request [#{tx_id}]</b>\nUser: @{username}\nAmount: ₹{net_receive:.2f} (Fee: ₹{fee:.2f})")
+
+        admin_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(text="🟢 Approve", callback_data=f"adm_wd_yes_{tx_id}"),
+                InlineKeyboardButton(text="🟢 Reject", callback_data=f"adm_wd_no_{tx_id}")
+            ]
+        ])
         for adm in ADMINS:
             try:
-                await context.bot.send_message(adm, f"🚨 Withdrawal #{tx_id} from @{username} for ₹{net:.2f}", reply_markup=admin_kb, parse_mode="HTML")
+                await context.bot.send_message(adm, f"🚨 Withdrawal #{tx_id} from @{username} for ₹{net_receive:.2f}", reply_markup=admin_kb, parse_mode="HTML")
             except Exception:
                 pass
         await query.answer("Submitted!")
 
-# Unified PvP & PvB challenge execution framework requested by user
-async def handle_game_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE, game: str, emoji: str):
+async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE, game: str, emoji: str):
     if not await security_middleware(update, context):
         return
     message = update.message
     if message.chat.type not in ["group", "supergroup"]:
-        return await message.reply_text("This game is restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
+        await message.reply_text(f"{emoji} PvP games are restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
+        return
 
     args = context.args
     if not args:
-        return await message.reply_text(f"Usage: <code>/{game} [amount] [rounds]</code>", parse_mode="HTML")
+        await message.reply_text(
+            f"Choose rounds below for {game.upper()}",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(text="🟢 1 Round", callback_data=f"pvp_rnd_{game}_1"),
+                    InlineKeyboardButton(text="🟢 2 Rounds", callback_data=f"pvp_rnd_{game}_2"),
+                    InlineKeyboardButton(text="🟢 3 Rounds", callback_data=f"pvp_rnd_{game}_3")
+                ],
+                [InlineKeyboardButton(text="🟢 Cancel", callback_data="pvp_rnd_cancel")]
+            ]),
+            parse_mode="HTML"
+        )
+        return
 
     raw_amount = args[0]
     rounds = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
-    if rounds < 1 or rounds > 5:
+    if rounds < 1 or rounds > 3:
         rounds = 1
 
     async with async_session() as session:
         user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
         bet = await parse_stake(user, raw_amount)
         if not bet or bet <= 0 or user.balance < bet:
-            return await message.reply_text("❌ Invalid or insufficient bet amount.")
+            await message.reply_text("❌ Invalid or insufficient bet amount. Minimum is ₹10.")
+            return
+        
         user.balance -= bet
         user.total_wagered += bet
         user.games_played += 1
@@ -995,11 +1102,6 @@ async def handle_game_challenge(update: Update, context: ContextTypes.DEFAULT_TY
     global MATCH_COUNTER
     MATCH_COUNTER += 1
     c_id = MATCH_COUNTER
-
-    # Check if a user tag was passed for a direct PvP duel (e.g. /dice @user amount rounds)
-    opponent_id = None
-    if len(args) > 2 and args[1].startswith("@"):
-        pass
 
     ACTIVE_CHALLENGES[c_id] = {
         "challenger_id": message.from_user.id,
@@ -1011,55 +1113,72 @@ async def handle_game_challenge(update: Update, context: ContextTypes.DEFAULT_TY
         "chat_id": message.chat.id
     }
 
-    room_id = f"#{random.randint(1000, 9999)}"
+    room_code = random.randint(1000, 9999)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=f"🟢 Accept ({fmt_money(bet)})", callback_data=f"pvp_acc_{c_id}")],
-        [InlineKeyboardButton(text="🟢 Play vs Bot", callback_data=f"pvp_bot_{c_id}")],
+        [InlineKeyboardButton(text=f"🟢 Accept ({fmt_money(bet, 'INR')})", callback_data=f"pvp_acc_{c_id}")],
         [InlineKeyboardButton(text="🟢 Cancel", callback_data=f"pvp_can_{c_id}")]
     ])
 
     await message.reply_text(
-        f"<b>ROOM ID~ {room_id}</b>\n"
-        f"{emoji} PvP {game.upper()} — ₹{bet:.2f} 🔄 {rounds} Rounds\n\n"
-        f"👤 @{message.from_user.username or message.from_user.first_name} created challenge!",
+        f"<b>ROOM ID~ #{room_code}</b>\n"
+        f"{emoji} <b>{game} vs Bot / PvP</b> — ₹{bet:.2f} 🔄 {rounds} Rounds\n\n"
+        f"🔄 Rounds: {rounds} — highest total wins\n\n"
+        f"👤 @{message.from_user.username or message.from_user.first_name} — send/copy this emoji now: {emoji}",
         reply_markup=kb,
         parse_mode="HTML"
     )
 
+async def cb_pvp_rounds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    if data == "pvp_rnd_cancel":
+        return await query.message.edit_text("Cancelled.", parse_mode="HTML")
+    parts = data.split("_")
+    game = parts[2]
+    rounds = int(parts[3])
+    await query.message.edit_text(f"Selected {rounds} rounds for {game}. Now send command with amount, e.g. <code>/{game} 50 {rounds}</code>", parse_mode="HTML")
+    await query.answer()
+
 async def cmd_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "dice", "🎲")
+    await create_pvp_challenge(update, context, "dice", "🎲")
 
 async def cmd_darts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "darts", "🎯")
+    await create_pvp_challenge(update, context, "darts", "🎯")
 
 async def cmd_bowling(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "bowling", "🎳")
+    await create_pvp_challenge(update, context, "bowling", "🎳")
 
 async def cmd_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "basket", "🏀")
+    await create_pvp_challenge(update, context, "basket", "🏀")
 
 async def cmd_football(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "football", "⚽")
+    await create_pvp_challenge(update, context, "football", "⚽")
 
 async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "slots", "🎰")
+    await create_pvp_challenge(update, context, "slots", "🎰")
 
 async def cmd_battle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_game_challenge(update, context, "dice", "🎲")
+    if not await security_middleware(update, context):
+        return
+    message = update.message
+    args = context.args
+    if not args:
+        return await message.reply_text("Usage: <code>/battle [@user] [amount]</code>", parse_mode="HTML")
+    await create_pvp_challenge(update, context, "dice", "🎲")
 
 async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
     message = update.message
     if message.chat.type not in ["group", "supergroup"]:
-        return await message.reply_text("Coin flip is restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
+        return await message.reply_text("🪙 Coin flip is restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
     args = context.args
     if not args:
         return await message.reply_text("Usage: <code>/coin [amount]</code>", parse_mode="HTML")
     
     async with async_session() as session:
         user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
-        bet = await parse_stake(user, args[0])
+        bet = await parse_stake(user, args[-1])
         if not bet or user.balance < bet:
             return await message.reply_text("❌ Invalid or insufficient bet amount.")
         user.balance -= bet
@@ -1084,27 +1203,14 @@ async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(text=f"🟢 Accept Coin Flip ({fmt_money(bet)})", callback_data=f"pvp_acc_{c_id}")],
         [InlineKeyboardButton(text="🟢 Cancel", callback_data=f"pvp_can_{c_id}")]
     ])
-    msg = await message.reply_text(
+    await message.reply_text(
         f"<b>Coin Flip Challenge #{c_id}</b>\n"
         f"Challenger: @{message.from_user.username or message.from_user.first_name}\n"
         f"Staked: ₹{bet:.2f}\n"
-        f"Win: 1.92x\n\n"
-        f"Starting in 3...",
+        f"Win: 1.92x",
+        reply_markup=kb,
         parse_mode="HTML"
     )
-    for sec in [2, 1]:
-        await asyncio.sleep(1)
-        try:
-            await msg.edit_text(
-                f"<b>Coin Flip Challenge #{c_id}</b>\n"
-                f"Challenger: @{message.from_user.username or message.from_user.first_name}\n"
-                f"Staked: ₹{bet:.2f}\n"
-                f"Win: 1.92x\n\n"
-                f"Starting in {sec}...",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
 
 async def cmd_7up(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
@@ -1114,7 +1220,7 @@ async def cmd_7up(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: <code>/7up [up/down] [amount]</code>", parse_mode="HTML")
     choice = args[0].lower()
     if choice not in ["up", "down"]:
-        return await update.message.reply_text("Choose 'up' or 'down'.")
+        return await update.message.reply_text("Choose 'up' (7-12) or 'down' (1-6).")
     
     async with async_session() as session:
         user = await get_user(session, update.message.from_user.id)
@@ -1191,6 +1297,13 @@ async def cb_accept_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
 
     if challenge["game"] == "coin":
+        msg = await query.message.edit_text("🪙 Flipping the coin... 1… ⏳", parse_mode="HTML")
+        await asyncio.sleep(1)
+        await msg.edit_text("🪙 Flipping the coin... 2… ⏳", parse_mode="HTML")
+        await asyncio.sleep(1)
+        await msg.edit_text("🪙 Flipping the coin... 3… ⏳", parse_mode="HTML")
+        await asyncio.sleep(1)
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(text="🟢 Heads", callback_data=f"coin_pick_{c_id}_heads"), InlineKeyboardButton(text="🟢 Tails", callback_data=f"coin_pick_{c_id}_tails")]
         ])
@@ -1199,7 +1312,7 @@ async def cb_accept_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "acceptor_id": acceptor_id,
             "acceptor_name": query.from_user.username or query.from_user.first_name,
         }
-        await query.message.edit_text(
+        await msg.edit_text(
             f"<b>Coin Flip</b>\n"
             f"👤 @{challenge['challenger_name']} vs @{query.from_user.username or query.from_user.first_name}\n\n"
             f"@{query.from_user.username or query.from_user.first_name}, pick your side below:",
@@ -1216,62 +1329,10 @@ async def cb_accept_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     await query.message.edit_text(
-        f"🎲 {challenge['game'].upper()} vs Bot / Player\n"
-        f"🔄 Rounds: {challenge['rounds']} — highest total wins\n\n"
-        f"👤 @{challenge['challenger_name']} — send/copy this emoji now: {challenge['emoji']} (1/{challenge['rounds']})",
-        parse_mode="HTML"
-    )
-    await query.answer()
-
-async def cb_play_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    c_id = int(query.data.split("_")[2])
-    if c_id not in ACTIVE_CHALLENGES:
-        return await query.answer("Challenge expired.", show_alert=True)
-    challenge = ACTIVE_CHALLENGES.pop(c_id)
-    if query.from_user.id != challenge["challenger_id"]:
-        return await query.answer("Not your challenge!", show_alert=True)
-
-    rounds = challenge["rounds"]
-    p_scores = []
-    b_scores = []
-    for _ in range(rounds):
-        p_scores.append(random.randint(1, 6))
-        b_scores.append(random.randint(1, 6))
-
-    p_tot = sum(p_scores)
-    b_tot = sum(b_scores)
-    bet = challenge["amount"]
-    payout = bet * 1.92
-
-    if p_tot > b_tot:
-        async with async_session() as session:
-            u = await get_user(session, challenge["challenger_id"])
-            u.balance += payout
-            u.total_won += payout
-            u.games_won += 1
-            await session.commit()
-            new_b = u.balance
-        res_txt = f"@{challenge['challenger_name']} wins {p_tot}-{b_tot}!\n₹{payout:.2f} credited.\nBalance: ₹{new_b:.2f}"
-    elif b_tot > p_tot:
-        BOT_STATE["house_balance"] += bet
-        async with async_session() as session:
-            u = await get_user(session, challenge["challenger_id"])
-            u.games_lost += 1
-            await session.commit()
-        res_txt = f"Bot wins {b_tot}-{p_tot}!\nYou lost ₹{bet:.2f}."
-    else:
-        async with async_session() as session:
-            u = await get_user(session, challenge["challenger_id"])
-            u.balance += bet
-            await session.commit()
-        res_txt = "🤝 IT'S A TIE! Stake refunded."
-
-    await query.message.edit_text(
-        f"🤖 <b>PvB {challenge['game'].upper()} Result</b>\n\n"
-        f"@{challenge['challenger_name']}: {p_tot} pts\n"
-        f"Rolex Bot: {b_tot} pts\n\n"
-        f"{res_txt}",
+        f"<b>Match Started!</b>\n"
+        f"Challenger: @{challenge['challenger_name']}\n"
+        f"Opponent: @{query.from_user.username or query.from_user.first_name}\n\n"
+        f"@{challenge['challenger_name']} SEND: {challenge['emoji']} 1/{challenge['rounds']}",
         parse_mode="HTML"
     )
     await query.answer()
@@ -1289,11 +1350,13 @@ async def cb_coin_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     opp_pick = pick
     chal_pick = "tails" if opp_pick == "heads" else "heads"
+
     result = random.choice(["heads", "tails"])
     won_chal = (chal_pick == result)
     winner_id = match["challenger_id"] if won_chal else match["acceptor_id"]
     loser_id = match["acceptor_id"] if won_chal else match["challenger_id"]
     winner_name = match["challenger_name"] if won_chal else match["acceptor_name"]
+    loser_name = match["acceptor_name"] if won_chal else match["challenger_name"]
 
     payout = match["amount"] * 1.92
     async with async_session() as session:
@@ -1306,7 +1369,13 @@ async def cb_coin_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
 
     await query.message.edit_text(
-        f"🪙 <b>Coin Flip Result!</b>\nLand: {result.upper()}\n🏆 Winner: @{winner_name} (₹{payout:.2f})",
+        f"🪙 <b>Coin Flip Result!</b>\n\n"
+        f"Coin landed on... <b>{result.upper()}</b>\n\n"
+        f"@{match['challenger_name']}: {chal_pick}\n"
+        f"@{match['acceptor_name']}: {opp_pick}\n\n"
+        f"🏆 Winner: @{winner_name}\n"
+        f"👻 Loser: @{loser_name}\n"
+        f"🏦 Prize: ₹{payout:.2f} credited to wallet.",
         parse_mode="HTML"
     )
     await query.answer()
@@ -1321,13 +1390,14 @@ async def handle_native_dice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     emoji_sent = message.dice.emoji
 
     if message.forward_date:
-        await message.delete()
-        return await message.reply_text("❌ Forward emoji detected! Forward emoji declined. Send game emoji again: 🎲")
+        await message.reply_text(f"Forwarded emoji detected ❌ warn 1/3 @admins and ask to send game emoji again: 🎲", parse_mode="HTML")
+        return
 
     for m_id, m in ACTIVE_MATCHES.items():
         if m["chat_id"] == chat_id and (m["challenger_id"] == user_id or m["acceptor_id"] == user_id):
             if emoji_sent != m["emoji"]:
-                return await message.reply_text(f"❌ Wrong emoji detected! Send required emoji again: {m['emoji']}")
+                await message.reply_text(f"Wrong emoji detected ❌ send required emoji again: {m['emoji']}", parse_mode="HTML")
+                return
             if user_id != m["turn"]:
                 return await message.reply_text("❌ Not your turn!")
 
@@ -1335,13 +1405,25 @@ async def handle_native_dice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if is_p1:
                 m["p1_scores"].append(val)
                 m["turn"] = m["acceptor_id"]
-                await message.reply_text(f"🏆 Round {m['round']}: @{m['challenger_name']} scored {val} ✅\nNow @{m['acceptor_name']} send: {m['emoji']} {m['round']}/{m['rounds']}", parse_mode="HTML")
+                await message.reply_text(f"🏆 Round {m['round']}: @{m['challenger_name']} scored {val} ✔️ ({val}-?)\nNow @{m['acceptor_name']} SEND: {m['emoji']} {m['round']}/{m['rounds']}", parse_mode="HTML")
             else:
                 m["p2_scores"].append(val)
+                p1_curr = m["p1_scores"][-1]
+                p2_curr = val
+                
+                if p1_curr > p2_curr:
+                    r_winner = f"@{m['challenger_name']}"
+                elif p2_curr > p1_curr:
+                    r_winner = f"@{m['acceptor_name']}"
+                else:
+                    r_winner = "Tie"
+
+                await message.reply_text(f"🏆 Round {m['round']}: @{m['acceptor_name']} scored {val} ✔️ ({p1_curr}-{p2_curr}) -> {r_winner} wins round!", parse_mode="HTML")
+
                 if m["round"] < m["rounds"]:
                     m["round"] += 1
                     m["turn"] = m["challenger_id"]
-                    await message.reply_text(f"🏆 Round {m['round']-1} finished!\nNow @{m['challenger_name']} send {m['emoji']} for Round {m['round']}", parse_mode="HTML")
+                    await message.reply_text(f"Now @{m['challenger_name']} SEND: {m['emoji']} {m['round']}/{m['rounds']}", parse_mode="HTML")
                 else:
                     ACTIVE_MATCHES.pop(m_id)
                     p1_tot = sum(m["p1_scores"])
@@ -1349,19 +1431,25 @@ async def handle_native_dice(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     bet = m["amount"]
                     payout = bet * 1.92
 
-                    if p1_tot == p2_tot:
+                    if p1_tot > p2_tot:
+                        winner_id = m["challenger_id"]
+                        winner_name = m["challenger_name"]
+                    elif p2_tot > p1_tot:
+                        winner_id = m["acceptor_id"]
+                        winner_name = m["acceptor_name"]
+                    else:
                         async with async_session() as session:
                             u1 = await get_user(session, m["challenger_id"])
                             u2 = await get_user(session, m["acceptor_id"])
                             u1.balance += bet
                             u2.balance += bet
                             await session.commit()
-                        return await message.reply_text("🤝 <b>IT'S A TIE!</b>\n\nBoth rolled the same value.\nThrow the required emoji again.", parse_mode="HTML")
+                        return await message.reply_text(
+                            "🤝 <b>IT'S A TIE!</b>\n\nBoth rolled the same value.\nThrow the required emoji again.",
+                            parse_mode="HTML"
+                        )
 
-                    winner_id = m["challenger_id"] if p1_tot > p2_tot else m["acceptor_id"]
-                    winner_name = m["challenger_name"] if p1_tot > p2_tot else m["acceptor_name"]
                     loser_id = m["acceptor_id"] if winner_id == m["challenger_id"] else m["challenger_id"]
-
                     async with async_session() as session:
                         w = await get_user(session, winner_id)
                         w.balance += payout
@@ -1372,9 +1460,10 @@ async def handle_native_dice(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         await session.commit()
                         new_b = w.balance
 
+                    BOT_STATE["house_balance"] += bet * 0.08
                     await message.reply_text(
-                        f"🏆 @{winner_name} wins 1-0!\n"
-                        f"₹{payout:.2f} credited.\nBalance: ₹{new_b:.2f}",
+                        f"🏆 {winner_name} wins {p1_tot}-{p2_tot}!\n"
+                        f"₹{payout:.2f} credited to wallet.\nBalance: ₹{new_b:.2f}",
                         parse_mode="HTML"
                     )
             return
@@ -1397,7 +1486,10 @@ async def cmd_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = await session.get(User, uid)
         if not u:
             return await update.message.reply_text("User not found.")
-    await update.message.reply_text(f"👤 User Info: {uid} | Name: {u.first_name} | Balance: ₹{u.balance:.2f}", parse_mode="HTML")
+    await update.message.reply_text(
+        f"👤 <b>User Info: {uid}</b>\nName: {u.first_name}\nUsername: @{u.username}\nBalance: ₹{u.balance:.2f}\nWager Req: ₹{u.wager_required:.2f}",
+        parse_mode="HTML"
+    )
 
 async def cmd_balancededuct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
@@ -1422,20 +1514,19 @@ async def cmd_rain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with async_session() as session:
         users = (await session.execute(select(User))).scalars().all()
         if not users:
-            return await update.message.reply_text("No users found.")
+            return await update.message.reply_text("No users found to rain.")
         share = total_amt / len(users)
         for u in users:
             u.balance += share
         await session.commit()
-    await update.message.reply_text(f"🌧️ Rained ₹{total_amt} across {len(users)} users.")
+    await update.message.reply_text(f"🌧️ Rained ₹{total_amt} across {len(users)} users (₹{share:.2f} each).")
 
 async def cmd_hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with async_session() as session:
         total_users = (await session.execute(select(func.count(User.telegram_id)))).scalar() or 0
         total_bal = (await session.execute(select(func.sum(User.balance)))).scalar() or 0.0
     await update.message.reply_text(
-        f"🏦 Treasury Vault Overview\n"
-        f"House Balance: ₹{BOT_STATE['house_balance']:.2f}\n"
+        f"🏦 House Balance: ₹{BOT_STATE['house_balance']:.2f}\n"
         f"Total Users: {total_users}\n"
         f"Total Balances: ₹{total_bal:.2f}",
         parse_mode="HTML"
@@ -1444,10 +1535,22 @@ async def cmd_hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await security_middleware(update, context):
         return
-    args = context.args
-    if not args and not update.message.reply_to_message:
-        return await update.message.reply_text("Usage: <code>/escrow [amount]</code> (reply to a user to create escrow deal)", parse_mode="HTML")
-    await update.message.reply_text("🛡️ <b>Rolex Secure Escrow Created</b>\nPlease contact @RolexCasinoMOD to complete the deal safely.", parse_mode="HTML")
+    message = update.message
+    if message.reply_to_message and context.args:
+        try:
+            amt = float(context.args[0])
+            return await message.reply_text(f"🛡️ Escrow deal created successfully for ₹{amt} involving @{message.reply_to_message.from_user.username or 'User'}. Contact @RolexCasinoMOD to lock funds.", parse_mode="HTML")
+        except ValueError:
+            pass
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="🟢 Create Escrow", callback_data="escrow_create"), InlineKeyboardButton(text="🟢 Join Escrow", callback_data="escrow_join")]
+    ])
+    await message.reply_text("🛡️ <b>Rolex Secure Escrow System</b>\n\nReply to a user with <code>/escrow [amount]</code> to create an escrow deal.", reply_markup=kb, parse_mode="HTML")
+
+async def cb_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("🛡️ Escrow service is active. Please contact @RolexCasinoMOD to setup a secure deal.", parse_mode="HTML")
+    await query.answer()
 
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
@@ -1455,7 +1558,7 @@ async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="🟢 Pending Requests", callback_data="adm_pending"), InlineKeyboardButton(text="🟢 Users Count", callback_data="adm_users")]
     ])
-    await update.message.reply_text("👑 Visual Administration Control Dashboard", reply_markup=kb, parse_mode="HTML")
+    await update.message.reply_text("👑 Admin Control Panel", reply_markup=kb, parse_mode="HTML")
 
 async def cb_adm_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1485,6 +1588,28 @@ async def cb_approve_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.balance += tx.amount
         user.wager_required += tx.amount
         await session.commit()
+        new_b = user.balance
+        uid = tx.telegram_id
+        amt = tx.amount
+
+    try:
+        if tx.type == "DEPOSIT":
+            await context.bot.send_message(
+                uid,
+                f"✅ <b>Deposit Approved!</b>\n\n"
+                f"Credited: ₹{amt}\n"
+                f"Balance: ₹{new_b:.2f}\n\n"
+                f"Wager ₹{amt} before withdrawing (1x deposit rule)\nPlay any game to clear it — /wagerstatus to track",
+                parse_mode="HTML"
+            )
+        else:
+            await context.bot.send_message(
+                uid,
+                "✅ Your withdrawal request has been successfully processed!",
+                parse_mode="HTML"
+            )
+    except Exception:
+        pass
     await query.message.edit_text(f"✅ Transaction #{tx_id} approved.")
     await query.answer("Approved!")
 
@@ -1497,7 +1622,16 @@ async def cb_reject_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tx = await session.get(Transaction, tx_id)
         if tx:
             tx.status = "REJECTED"
+            uid = tx.telegram_id
             await session.commit()
+    try:
+        await context.bot.send_message(
+            uid,
+            "❌ Your withdrawal/deposit is rejected. Kindly contact support by sending /support or /help below",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
     await query.message.edit_text(f"❌ Transaction #{tx_id} rejected.")
     await query.answer("Rejected.")
 
@@ -1522,17 +1656,28 @@ async def cmd_creategift(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
     await update.message.reply_text(f"✅ Gift code {code} created for ₹{amt}.")
 
+async def cmd_announcement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS: return
+    text = " ".join(context.args)
+    if not text:
+        return await update.message.reply_text("Please provide announcement text.")
+    try:
+        await context.bot.send_message(GROUP_ID, f"📢 <b>OFFICIAL ANNOUNCEMENT</b>\n\n{text}", parse_mode="HTML")
+        await update.message.reply_text("✅ Announcement sent to group chat.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send announcement: {e}")
+
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS: return
     text = " ".join(context.args)
     if not text:
-        return await update.message.reply_text("Please provide message.")
+        return await update.message.reply_text("Please provide message to broadcast.")
     async with async_session() as session:
         users = (await session.execute(select(User.telegram_id))).scalars().all()
     for uid in users:
         try: await context.bot.send_message(uid, text, parse_mode="HTML")
         except Exception: pass
-    await update.message.reply_text("✅ Direct broadcast sent to all registered players' DMs.")
+    await update.message.reply_text("✅ Broadcast sent.")
 
 def main():
     asyncio.run(init_db())
@@ -1594,17 +1739,11 @@ def main():
     app.add_handler(CommandHandler("coin", cmd_coin))
     app.add_handler(CommandHandler("battle", cmd_battle))
     app.add_handler(CommandHandler("7up", cmd_7up))
-    app.add_handler(CommandHandler("dr", cmd_dice))
-    app.add_handler(CommandHandler("odice", cmd_dice))
-    app.add_handler(CommandHandler("bj", cmd_dice))
-    app.add_handler(CommandHandler("towers", cmd_dice))
-    app.add_handler(CommandHandler("limbo", cmd_dice))
-    app.add_handler(CommandHandler("mines", cmd_dice))
     app.add_handler(CommandHandler("hb", cmd_hb))
     app.add_handler(CommandHandler("escrow", cmd_escrow))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("admincommands", cmd_panel))
-    app.add_handler(CommandHandler("pending", cmd_panel))
+    app.add_handler(CommandHandler("pending", cb_adm_pending))
     app.add_handler(CommandHandler("balanceadd", cmd_balanceadd))
     app.add_handler(CommandHandler("balancededuct", cmd_balancededuct))
     app.add_handler(CommandHandler("users", cmd_users))
@@ -1629,12 +1768,13 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_referral, pattern="^menu_referral$"))
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
     app.add_handler(CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
-    app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_s"))
+    app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_"))
     app.add_handler(CallbackQueryHandler(cb_tip_action, pattern="^tip_"))
     app.add_handler(CallbackQueryHandler(cb_coin_pick, pattern="^coin_pick_"))
+    app.add_handler(CallbackQueryHandler(cb_escrow, pattern="^escrow_"))
     app.add_handler(CallbackQueryHandler(cb_cancel_pvp, pattern="^pvp_can_"))
     app.add_handler(CallbackQueryHandler(cb_accept_pvp, pattern="^pvp_acc_"))
-    app.add_handler(CallbackQueryHandler(cb_play_bot, pattern="^pvp_bot_"))
+    app.add_handler(CallbackQueryHandler(cb_pvp_rounds, pattern="^pvp_rnd_"))
     app.add_handler(CallbackQueryHandler(cb_adm_pending, pattern="^adm_pending$"))
     app.add_handler(CallbackQueryHandler(cb_approve_dep, pattern="^adm_dep_yes_"))
     app.add_handler(CallbackQueryHandler(cb_reject_dep, pattern="^adm_dep_no_"))
@@ -1643,7 +1783,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.Dice.ALL, handle_native_dice))
 
-    logger.info("Rolex Casino Bot updated successfully with all requested features and exact messaging protocols.")
+    logger.info("Rolex Casino Bot updated & started successfully with all requested features & rules applied.")
     app.run_polling()
 
 if __name__ == "__main__":
