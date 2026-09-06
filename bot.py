@@ -313,10 +313,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
     first_name = message.from_user.first_name or "Player"
 
     if message.chat.type in ["group", "supergroup"]:
+            if message.chat.type in ["group", "supergroup"]:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Launch Bot in DM 🤖", url=f"https://t.me/{BOT_USERNAME}")],
-            [InlineKeyboardButton(text="👥 Official Community 🌐", url=GROUP_LINK)]
-        ]]
+            [InlineKeyboardButton(text="✨ Join Community", url=GROUP_LINK)],
+            [InlineKeyboardButton(text="💬 Open Bot Chat", url=f"https://t.me/{BOT_USERNAME}")]
+        ])
+        return await message.answer(
+
         return await message.answer(
             f"✨ <b>Welcome, {first_name}!</b>\n\n"
             f"‼️ <b>I'm Rolex–Casino-Bot</b>\n\n"
