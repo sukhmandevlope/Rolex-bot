@@ -8,14 +8,22 @@ from dotenv import load_dotenv
 # Load local environment variables if available (.env file)
 load_dotenv()
 
-from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    Bot
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler
 )
 from sqlalchemy import BigInteger, String, Float, Boolean, Column, DateTime, Integer, select, func, desc
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -169,38 +177,30 @@ def fmt_money(amount: float, currency: str = "INR") -> str:
 
 BOT_STATE = {"maintenance": False, "house_balance": 0.0}
 
-class DepositStates(StatesGroup):
-    waiting_for_amount = State()
-    waiting_for_proof = State()
-    waiting_for_photo = State()
-
-class WithdrawStates(StatesGroup):
-    waiting_for_amount = State()
-    waiting_for_address = State()
-
-class SetWalletStates(StatesGroup):
-    waiting_for_address = State()
-
-class AdminStates(StatesGroup):
-    broadcast_text = State()
+# FSM States representation for ConversationHandler
+(
+    DEP_AMOUNT, DEP_PROOF, DEP_PHOTO,
+    WD_AMOUNT, WD_ADDRESS,
+    SET_WALLET
+) = range(6)
 
 ACTIVE_CHALLENGES = {}
 ACTIVE_MATCHES = {}
 MATCH_COUNTER = 0
 
 def get_channel_lock_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(text="📢 Join Official Group 🌐", url=GROUP_LINK)],
         [InlineKeyboardButton(text="📥 Deposit Funds 💵", url=f"https://t.me/{BOT_USERNAME}?start=deposit")]
     ])
 
 def get_dm_redirect_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(text="🤖 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
     ])
 
 def get_main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
             InlineKeyboardButton(text="📤 Withdraw 🔴", callback_data="menu_withdraw")
@@ -217,22 +217,13 @@ def get_main_menu_kb():
         [InlineKeyboardButton(text="🛟 24/7 VIP Support 🔵", callback_data="menu_support")]
     ])
 
-async def security_middleware(handler, event: types.TelegramObject, data: dict):
-    if isinstance(event, types.CallbackQuery):
-        message = event.message
-        user = event.from_user
-    elif isinstance(event, types.Message):
-        message = event
-        user = event.from_user
-    elif isinstance(event, types.Update):
-        message = event.message or (event.callback_query.message if event.callback_query else None)
-        user = (event.message.from_user if event.message else 
-                (event.callback_query.from_user if event.callback_query else None))
-    else:
-        return await handler(event, data)
+async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    user = update.effective_user
     
     if not message or not user:
-        return await handler(event, data)
+        return True
 
     chat_type = message.chat.type
     is_admin = user.id in ADMINS
@@ -240,18 +231,22 @@ async def security_middleware(handler, event: types.TelegramObject, data: dict):
     async with async_session() as session:
         db_user = await session.get(User, user.id)
         if db_user and db_user.is_banned and not is_admin:
-            if isinstance(event, types.CallbackQuery):
-                return await event.answer("⛔ Your account has been suspended by Rolex Security.", show_alert=True)
+            if query:
+                await query.answer("⛔ Your account has been suspended by Rolex Security.", show_alert=True)
+                return False
             if chat_type == "private":
-                return await message.answer("⛔ <b>Your account has been suspended by Rolex Casino Security.</b>", parse_mode="HTML")
-            return
+                await message.answer("⛔ <b>Your account has been suspended by Rolex Casino Security.</b>", parse_mode="HTML")
+                return False
+            return False
 
     if BOT_STATE["maintenance"] and not is_admin:
-        if isinstance(event, types.CallbackQuery):
-            return await event.answer("⚠️ Bot is currently under maintenance. Bets are paused.", show_alert=True)
+        if query:
+            await query.answer("⚠️ Bot is currently under maintenance. Bets are paused.", show_alert=True)
+            return False
         if chat_type in ["group", "supergroup"]:
-            return
-        return await message.answer("⚠️ <b>Rolex Casino is currently under scheduled maintenance.</b> Please check back soon!", parse_mode="HTML")
+            return False
+        await message.answer("⚠️ <b>Rolex Casino is currently under scheduled maintenance.</b> Please check back soon!", parse_mode="HTML")
+        return False
 
     text = message.text or message.caption or ""
     raw_cmd = text.split()[0].lower() if text.startswith("/") else ""
@@ -261,21 +256,23 @@ async def security_middleware(handler, event: types.TelegramObject, data: dict):
     if command in admin_commands and chat_type in ["group", "supergroup"]:
         try: await message.delete()
         except Exception: pass
-        return await message.answer(
+        await message.answer(
             f"⛔ <b>{user.first_name}, administrative commands can only be executed securely inside our DM inbox!</b>",
             reply_markup=get_dm_redirect_kb(),
             parse_mode="HTML"
         )
+        return False
 
     dm_only_commands = {"/deposit", "/withdraw", "/setwallet", "/changecurrency"}
     if command in dm_only_commands and chat_type in ["group", "supergroup"]:
         try: await message.delete()
         except Exception: pass
-        return await message.answer(
+        await message.answer(
             f"⛔ <b>{user.first_name}, wallet & payment commands can only be accessed securely inside DM!</b>",
             reply_markup=get_dm_redirect_kb(),
             parse_mode="HTML"
         )
+        return False
 
     game_commands = {"/dice", "/basket", "/darts", "/football", "/bowling", "/slots", "/coin", "/battle", "/7up", "/dr", "/odice"}
     if command in game_commands and chat_type == "private" and not is_admin:
@@ -284,9 +281,9 @@ async def security_middleware(handler, event: types.TelegramObject, data: dict):
             reply_markup=get_channel_lock_kb(),
             parse_mode="HTML"
         )
-        return
+        return False
 
-    return await handler(event, data)
+    return True
 
 async def parse_stake(user: User, raw_arg: str) -> float | None:
     raw = raw_arg.strip().lower()
@@ -304,16 +301,16 @@ async def parse_stake(user: User, raw_arg: str) -> float | None:
     except ValueError:
         return None
 
-router = Router()
-
-@router.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     user_id = message.from_user.id
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Player"
 
     if message.chat.type in ["group", "supergroup"]:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(text="✨ Join Community", url=GROUP_LINK)],
             [InlineKeyboardButton(text="💬 Open Bot Chat", url=f"https://t.me/{BOT_USERNAME}")]
         ])
@@ -325,12 +322,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
     
-    args = message.text.split()
+    args = context.args
     inviter_id = None
-    if len(args) > 1:
-        param = args[1].strip()
+    if args:
+        param = args[0].strip()
         if param == "deposit":
-            return await start_deposit_flow(message, state)
+            return await cmd_deposit(update, context)
         elif param.startswith("ref_"):
             try:
                 ref_cand = int(param.replace("ref_", ""))
@@ -370,14 +367,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     await session.commit()
                     
                     try:
-                        await message.bot.send_message(
+                        await context.bot.send_message(
                             inviter_id,
                             f"🎁 <b>New Referral Joined!</b>\n\n👤 Player: @{username or first_name}\n💵 Bonus: <b>+₹{REFERRAL_BONUS:.2f}</b> added to your wallet!\n💼 New Balance: <b>₹{inviter.balance:.2f}</b>",
                             parse_mode="HTML"
                         )
                     except Exception:
                         pass
-                    await send_log(message.bot, f"🎁 <b>Referral Bonus</b>: `{inviter_id}` earned ₹{REFERRAL_BONUS:.2f} from new user `{user_id}` (@{username})")
+                    await send_log(context.bot, f"🎁 <b>Referral Bonus</b>: `{inviter_id}` earned ₹{REFERRAL_BONUS:.2f} from new user `{user_id}` (@{username})")
 
         else:
             if username and user.username != username:
@@ -399,43 +396,44 @@ async def cmd_start(message: types.Message, state: FSMContext):
     )
     await message.answer(welcome_text, reply_markup=get_main_menu_kb(), parse_mode="HTML")
 
-@router.callback_query(F.data == "menu_deposit")
-async def cb_menu_deposit(callback: types.CallbackQuery, state: FSMContext):
-    await start_deposit_flow(callback.message, state)
-    await callback.answer()
+async def cb_menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_deposit(update, context)
 
-@router.callback_query(F.data == "menu_withdraw")
-async def cb_menu_withdraw(callback: types.CallbackQuery, state: FSMContext):
-    await cmd_withdraw(callback.message, state)
-    await callback.answer()
+async def cb_menu_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_withdraw(update, context)
 
-@router.callback_query(F.data == "menu_wallet")
-async def cb_menu_wallet(callback: types.CallbackQuery):
-    await cmd_wallet(callback.message)
-    await callback.answer()
+async def cb_menu_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_wallet(update, context)
 
-@router.callback_query(F.data == "menu_games")
-async def cb_menu_games(callback: types.CallbackQuery):
-    await cmd_games(callback.message)
-    await callback.answer()
+async def cb_menu_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_games(update, context)
 
-@router.callback_query(F.data == "menu_referral")
-async def cb_menu_referral(callback: types.CallbackQuery):
-    await cmd_refer(callback.message)
-    await callback.answer()
+async def cb_menu_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_refer(update, context)
 
-@router.callback_query(F.data == "menu_stats")
-async def cb_menu_stats(callback: types.CallbackQuery):
-    await cmd_mystats(callback.message)
-    await callback.answer()
+async def cb_menu_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_mystats(update, context)
 
-@router.callback_query(F.data == "menu_support")
-async def cb_menu_support(callback: types.CallbackQuery):
-    await cmd_support_msg(callback.message)
-    await callback.answer()
+async def cb_menu_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await cmd_help(update, context)
 
-@router.message(Command("help"))
-async def cmd_help(message: types.Message):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
     txt = (
         "🎧 <b>CUSTOMER SUPPORT</b>\n"
         "Need help? Our support team is here to assist you.\n\n"
@@ -452,14 +450,11 @@ async def cmd_help(message: types.Message):
         "👑 Admin Notice:\n"
         "For admin-related matters, please inform the admins directly."
     )
-    await message.answer(txt, parse_mode="HTML")
+    await update.message.answer(txt, parse_mode="HTML")
 
-@router.message(Command("support"))
-async def cmd_support_msg(message: types.Message):
-    await cmd_help(message)
-
-@router.message(Command("games"))
-async def cmd_games(message: types.Message):
+async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
     txt = (
         "🤍 <b>AVAILABLE GAMES</b>\n\n"
         "👋 <b>Rock • Paper • Scissors</b>\n"
@@ -480,13 +475,15 @@ async def cmd_games(message: types.Message):
         "🏏 <b>Cricket Dice</b> (/odice)\n\n"
         "Interactive games will be added soon."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="📢 Enter Official Game Group 🎮", url=GROUP_LINK)]
     ])
-    await message.answer(txt, reply_markup=kb, parse_mode="HTML")
+    await update.message.answer(txt, reply_markup=kb, parse_mode="HTML")
 
-@router.message(Command("wallet", "bal", "wal"))
-async def cmd_wallet(message: types.Message):
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     async with async_session() as session:
         user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
     
@@ -501,7 +498,7 @@ async def cmd_wallet(message: types.Message):
         f"(Play wallet bets to clear it)\n"
         f"Min withdrawal: $1/100₹"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="📥 Deposit 🟢", callback_data="menu_deposit"),
             InlineKeyboardButton(text="📤 Withdraw 🔴", callback_data="menu_withdraw")
@@ -513,89 +510,94 @@ async def cmd_wallet(message: types.Message):
     ])
     await message.answer(txt, reply_markup=kb, parse_mode="HTML")
 
-@router.callback_query(F.data == "toggle_currency")
-async def cb_toggle_currency(callback: types.CallbackQuery):
+async def cb_toggle_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     async with async_session() as session:
-        user = await get_user(session, callback.from_user.id)
+        user = await get_user(session, query.from_user.id)
         user.currency = "USD" if user.currency == "INR" else "INR"
         await session.commit()
         new_curr = user.currency
-    await callback.answer(f"Currency changed to {new_curr}!", show_alert=True)
-    await cmd_wallet(callback.message)
+    await query.answer(f"Currency changed to {new_curr}!", show_alert=True)
+    update.message = query.message
+    await cmd_wallet(update, context)
 
-@router.message(Command("changecurrency"))
-async def cmd_changecurrency(message: types.Message):
+async def cmd_changecurrency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
+        user = await get_user(session, update.message.from_user.id)
         user.currency = "USD" if user.currency == "INR" else "INR"
         await session.commit()
         new_curr = user.currency
-    await message.answer(f"💱 <b>Display currency successfully updated to:</b> {new_curr}", parse_mode="HTML")
+    await update.message.answer(f"💱 <b>Display currency successfully updated to:</b> {new_curr}", parse_mode="HTML")
 
-@router.message(Command("setwallet"))
-async def cmd_setwallet(message: types.Message, state: FSMContext):
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        address = args[1].strip()
+async def cmd_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
+    args = context.args
+    if args:
+        address = " ".join(args).strip()
         async with async_session() as session:
             user = await get_user(session, message.from_user.id)
             user.payout_address = address
             await session.commit()
         return await message.answer(f"👨‍💻 <b>Saved UPI:</b>\n<code>{address}</code>", parse_mode="HTML")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="BSC (BEP20)", callback_data="set_w_bep20"), InlineKeyboardButton(text="SOLANA", callback_data="set_w_sol")],
         [InlineKeyboardButton(text="ETHEREUM", callback_data="set_w_eth"), InlineKeyboardButton(text="BITCOIN", callback_data="set_w_btc")]
     ])
     await message.answer("👨‍💻 <b>Save Your UPI</b>\nEnter your UPI ID:\nExample: <code>yourname@ybl</code> or <code>9876543210@paytm</code>", reply_markup=kb, parse_mode="HTML")
-    await state.set_state(SetWalletStates.waiting_for_address)
+    return SET_WALLET
 
-@router.callback_query(F.data.startswith("set_w_"))
-async def cb_set_crypto_wallet(callback: types.CallbackQuery, state: FSMContext):
-    net = callback.data.split("_")[2].upper()
-    await state.update_data(crypto_net=net)
-    await callback.message.answer(f"Send your {net} crypto address:", parse_mode="HTML")
-    await callback.answer()
+async def cb_set_crypto_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    net = query.data.split("_")[2].upper()
+    context.user_data["crypto_net"] = net
+    await query.message.answer(f"Send your {net} crypto address:", parse_mode="HTML")
+    await query.answer()
 
-@router.callback_query(F.data == "btn_setwallet")
-async def cb_setwallet(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(SetWalletStates.waiting_for_address)
-    await callback.message.answer("👨‍💻 <b>Save Your UPI</b>\nEnter your UPI ID:\nExample: <code>yourname@ybl</code>", parse_mode="HTML")
-    await callback.answer()
+async def cb_setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.answer("👨‍💻 <b>Save Your UPI</b>\nEnter your UPI ID:\nExample: <code>yourname@ybl</code>", parse_mode="HTML")
+    await query.answer()
 
-@router.message(SetWalletStates.waiting_for_address)
-async def process_setwallet_address(message: types.Message, state: FSMContext):
-    address = message.text.strip()
+async def process_setwallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = update.message.text.strip()
     if len(address) < 4:
-        return await message.answer("❌ Invalid wallet address. Please enter a valid UPI ID or Crypto wallet.")
+        await update.message.answer("❌ Invalid wallet address. Please enter a valid UPI ID or Crypto wallet.")
+        return SET_WALLET
 
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
+        user = await get_user(session, update.message.from_user.id)
         user.payout_address = address
         await session.commit()
 
-    await state.clear()
-    await message.answer(f"👨‍💻 <b>Saved UPI:</b>\n<code>{address}</code>", parse_mode="HTML")
+    await update.message.answer(f"👨‍💻 <b>Saved UPI:</b>\n<code>{address}</code>", parse_mode="HTML")
+    return ConversationHandler.END
 
-@router.message(Command("saveupi"))
-async def cmd_saveupi(message: types.Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        return await message.answer("Usage: <code>/saveupi newupi@bank</code>", parse_mode="HTML")
-    address = args[1].strip()
+async def cmd_saveupi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    args = context.args
+    if not args:
+        return await update.message.answer("Usage: <code>/saveupi newupi@bank</code>", parse_mode="HTML")
+    address = " ".join(args).strip()
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
+        user = await get_user(session, update.message.from_user.id)
         user.payout_address = address
         await session.commit()
-    await message.answer(f"👨‍💻 <b>Saved UPI:</b>\n<code>{address}</code>", parse_mode="HTML")
+    await update.message.answer(f"👨‍💻 <b>Saved UPI:</b>\n<code>{address}</code>", parse_mode="HTML")
 
-@router.message(Command("refer", "referral", "referrals"))
-async def cmd_refer(message: types.Message):
-    user_id = message.from_user.id
+async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    user_id = update.message.from_user.id
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
     async with async_session() as session:
-        user = await get_user(session, user_id, message.from_user.username, message.from_user.first_name)
+        user = await get_user(session, user_id, update.message.from_user.username, update.message.from_user.first_name)
 
     txt = (
         f"🎁 <b>Rolex Casino Referral Program</b>\n\n"
@@ -606,13 +608,15 @@ async def cmd_refer(message: types.Message):
         f"• Total Invited Players: <b>{user.referral_count}</b>\n"
         f"• Total Referral Earnings: <b>₹{user.referral_earnings:.2f}</b>"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="🚀 Share Referral Link 📲", url=f"https://t.me/share/url?url={ref_link}&text=Join%20Rolex%20Casino%20PvP%20and%20play%20live%20games!")]
     ])
-    await message.answer(txt, reply_markup=kb, parse_mode="HTML")
+    await update.message.answer(txt, reply_markup=kb, parse_mode="HTML")
 
-@router.message(Command("mystats"))
-async def cmd_mystats(message: types.Message):
+async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     async with async_session() as session:
         user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
         rank_query = select(func.count(User.telegram_id)).where(User.total_wagered > user.total_wagered)
@@ -635,8 +639,9 @@ async def cmd_mystats(message: types.Message):
     )
     await message.answer(txt, parse_mode="HTML")
 
-@router.message(Command("rank", "leaderboard"))
-async def cmd_leaderboard(message: types.Message):
+async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
     async with async_session() as session:
         top_players = (await session.execute(
             select(User).order_by(desc(User.total_wagered)).limit(10)
@@ -652,12 +657,13 @@ async def cmd_leaderboard(message: types.Message):
             badge = medals[idx] if idx < len(medals) else f"#{idx+1}"
             txt += f"{badge} <b>{name}</b> — Wagered: ₹{u.total_wagered:.2f} | Won: {u.games_won}W\n"
 
-    await message.answer(txt, parse_mode="HTML")
+    await update.message.answer(txt, parse_mode="HTML")
 
-@router.message(Command("wagerstatus"))
-async def cmd_wager(message: types.Message):
+async def cmd_wager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
+        user = await get_user(session, update.message.from_user.id)
     
     status_icon = "🟢 Clear" if user.wager_required <= 0 else "⚠️ Locked"
     txt = (
@@ -666,23 +672,25 @@ async def cmd_wager(message: types.Message):
         f"• Pending Wager Requirement: <b>{fmt_money(user.wager_required, user.currency)}</b>\n"
         f"• Total Wager Completed: <b>{fmt_money(user.wager_completed, user.currency)}</b>"
     )
-    await message.answer(txt, parse_mode="HTML")
+    await update.message.answer(txt, parse_mode="HTML")
 
-@router.message(Command("tip"))
-async def cmd_tip(message: types.Message):
+async def cmd_tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     sender_id = message.from_user.id
-    args = message.text.split()
+    args = context.args
     
     recipient = None
     raw_amount = None
 
     if message.reply_to_message:
         recipient = message.reply_to_message.from_user
-        if len(args) > 1:
-            raw_amount = args[1]
-    elif len(args) >= 3 and args[1].startswith("@"):
-        target_tag = args[1].replace("@", "").lower()
-        raw_amount = args[2]
+        if args:
+            raw_amount = args[0]
+    elif len(args) >= 2 and args[0].startswith("@"):
+        target_tag = args[0].replace("@", "").lower()
+        raw_amount = args[1]
         async with async_session() as session:
             recipient = (await session.execute(select(User).where(func.lower(User.username) == target_tag))).scalar_one_or_none()
             if not recipient:
@@ -707,7 +715,7 @@ async def cmd_tip(message: types.Message):
         if sender.balance < amount:
             return await message.answer(f"❌ Insufficient balance! You have {fmt_money(sender.balance, sender.currency)}.")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="Confirm ✅", callback_data=f"tip_yes_{target_id}_{amount}"),
             InlineKeyboardButton(text="Cancel ❌", callback_data=f"tip_no_{target_id}_{amount}")
@@ -719,25 +727,25 @@ async def cmd_tip(message: types.Message):
         parse_mode="HTML"
     )
 
-@router.callback_query(F.data.startswith("tip_"))
-async def cb_tip_action(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
+async def cb_tip_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split("_")
     action = parts[1]
     target_id = int(parts[2])
     amount = float(parts[3])
-    sender_id = callback.from_user.id
+    sender_id = query.from_user.id
 
     if action == "no":
-        await callback.message.edit_text(
-            f"Tip transaction cancel refund to your account\nFrom » @{callback.from_user.username or callback.from_user.first_name}\nTo » @{target_id}\nAmount » ₹{amount:.2f}",
+        await query.message.edit_text(
+            f"Tip transaction cancel refund to your account\nFrom » @{query.from_user.username or query.from_user.first_name}\nTo » @{target_id}\nAmount » ₹{amount:.2f}",
             parse_mode="HTML"
         )
-        return await callback.answer("Tip cancelled.")
+        return await query.answer("Tip cancelled.")
 
     async with async_session() as session:
         sender = await get_user(session, sender_id)
         if sender.balance < amount:
-            return await callback.answer("Insufficient balance!", show_alert=True)
+            return await query.answer("Insufficient balance!", show_alert=True)
         sender.balance -= amount
         
         rec_user = await get_user(session, target_id)
@@ -745,26 +753,28 @@ async def cb_tip_action(callback: types.CallbackQuery):
         await session.commit()
         new_bal = rec_user.balance
 
-    await callback.message.edit_text(
-        f"🏆 <b>Tip Sent!</b>\nFrom » @{callback.from_user.username or callback.from_user.first_name}\nTo » @{target_id}\nAmount » ₹{amount:.2f}",
+    await query.message.edit_text(
+        f"🏆 <b>Tip Sent!</b>\nFrom » @{query.from_user.username or query.from_user.first_name}\nTo » @{target_id}\nAmount » ₹{amount:.2f}",
         parse_mode="HTML"
     )
     try:
-        await callback.bot.send_message(
+        await context.bot.send_message(
             target_id,
-            f"🏆 <b>You received a tip!</b>\n👤 From: @{callback.from_user.username or callback.from_user.first_name}\n💵 Amount: ₹{amount:.2f}\n\n🏦 New Balance: ₹{new_bal:.2f}\nUse /wallet to view your balance.",
+            f"🏆 <b>You received a tip!</b>\n👤 From: @{query.from_user.username or query.from_user.first_name}\n💵 Amount: ₹{amount:.2f}\n\n🏦 New Balance: ₹{new_bal:.2f}\nUse /wallet to view your balance.",
             parse_mode="HTML"
         )
     except Exception:
         pass
-    await callback.answer("Tip sent successfully!")
+    await query.answer("Tip sent successfully!")
 
-@router.message(Command("escrow"))
-async def cmd_escrow(message: types.Message):
+async def cmd_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     if not message.reply_to_message:
         return await message.answer("Usage: Reply to a user with <code>/escrow [amount]</code>", parse_mode="HTML")
-    args = message.text.split()
-    if len(args) < 2:
+    args = context.args
+    if not args:
         return await message.answer("Please specify escrow amount.", parse_mode="HTML")
     
     sender_id = message.from_user.id
@@ -774,13 +784,13 @@ async def cmd_escrow(message: types.Message):
 
     async with async_session() as session:
         sender = await get_user(session, sender_id)
-        amount = await parse_stake(sender, args[1])
+        amount = await parse_stake(sender, args[0])
         if not amount or amount <= 0 or sender.balance < amount:
             return await message.answer("❌ Insufficient balance for escrow.", parse_mode="HTML")
         sender.balance -= amount
         await session.commit()
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="Release 🟢", callback_data=f"esc_rel_{target_user.id}_{amount}"),
             InlineKeyboardButton(text="Cancel 🔴", callback_data=f"esc_can_{sender_id}_{target_user.id}_{amount}"),
@@ -793,12 +803,12 @@ async def cmd_escrow(message: types.Message):
         parse_mode="HTML"
     )
 
-@router.callback_query(F.data.startswith("esc_"))
-async def cb_escrow(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
+async def cb_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split("_")
     action = parts[1]
     if action == "help":
-        return await callback.answer("Escrow holds funds securely between two players until released.", show_alert=True)
+        return await query.answer("Escrow holds funds securely between two players until released.", show_alert=True)
     
     if action == "rel":
         target_id = int(parts[2])
@@ -807,104 +817,103 @@ async def cb_escrow(callback: types.CallbackQuery):
             target = await get_user(session, target_id)
             target.balance += amount
             await session.commit()
-        await callback.message.edit_text(f"✅ Escrow released! ₹{amount:.2f} credited to @{target.username or target.first_name}.", parse_mode="HTML")
-        await callback.answer("Released!")
+        await query.message.edit_text(f"✅ Escrow released! ₹{amount:.2f} credited to @{target.username or target.first_name}.", parse_mode="HTML")
+        await query.answer("Released!")
     elif action == "can":
         maker_id = int(parts[2])
         amount = float(parts[4])
-        if callback.from_user.id not in [maker_id, int(parts[3])] and callback.from_user.id not in ADMINS:
-            return await callback.answer("Unauthorized.", show_alert=True)
+        if query.from_user.id not in [maker_id, int(parts[3])] and query.from_user.id not in ADMINS:
+            return await query.answer("Unauthorized.", show_alert=True)
         async with async_session() as session:
             maker = await get_user(session, maker_id)
             maker.balance += amount
             await session.commit()
-        await callback.message.edit_text(f"❌ Escrow cancelled. ₹{amount:.2f} refunded to maker.", parse_mode="HTML")
-        await callback.answer("Cancelled.")
+        await query.message.edit_text(f"❌ Escrow cancelled. ₹{amount:.2f} refunded to maker.", parse_mode="HTML")
+        await query.answer("Cancelled.")
 
-@router.message(Command("claim"))
-async def cmd_claim(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.answer("Usage: <code>/claim [GIFT_CODE]</code>", parse_mode="HTML")
-    code = args[1].strip()
+async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    args = context.args
+    if not args:
+        return await update.message.answer("Usage: <code>/claim [GIFT_CODE]</code>", parse_mode="HTML")
+    code = args[0].strip()
 
     async with async_session() as session:
         gift = await session.get(GiftCode, code)
         if not gift or gift.is_claimed:
-            return await message.answer("❌ Invalid or already claimed gift code.")
+            return await update.message.answer("❌ Invalid or already claimed gift code.")
         
         gift.is_claimed = True
-        gift.claimed_by = message.from_user.id
-        user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
+        gift.claimed_by = update.message.from_user.id
+        user = await get_user(session, update.message.from_user.id, update.message.from_user.username, update.message.from_user.first_name)
         user.balance += gift.amount
         await session.commit()
         new_bal = user.balance
 
-    await message.answer(f"🎉 <b>Gift Code Claimed!</b>\n\n💵 Amount Credited: <b>₹{gift.amount:.2f}</b>\n🏦 Your New Balance: <b>₹{new_bal:.2f}</b>", parse_mode="HTML")
-    await send_log(message.bot, f"🎟️ <b>Gift Claimed</b>: Code <code>{code}</code> claimed by @{message.from_user.username} for ₹{gift.amount:.2f}")
+    await update.message.answer(f"🎉 <b>Gift Code Claimed!</b>\n\n💵 Amount Credited: <b>₹{gift.amount:.2f}</b>\n🏦 Your New Balance: <b>₹{new_bal:.2f}</b>", parse_mode="HTML")
+    await send_log(context.bot, f"🎟️ <b>Gift Claimed</b>: Code <code>{code}</code> claimed by @{update.message.from_user.username} for ₹{gift.amount:.2f}")
 
-@router.message(Command("deposit"))
-async def start_deposit_flow(message: types.Message, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+async def cmd_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="INR ₹", callback_data="dep_INR"), InlineKeyboardButton(text="BSC (BEP20)", callback_data="dep_BEP20")],
         [InlineKeyboardButton(text="SOLANA", callback_data="dep_SOLANA"), InlineKeyboardButton(text="ETHERIUM", callback_data="dep_ETHEREUM")]
     ])
-    await message.answer("⬇️ <b>Deposit</b>\n\nHow much do you want to deposit?\nMin: ₹50. Type 5 for USDT or ₹500 for INR.", reply_markup=kb, parse_mode="HTML")
-    await state.set_state(DepositStates.waiting_for_amount)
+    await update.message.answer("⬇️ <b>Deposit</b>\n\nHow much do you want to deposit?\nMin: ₹50. Type 5 for USDT or ₹500 for INR.", reply_markup=kb, parse_mode="HTML")
+    return DEP_AMOUNT
 
-@router.callback_query(F.data.startswith("dep_"), DepositStates.waiting_for_amount)
-async def choose_deposit_gateway(callback: types.CallbackQuery, state: FSMContext):
-    method = callback.data.split("_")[1]
-    await state.update_data(deposit_method=method)
-    await callback.message.answer(f"Enter deposit amount for {method}:", parse_mode="HTML")
-    await callback.answer()
+async def choose_deposit_gateway(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    method = query.data.split("_")[1]
+    context.user_data["deposit_method"] = method
+    await query.message.answer(f"Enter deposit amount for {method}:", parse_mode="HTML")
+    await query.answer()
+    return DEP_AMOUNT
 
-@router.message(DepositStates.waiting_for_amount)
-async def process_deposit_amount(message: types.Message, state: FSMContext):
+async def process_deposit_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = float(message.text.strip())
+        amount = float(update.message.text.strip())
     except ValueError:
-        return await message.answer("❌ Invalid amount format.", parse_mode="HTML")
+        await update.message.answer("❌ Invalid amount format.", parse_mode="HTML")
+        return DEP_AMOUNT
 
-    data = await state.get_data()
-    method = data.get("deposit_method", "INR")
+    method = context.user_data.get("deposit_method", "INR")
+    context.user_data["deposit_amount"] = amount
 
-    await state.update_data(deposit_amount=amount)
-    await state.set_state(DepositStates.waiting_for_proof)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="I have paid ✔️", callback_data="dep_paid_confirm")]
     ])
-    await message.answer(
+    await update.message.answer(
         f"⬇️ Deposit — {method}\n\nAmount: ₹{amount}\nAddress / ID:\n<code>{UPI_ADDRESS}</code>\n\nAfter paying, press ✅ I've Paid.",
         reply_markup=kb,
         parse_mode="HTML"
     )
+    return DEP_PROOF
 
-@router.callback_query(F.data == "dep_paid_confirm")
-async def cb_dep_paid(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(DepositStates.waiting_for_proof)
-    await callback.message.answer("⬇️ <b>Step 1/2 — UTR Number</b>\n\nSend your UTR / Transaction ID\n(12-digit number from your UPI app)", parse_mode="HTML")
-    await callback.answer()
+async def cb_dep_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.answer("⬇️ <b>Step 1/2 — UTR Number</b>\n\nSend your UTR / Transaction ID\n(12-digit number from your UPI app)", parse_mode="HTML")
+    await query.answer()
+    return DEP_PROOF
 
-@router.message(DepositStates.waiting_for_proof)
-async def process_deposit_utr(message: types.Message, state: FSMContext):
-    utr = message.text.strip()
+async def process_deposit_utr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    utr = update.message.text.strip()
     if not (utr.isdigit() and len(utr) == 12):
-        return await message.answer("❌ Please send a valid 12-digit UTR number.")
+        await update.message.answer("❌ Please send a valid 12-digit UTR number.")
+        return DEP_PROOF
     
-    await state.update_data(deposit_proof=utr)
-    await state.set_state(DepositStates.waiting_for_photo)
-    await message.answer(f"✅ UTR saved: {utr}\n\n⬇️ <b>Step 2/2 — Payment Screenshot</b>\n\nNow send the screenshot of your payment.", parse_mode="HTML")
+    context.user_data["deposit_proof"] = utr
+    await update.message.answer(f"✅ UTR saved: {utr}\n\n⬇️ <b>Step 2/2 — Payment Screenshot</b>\n\nNow send the screenshot of your payment.", parse_mode="HTML")
+    return DEP_PHOTO
 
-@router.message(F.photo, DepositStates.waiting_for_photo)
-async def process_deposit_screenshot(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    amount = data.get("deposit_amount", 0.0)
-    method = data.get("deposit_method", "INR")
-    proof = data.get("deposit_proof", "N/A")
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
+async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount = context.user_data.get("deposit_amount", 0.0)
+    method = context.user_data.get("deposit_method", "INR")
+    proof = context.user_data.get("deposit_proof", "N/A")
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or update.message.from_user.first_name
 
     async with async_session() as session:
         tx = Transaction(
@@ -920,14 +929,13 @@ async def process_deposit_screenshot(message: types.Message, state: FSMContext):
         await session.refresh(tx)
         tx_id = tx.id
 
-    await state.clear()
-    await message.answer(
+    await update.message.answer(
         f"✅ <b>Deposit proof submitted!</b>\n\n💵 Amount: ₹{amount}\n📍 UTR: {proof}\n\n⌛ Deposit will be credited automatically. It may take 3-5 minutes.",
         parse_mode="HTML"
     )
-    await send_log(message.bot, f"📥 <b>New Deposit #{tx_id}</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount} ({method})\nRef: `{proof}`")
+    await send_log(context.bot, f"📥 <b>New Deposit #{tx_id}</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount} ({method})\nRef: `{proof}`")
 
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+    admin_kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="✅ Approve 🟢", callback_data=f"adm_dep_yes_{tx_id}"),
             InlineKeyboardButton(text="❌ Reject 🔴", callback_data=f"adm_dep_no_{tx_id}")
@@ -935,7 +943,7 @@ async def process_deposit_screenshot(message: types.Message, state: FSMContext):
     ])
     for adm in ADMINS:
         try:
-            await message.bot.send_message(
+            await context.bot.send_message(
                 adm,
                 f"🚨 <b>New Deposit Request [#{tx_id}]</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount}\nRef: `{proof}`",
                 reply_markup=admin_kb,
@@ -943,45 +951,48 @@ async def process_deposit_screenshot(message: types.Message, state: FSMContext):
             )
         except Exception:
             pass
+    return ConversationHandler.END
 
-@router.message(Command("withdraw"))
-async def cmd_withdraw(message: types.Message, state: FSMContext):
+async def cmd_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     user_id = message.from_user.id
     async with async_session() as session:
         user = await get_user(session, user_id)
         if user.balance <= 0:
-            return await message.answer("❌ You have zero available balance for withdrawal.")
+            await message.answer("❌ You have zero available balance for withdrawal.")
+            return ConversationHandler.END
 
-    args = message.text.split()
-    if len(args) > 1:
-        req_amount = await parse_stake(user, args[1])
+    args = context.args
+    if args:
+        req_amount = await parse_stake(user, args[0])
         if req_amount and 0 < req_amount <= user.balance:
-            await execute_withdrawal(message, state, message.from_user, req_amount, user.payout_address or "Not Set")
-            return
+            await execute_withdrawal(message, context, message.from_user, req_amount, user.payout_address or "Not Set")
+            return ConversationHandler.END
 
-    await state.set_state(WithdrawStates.waiting_for_amount)
     await message.answer("📤 Enter amount to withdraw:", parse_mode="HTML")
+    return WD_AMOUNT
 
-@router.message(WithdrawStates.waiting_for_amount)
-async def process_withdraw_amount(message: types.Message, state: FSMContext):
+async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
-        amount = await parse_stake(user, message.text)
+        user = await get_user(session, update.message.from_user.id)
+        amount = await parse_stake(user, update.message.text)
         if not amount or amount <= 0 or amount > user.balance:
-            return await message.answer("❌ Invalid or insufficient amount.")
+            await update.message.answer("❌ Invalid or insufficient amount.")
+            return WD_AMOUNT
     
-    await state.update_data(withdraw_amount=amount)
-    await state.set_state(WithdrawStates.waiting_for_address)
-    await message.answer("Send your payout address / UPI ID:", parse_mode="HTML")
+    context.user_data["withdraw_amount"] = amount
+    await update.message.answer("Send your payout address / UPI ID:", parse_mode="HTML")
+    return WD_ADDRESS
 
-@router.message(WithdrawStates.waiting_for_address)
-async def process_withdraw_address(message: types.Message, state: FSMContext):
-    address = message.text.strip()
-    data = await state.get_data()
-    amount = data.get("withdraw_amount")
-    await execute_withdrawal(message, state, message.from_user, amount, address)
+async def process_withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = update.message.text.strip()
+    amount = context.user_data.get("withdraw_amount")
+    await execute_withdrawal(update.message, context, update.message.from_user, amount, address)
+    return ConversationHandler.END
 
-async def execute_withdrawal(message: types.Message, state: FSMContext, user_obj: types.User, amount: float, address: str):
+async def execute_withdrawal(message, context, user_obj, amount: float, address: str):
     user_id = user_obj.id
     username = user_obj.username or user_obj.first_name
     fee = amount * WITHDRAWAL_FEE_PCT
@@ -990,7 +1001,8 @@ async def execute_withdrawal(message: types.Message, state: FSMContext, user_obj
     async with async_session() as session:
         user = await get_user(session, user_id)
         if user.balance < amount:
-            return await message.answer("❌ Insufficient balance.")
+            await message.answer("❌ Insufficient balance.")
+            return
         user.balance -= amount
         BOT_STATE["house_balance"] += fee
 
@@ -1006,11 +1018,10 @@ async def execute_withdrawal(message: types.Message, state: FSMContext, user_obj
         await session.commit()
         tx_id = tx.id
 
-    await state.clear()
     await message.answer(f"⏳ Withdrawal request #{tx_id} submitted. 2% fee applied.", parse_mode="HTML")
-    await send_log(message.bot, f"📤 <b>Withdrawal Request [#{tx_id}]</b>\nUser: @{username}\nAmount: ₹{net_amount:.2f} (Fee: ₹{fee:.2f})")
+    await send_log(context.bot, f"📤 <b>Withdrawal Request [#{tx_id}]</b>\nUser: @{username}\nAmount: ₹{net_amount:.2f} (Fee: ₹{fee:.2f})")
 
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+    admin_kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(text="✅ Approve 🟢", callback_data=f"adm_wd_yes_{tx_id}"),
             InlineKeyboardButton(text="❌ Reject 🔴", callback_data=f"adm_wd_no_{tx_id}")
@@ -1018,26 +1029,32 @@ async def execute_withdrawal(message: types.Message, state: FSMContext, user_obj
     ])
     for adm in ADMINS:
         try:
-            await message.bot.send_message(adm, f"🚨 Withdrawal #{tx_id} from @{username} for ₹{net_amount:.2f}", reply_markup=admin_kb, parse_mode="HTML")
+            await context.bot.send_message(adm, f"🚨 Withdrawal #{tx_id} from @{username} for ₹{net_amount:.2f}", reply_markup=admin_kb, parse_mode="HTML")
         except Exception:
             pass
 
-async def create_pvp_challenge(message: types.Message, game: str, emoji: str):
+async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE, game: str, emoji: str):
+    if not await security_middleware(update, context):
+        return
+    message = update.message
     if message.chat.type not in ["group", "supergroup"]:
-        return await message.answer(f"{emoji} PvP games are restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
+        await message.answer(f"{emoji} PvP games are restricted to the official group!", reply_markup=get_channel_lock_kb(), parse_mode="HTML")
+        return
 
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.answer(f"Usage: <code>/{game} [amount] [rounds]</code>", parse_mode="HTML")
+    args = context.args
+    if not args:
+        await message.answer(f"Usage: <code>/{game} [amount] [rounds]</code>", parse_mode="HTML")
+        return
 
-    raw_amount = args[1]
-    rounds = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
+    raw_amount = args[0]
+    rounds = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
 
     async with async_session() as session:
         user = await get_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name)
         bet = await parse_stake(user, raw_amount)
         if not bet or bet <= 0 or user.balance < bet:
-            return await message.answer("❌ Invalid or insufficient bet amount.")
+            await message.answer("❌ Invalid or insufficient bet amount.")
+            return
         
         user.balance -= bet
         user.total_wagered += bet
@@ -1058,7 +1075,7 @@ async def create_pvp_challenge(message: types.Message, game: str, emoji: str):
         "chat_id": message.chat.id
     }
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text=f"⚔️ Accept ({fmt_money(bet, 'INR')}) 🟢", callback_data=f"pvp_acc_{c_id}")],
         [InlineKeyboardButton(text="❌ Cancel 🔴", callback_data=f"pvp_can_{c_id}")]
     ])
@@ -1071,45 +1088,39 @@ async def create_pvp_challenge(message: types.Message, game: str, emoji: str):
         parse_mode="HTML"
     )
 
-@router.message(Command("dice"))
-async def cmd_dice(message: types.Message):
-    await create_pvp_challenge(message, "dice", "🎲")
+async def cmd_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "dice", "🎲")
 
-@router.message(Command("darts"))
-async def cmd_darts(message: types.Message):
-    await create_pvp_challenge(message, "darts", "🎯")
+async def cmd_darts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "darts", "🎯")
 
-@router.message(Command("bowling"))
-async def cmd_bowling(message: types.Message):
-    await create_pvp_challenge(message, "bowling", "🎳")
+async def cmd_bowling(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "bowling", "🎳")
 
-@router.message(Command("basket"))
-async def cmd_basket(message: types.Message):
-    await create_pvp_challenge(message, "basket", "🏀")
+async def cmd_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "basket", "🏀")
 
-@router.message(Command("football"))
-async def cmd_football(message: types.Message):
-    await create_pvp_challenge(message, "football", "⚽")
+async def cmd_football(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "football", "⚽")
 
-@router.message(Command("slots"))
-async def cmd_slots(message: types.Message):
-    await create_pvp_challenge(message, "slots", "🎰")
+async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "slots", "🎰")
 
-@router.message(Command("coin"))
-async def cmd_coin(message: types.Message):
-    await create_pvp_challenge(message, "coin", "🪙")
+async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_pvp_challenge(update, context, "coin", "🪙")
 
-@router.message(Command("7up"))
-async def cmd_7up(message: types.Message):
-    args = message.text.split()
-    if len(args) < 3:
-        return await message.answer("Usage: <code>/7up [up/down] [amount]</code>", parse_mode="HTML")
-    choice = args[1].lower()
+async def cmd_7up(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    args = context.args
+    if len(args) < 2:
+        return await update.message.answer("Usage: <code>/7up [up/down] [amount]</code>", parse_mode="HTML")
+    choice = args[0].lower()
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
-        bet = await parse_stake(user, args[2])
+        user = await get_user(session, update.message.from_user.id)
+        bet = await parse_stake(user, args[1])
         if not bet or user.balance < bet:
-            return await message.answer("❌ Invalid bet.")
+            return await update.message.answer("❌ Invalid bet.")
         user.balance -= bet
         await session.commit()
     
@@ -1121,25 +1132,26 @@ async def cmd_7up(message: types.Message):
     if won:
         payout = bet * 1.92
         async with async_session() as session:
-            u = await get_user(session, message.from_user.id)
+            u = await get_user(session, update.message.from_user.id)
             u.balance += payout
             await session.commit()
-        await message.answer(f"🎲 7UP Result: {roll1} + {roll2} = {total} ({res.upper()}). You WON ₹{payout:.2f}!", parse_mode="HTML")
+        await update.message.answer(f"🎲 7UP Result: {roll1} + {roll2} = {total} ({res.upper()}). You WON ₹{payout:.2f}!", parse_mode="HTML")
     else:
         BOT_STATE["house_balance"] += bet
-        await message.answer(f"🎲 7UP Result: {roll1} + {roll2} = {total} ({res.upper()}). You lost ₹{bet:.2f}.", parse_mode="HTML")
+        await update.message.answer(f"🎲 7UP Result: {roll1} + {roll2} = {total} ({res.upper()}). You lost ₹{bet:.2f}.", parse_mode="HTML")
 
-@router.message(Command("dr"))
-async def cmd_dr(message: types.Message):
-    args = message.text.split()
-    if len(args) < 3:
-        return await message.answer("Usage: <code>/dr [low/high/odd/even] [amount]</code>", parse_mode="HTML")
-    choice = args[1].lower()
+async def cmd_dr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    args = context.args
+    if len(args) < 2:
+        return await update.message.answer("Usage: <code>/dr [low/high/odd/even] [amount]</code>", parse_mode="HTML")
+    choice = args[0].lower()
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
-        bet = await parse_stake(user, args[2])
+        user = await get_user(session, update.message.from_user.id)
+        bet = await parse_stake(user, args[1])
         if not bet or user.balance < bet:
-            return await message.answer("❌ Invalid bet.")
+            return await update.message.answer("❌ Invalid bet.")
         user.balance -= bet
         await session.commit()
 
@@ -1153,35 +1165,36 @@ async def cmd_dr(message: types.Message):
     if won:
         payout = bet * 1.92
         async with async_session() as session:
-            u = await get_user(session, message.from_user.id)
+            u = await get_user(session, update.message.from_user.id)
             u.balance += payout
             await session.commit()
-        await message.answer(f"🎲 Dice Rush landed on {val}. You won ₹{payout:.2f}!", parse_mode="HTML")
+        await update.message.answer(f"🎲 Dice Rush landed on {val}. You won ₹{payout:.2f}!", parse_mode="HTML")
     else:
         BOT_STATE["house_balance"] += bet
-        await message.answer(f"📉 Dice Rush landed on {val}. ₹{bet:.2f} lost.", parse_mode="HTML")
+        await update.message.answer(f"📉 Dice Rush landed on {val}. ₹{bet:.2f} lost.", parse_mode="HTML")
 
-@router.message(Command("odice"))
-async def cmd_odice(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.answer("Usage: <code>/odice [amount]</code>", parse_mode="HTML")
+async def cmd_odice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await security_middleware(update, context):
+        return
+    args = context.args
+    if not args:
+        return await update.message.answer("Usage: <code>/odice [amount]</code>", parse_mode="HTML")
     async with async_session() as session:
-        user = await get_user(session, message.from_user.id)
-        bet = await parse_stake(user, args[1])
+        user = await get_user(session, update.message.from_user.id)
+        bet = await parse_stake(user, args[0])
         if not bet or user.balance < bet:
-            return await message.answer("❌ Invalid bet.")
+            return await update.message.answer("❌ Invalid bet.")
         user.balance -= bet
         await session.commit()
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="Heads 🪙", callback_data=f"odice_h_{bet}"), InlineKeyboardButton(text="Tails 🪙", callback_data=f"odice_t_{bet}")]
     ])
-    await message.answer("🏟️ Open Match — /odice\nPick side for toss:", reply_markup=kb, parse_mode="HTML")
+    await update.message.answer("🏟️ Open Match — /odice\nPick side for toss:", reply_markup=kb, parse_mode="HTML")
 
-@router.callback_query(F.data.startswith("odice_"))
-async def cb_odice(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
+async def cb_odice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split("_")
     bet = float(parts[2])
     side = parts[1]
     toss = random.choice(["h", "t"])
@@ -1190,63 +1203,65 @@ async def cb_odice(callback: types.CallbackQuery):
     if won:
         payout = bet * 1.92 * 0.97  # 3% fee
         async with async_session() as session:
-            u = await get_user(session, callback.from_user.id)
+            u = await get_user(session, query.from_user.id)
             u.balance += payout
             await session.commit()
-        await callback.message.edit_text(f"🏏 Toss won! You batted and won ₹{payout:.2f}.", parse_mode="HTML")
+        await query.message.edit_text(f"🏏 Toss won! You batted and won ₹{payout:.2f}.", parse_mode="HTML")
     else:
         BOT_STATE["house_balance"] += bet * 0.97
-        await callback.message.edit_text("🏏 Toss lost! Bowled out.", parse_mode="HTML")
-    await callback.answer()
+        await query.message.edit_text("🏏 Toss lost! Bowled out.", parse_mode="HTML")
+    await query.answer()
 
-@router.callback_query(F.data.startswith("pvp_can_"))
-async def cb_cancel_pvp(callback: types.CallbackQuery):
-    c_id = int(callback.data.split("_")[2])
+async def cb_cancel_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    c_id = int(query.data.split("_")[2])
     if c_id not in ACTIVE_CHALLENGES:
-        return await callback.answer("Expired.", show_alert=True)
+        return await query.answer("Expired.", show_alert=True)
     challenge = ACTIVE_CHALLENGES.pop(c_id)
     async with async_session() as session:
         user = await get_user(session, challenge["challenger_id"])
         user.balance += challenge["amount"]
         await session.commit()
-    await callback.message.edit_text("❌ Challenge cancelled & refunded.", parse_mode="HTML")
-    await callback.answer("Cancelled.")
+    await query.message.edit_text("❌ Challenge cancelled & refunded.", parse_mode="HTML")
+    await query.answer("Cancelled.")
 
-@router.callback_query(F.data.startswith("pvp_acc_"))
-async def cb_accept_pvp(callback: types.CallbackQuery):
-    c_id = int(callback.data.split("_")[2])
+async def cb_accept_pvp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    c_id = int(query.data.split("_")[2])
     if c_id not in ACTIVE_CHALLENGES:
-        return await callback.answer("Challenge no longer available.", show_alert=True)
+        return await query.answer("Challenge no longer available.", show_alert=True)
     challenge = ACTIVE_CHALLENGES.pop(c_id)
-    acceptor_id = callback.from_user.id
+    acceptor_id = query.from_user.id
     if challenge["challenger_id"] == acceptor_id:
-        return await callback.answer("Cannot play against yourself.", show_alert=True)
+        return await query.answer("Cannot play against yourself.", show_alert=True)
 
     bet = challenge["amount"]
     async with async_session() as session:
-        acc = await get_user(session, acceptor_id, callback.from_user.username, callback.from_user.first_name)
+        acc = await get_user(session, acceptor_id, query.from_user.username, query.from_user.first_name)
         if acc.balance < bet:
-            return await callback.answer("Insufficient balance.", show_alert=True)
+            return await query.answer("Insufficient balance.", show_alert=True)
         acc.balance -= bet
         await session.commit()
 
     ACTIVE_MATCHES[c_id] = {
         **challenge,
         "acceptor_id": acceptor_id,
-        "acceptor_name": callback.from_user.username or callback.from_user.first_name,
+        "acceptor_name": query.from_user.username or query.from_user.first_name,
         "p1_score": 0, "p2_score": 0, "round": 1
     }
 
-    await callback.message.edit_text(
+    await query.message.edit_text(
         f"ROOM ID~ #{c_id:04d}\n"
-        f"Match commenced! @{challenge['challenger_name']} vs @{callback.from_user.username or callback.from_user.first_name}\n\n"
+        f"Match commenced! @{challenge['challenger_name']} vs @{query.from_user.username or query.from_user.first_name}\n\n"
         f"@{challenge['challenger_name']} SEND: {challenge['emoji']} 1/{challenge['rounds']}",
         parse_mode="HTML"
     )
-    await callback.answer()
+    await query.answer()
 
-@router.message(F.dice)
-async def handle_native_dice(message: types.Message):
+async def handle_native_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message.dice:
+        return
     chat_id = message.chat.id
     user_id = message.from_user.id
     val = message.dice.value
@@ -1265,11 +1280,11 @@ async def handle_native_dice(message: types.Message):
     
     if is_p1:
         match["p1_score"] += val
-        await message.reply(f"🏆 Round {match['round']}: @{match['challenger_name']} ✅ ({val})", parse_mode="HTML")
+        await message.reply_text(f"🏆 Round {match['round']}: @{match['challenger_name']} ✅ ({val})", parse_mode="HTML")
         match["turn"] = match["acceptor_id"]
     else:
         match["p2_score"] += val
-        await message.reply(f"🏆 Round {match['round']}: @{match['acceptor_name']} ✅ ({val})", parse_mode="HTML")
+        await message.reply_text(f"🏆 Round {match['round']}: @{match['acceptor_name']} ✅ ({val})", parse_mode="HTML")
 
         if match["round"] < match["rounds"]:
             match["round"] += 1
@@ -1294,7 +1309,7 @@ async def handle_native_dice(message: types.Message):
                     u1.balance += bet
                     u2.balance += bet
                     await session.commit()
-                return await message.reply("🤝 IT'S A TIE!\nBoth rolled the same value.\nThrow the required emoji again.", parse_mode="HTML")
+                return await message.reply_text("🤝 IT'S A TIE!\nBoth rolled the same value.\nThrow the required emoji again.", parse_mode="HTML")
 
             async with async_session() as session:
                 w = await get_user(session, winner_id)
@@ -1303,18 +1318,17 @@ async def handle_native_dice(message: types.Message):
                 new_b = w.balance
 
             BOT_STATE["house_balance"] += bet * 0.08
-            await message.reply(f"🏆 {winner_name} wins {match['round']}-{match['round']}!\n₹{payout:.2f} (1.92x) credited.\nNew Balance: ₹{new_b:.2f}", parse_mode="HTML")
+            await message.reply_text(f"🏆 {winner_name} wins {match['round']}-{match['round']}!\n₹{payout:.2f} (1.92x) credited.\nNew Balance: ₹{new_b:.2f}", parse_mode="HTML")
 
-@router.message(Command("hb"))
-async def cmd_hb(message: types.Message):
-    if message.from_user.id not in ADMINS:
-        return await message.answer("⛔ Admins only.")
+async def cmd_hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS:
+        return await update.message.answer("⛔ Admins only.")
     async with async_session() as session:
         total_users = (await session.execute(select(func.count(User.telegram_id)))).scalar() or 0
         total_bal = (await session.execute(select(func.sum(User.balance)))).scalar() or 0.0
         total_wagered = (await session.execute(select(func.sum(User.total_wagered)))).scalar() or 0.0
 
-    await message.answer(
+    await update.message.answer(
         f"🏦 House Balance: ${BOT_STATE['house_balance']:.2f}\n"
         f"Bets: allowed ✔️\n"
         f"Total Users: {total_users}\n"
@@ -1323,38 +1337,37 @@ async def cmd_hb(message: types.Message):
         parse_mode="HTML"
     )
 
-@router.message(Command("panel", "admincommands"))
-async def cmd_panel(message: types.Message):
-    if message.from_user.id not in ADMINS:
-        return await message.answer("⛔ Admins only.")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS:
+        return await update.message.answer("⛔ Admins only.")
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="Pending Requests", callback_data="adm_pending"), InlineKeyboardButton(text="Users", callback_data="adm_users")]
     ])
-    await message.answer("👑 Admin Control Panel", reply_markup=kb, parse_mode="HTML")
+    await update.message.answer("👑 Admin Control Panel", reply_markup=kb, parse_mode="HTML")
 
-@router.callback_query(F.data == "adm_pending")
-async def cb_adm_pending(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+async def cb_adm_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMINS:
         return
     async with async_session() as session:
         txs = (await session.execute(select(Transaction).where(Transaction.status == "PENDING"))).scalars().all()
     if not txs:
-        return await callback.message.edit_text("No pending requests.")
+        return await query.message.edit_text("No pending requests.")
     for tx in txs[:5]:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(text="Approve", callback_data=f"adm_dep_yes_{tx.id}"), InlineKeyboardButton(text="Reject", callback_data=f"adm_dep_no_{tx.id}")]
         ])
-        await callback.message.answer(f"TX #{tx.id} | Type: {tx.type} | Amt: ₹{tx.amount}", reply_markup=kb)
-    await callback.answer()
+        await query.message.answer(f"TX #{tx.id} | Type: {tx.type} | Amt: ₹{tx.amount}", reply_markup=kb)
+    await query.answer()
 
-@router.callback_query(F.data.startswith("adm_dep_yes_"))
-async def cb_approve_dep(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+async def cb_approve_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMINS:
         return
-    tx_id = int(callback.data.split("_")[3])
+    tx_id = int(query.data.split("_")[3])
     async with async_session() as session:
         tx = await session.get(Transaction, tx_id)
-        if not tx: return await callback.answer("Not found.")
+        if not tx: return await query.answer("Not found.")
         tx.status = "APPROVED"
         user = await get_user(session, tx.telegram_id)
         user.balance += tx.amount
@@ -1365,73 +1378,165 @@ async def cb_approve_dep(callback: types.CallbackQuery):
         amt = tx.amount
 
     try:
-        await callback.bot.send_message(
+        await context.bot.send_message(
             uid,
             f"🏆 Deposit Approved!\n\n💵 Credited: ₹{amt}\n🏦 Balance: ₹{new_b:.2f}\n\n⚠️ Wager ₹{amt} more before withdrawing (1x deposit rule)\nPlay any game to clear it — /wagerstatus to track",
             parse_mode="HTML"
         )
     except Exception:
         pass
-    await callback.message.edit_text(f"✅ Deposit #{tx_id} approved.")
-    await callback.answer("Approved!")
+    await query.message.edit_text(f"✅ Deposit #{tx_id} approved.")
+    await query.answer("Approved!")
 
-@router.callback_query(F.data.startswith("adm_dep_no_"))
-async def cb_reject_dep(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+async def cb_reject_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMINS:
         return
-    tx_id = int(callback.data.split("_")[3])
+    tx_id = int(query.data.split("_")[3])
     async with async_session() as session:
         tx = await session.get(Transaction, tx_id)
         if tx:
             tx.status = "REJECTED"
             await session.commit()
-    await callback.message.edit_text(f"❌ Deposit #{tx_id} rejected.")
-    await callback.answer("Rejected.")
+    await query.message.edit_text(f"❌ Deposit #{tx_id} rejected.")
+    await query.answer("Rejected.")
 
-@router.message(Command("balanceadd"))
-async def cmd_balanceadd(message: types.Message):
-    if message.from_user.id not in ADMINS: return
-    args = message.text.split()
-    if len(args) < 3: return await message.answer("Usage: /balanceadd [user_id] [amount]")
-    uid, amt = int(args[1]), float(args[2])
+async def cmd_balanceadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS: return
+    args = context.args
+    if len(args) < 2: return await update.message.answer("Usage: /balanceadd [user_id] [amount]")
+    uid, amt = int(args[0]), float(args[1])
     async with async_session() as session:
         u = await get_user(session, uid)
         u.balance += amt
         await session.commit()
-    await message.answer(f"✅ Credited ₹{amt} to {uid}.")
+    await update.message.answer(f"✅ Credited ₹{amt} to {uid}.")
 
-@router.message(Command("creategift"))
-async def cmd_creategift(message: types.Message):
-    if message.from_user.id not in ADMINS: return
-    args = message.text.split()
-    if len(args) < 3: return await message.answer("Usage: /creategift [code] [amount]")
-    code, amt = args[1], float(args[2])
+async def cmd_creategift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS: return
+    args = context.args
+    if len(args) < 2: return await update.message.answer("Usage: /creategift [code] [amount]")
+    code, amt = args[0], float(args[1])
     async with async_session() as session:
         session.add(GiftCode(code=code, amount=amt))
         await session.commit()
-    await message.answer(f"✅ Gift code {code} created for ₹{amt}.")
+    await update.message.answer(f"✅ Gift code {code} created for ₹{amt}.")
 
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: types.Message):
-    if message.from_user.id not in ADMINS: return
-    text = message.text.replace("/broadcast", "").strip()
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id not in ADMINS: return
+    text = " ".join(context.args)
+    if not text:
+        return await update.message.answer("Please provide message to broadcast.")
     async with async_session() as session:
         users = (await session.execute(select(User.telegram_id))).scalars().all()
     for uid in users:
-        try: await message.bot.send_message(uid, text, parse_mode="HTML")
+        try: await context.bot.send_message(uid, text, parse_mode="HTML")
         except Exception: pass
-    await message.answer("✅ Broadcast sent.")
+    await update.message.answer("✅ Broadcast sent.")
 
-async def main():
-    await init_db()
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.message.middleware(security_middleware)
-    dp.callback_query.middleware(security_middleware)
-    dp.include_router(router)
+def main():
+    asyncio.run(init_db())
     
-    logger.info("Rolex Casino Bot started successfully.")
-    await dp.start_polling(bot)
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Conversation handler for deposits
+    deposit_conv = ConversationHandler(
+        entry_points=[CommandHandler("deposit", cmd_deposit), CallbackQueryHandler(choose_deposit_gateway, pattern="^dep_")],
+        states={
+            DEP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_deposit_amount)],
+            DEP_PROOF: [
+                CallbackQueryHandler(cb_dep_paid, pattern="^dep_paid_confirm$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_deposit_utr)
+            ],
+            DEP_PHOTO: [MessageHandler(filters.PHOTO, process_deposit_screenshot)]
+        },
+        fallbacks=[]
+    )
+
+    # Conversation handler for withdrawals
+    withdraw_conv = ConversationHandler(
+        entry_points=[CommandHandler("withdraw", cmd_withdraw)],
+        states={
+            WD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_withdraw_amount)],
+            WD_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_withdraw_address)]
+        },
+        fallbacks=[]
+    )
+
+    # Conversation handler for set wallet
+    wallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("setwallet", cmd_setwallet)],
+        states={
+            SET_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_setwallet_address)]
+        },
+        fallbacks=[]
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("support", cmd_support_msg := cmd_help))
+    app.add_handler(CommandHandler("games", cmd_games))
+    app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("bal", cmd_wallet))
+    app.add_handler(CommandHandler("wal", cmd_wallet))
+    app.add_handler(CommandHandler("changecurrency", cmd_changecurrency))
+    app.add_handler(CommandHandler("saveupi", cmd_saveupi))
+    app.add_handler(CommandHandler("refer", cmd_refer))
+    app.add_handler(CommandHandler("referral", cmd_refer))
+    app.add_handler(CommandHandler("referrals", cmd_refer))
+    app.add_handler(CommandHandler("mystats", cmd_mystats))
+    app.add_handler(CommandHandler("rank", cmd_leaderboard))
+    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    app.add_handler(CommandHandler("wagerstatus", cmd_wager))
+    app.add_handler(CommandHandler("tip", cmd_tip))
+    app.add_handler(CommandHandler("escrow", cmd_escrow))
+    app.add_handler(CommandHandler("claim", cmd_claim))
+    app.add_handler(CommandHandler("dice", cmd_dice))
+    app.add_handler(CommandHandler("darts", cmd_darts))
+    app.add_handler(CommandHandler("bowling", cmd_bowling))
+    app.add_handler(CommandHandler("basket", cmd_basket))
+    app.add_handler(CommandHandler("football", cmd_football))
+    app.add_handler(CommandHandler("slots", cmd_slots))
+    app.add_handler(CommandHandler("coin", cmd_coin))
+    app.add_handler(CommandHandler("7up", cmd_7up))
+    app.add_handler(CommandHandler("dr", cmd_dr))
+    app.add_handler(CommandHandler("odice", cmd_odice))
+    app.add_handler(CommandHandler("hb", cmd_hb))
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("admincommands", cmd_panel))
+    app.add_handler(CommandHandler("balanceadd", cmd_balanceadd))
+    app.add_handler(CommandHandler("creategift", cmd_creategift))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
+    app.add_handler(deposit_conv)
+    app.add_handler(withdraw_conv)
+    app.add_handler(wallet_conv)
+
+    # Inline Query Callbacks
+    app.add_handler(CallbackQueryHandler(cb_menu_deposit, pattern="^menu_deposit$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_withdraw, pattern="^menu_withdraw$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_wallet, pattern="^menu_wallet$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_games, pattern="^menu_games$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_referral, pattern="^menu_referral$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
+    app.add_handler(CallbackQueryHandler(cb_toggle_currency, pattern="^toggle_currency$"))
+    app.add_handler(CallbackQueryHandler(cb_setwallet, pattern="^btn_setwallet$"))
+    app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_"))
+    app.add_handler(CallbackQueryHandler(cb_tip_action, pattern="^tip_"))
+    app.add_handler(CallbackQueryHandler(cb_escrow, pattern="^esc_"))
+    app.add_handler(CallbackQueryHandler(cb_odice, pattern="^odice_"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_pvp, pattern="^pvp_can_"))
+    app.add_handler(CallbackQueryHandler(cb_accept_pvp, pattern="^pvp_acc_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_pending, pattern="^adm_pending$"))
+    app.add_handler(CallbackQueryHandler(cb_approve_dep, pattern="^adm_dep_yes_"))
+    app.add_handler(CallbackQueryHandler(cb_reject_dep, pattern="^adm_dep_no_"))
+
+    # Dice / Native game triggers
+    app.add_handler(MessageHandler(filters.Dice.ALL, handle_native_dice))
+
+    logger.info("Rolex Casino Bot started successfully using python-telegram-bot.")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
