@@ -21,7 +21,7 @@ from sqlalchemy import BigInteger, String, Float, Boolean, Column, DateTime, Int
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-# --- CONFIGURATION & ENVIRONMENT (Loaded securely from Railway Environment) ---
+# --- CONFIGURATION & ENVIRONMENT ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8673935058:AAGjyla-Im0LenfSNeyNJ5btScwcvfGI6oo")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:////data/rolex_casino.db")
 GROUP_ID = int(os.getenv("GROUP_ID", "-1004458883943"))
@@ -313,13 +313,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
     first_name = message.from_user.first_name or "Player"
 
     if message.chat.type in ["group", "supergroup"]:
-            if message.chat.type in ["group", "supergroup"]:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✨ Join Community", url=GROUP_LINK)],
             [InlineKeyboardButton(text="💬 Open Bot Chat", url=f"https://t.me/{BOT_USERNAME}")]
         ])
-        return await message.answer(
-
         return await message.answer(
             f"✨ <b>Welcome, {first_name}!</b>\n\n"
             f"‼️ <b>I'm Rolex–Casino-Bot</b>\n\n"
@@ -434,7 +431,7 @@ async def cb_menu_stats(callback: types.CallbackQuery):
 
 @router.callback_query(F.data == "menu_support")
 async def cb_menu_support(callback: types.CallbackQuery):
-    await cmd_support(callback.message)
+    await cmd_support_msg(callback.message)
     await callback.answer()
 
 @router.message(Command("help"))
