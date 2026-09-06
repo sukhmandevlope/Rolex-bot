@@ -208,8 +208,6 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ACTIVE_CHALLENGES = {}
 ACTIVE_MATCHES = {}
-ACTIVE_PVB = {}
-ACTIVE_ODICE = {}
 MATCH_COUNTER = 0
 
 def get_channel_lock_kb():
@@ -221,24 +219,6 @@ def get_channel_lock_kb():
 def get_dm_redirect_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(text="🟢 Open Bot in DM 📩", url=f"https://t.me/{BOT_USERNAME}")]
-    ])
-
-def get_main_menu_kb():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(text="🟢 Deposit", callback_data="menu_deposit"),
-            InlineKeyboardButton(text="🟢 Withdraw", callback_data="menu_withdraw")
-        ],
-        [
-            InlineKeyboardButton(text="🟢 PvP Games Arena", callback_data="menu_games"),
-            InlineKeyboardButton(text="🟢 My Wallet", callback_data="menu_wallet")
-        ],
-        [
-            InlineKeyboardButton(text="🟢 Refer & Earn (₹5)", callback_data="menu_referral"),
-            InlineKeyboardButton(text="🟢 Stats & Rank", callback_data="menu_stats")
-        ],
-        [InlineKeyboardButton(text="🟢 Official Community Group", url=GROUP_LINK)],
-        [InlineKeyboardButton(text="🟢 24/7 VIP Support", callback_data="menu_support")]
     ])
 
 async def security_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,8 +459,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /basket [amt] [rounds] — Basketball shootout\n"
         "• /football [amt] [rounds] — Football penalty kick\n"
         "• /slots [amt] [rounds] — Slots 777 duel\n"
-        "• /coin [@user] [amt] — Coin flip challenge\n"
-        "• /battle [@user] [amt] — Choose any PvP duel\n"
+        "• /coin [amt] — Coin flip challenge\n"
+        "• /battle [amt] — Choose any PvP duel\n"
         "• /wallet — View balance & stats\n"
         "• /deposit — Add funds\n"
         "• /withdraw — Request payout\n"
@@ -503,7 +483,6 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     txt = (
         "🤍 <b>AVAILABLE GAMES</b>\n\n"
-        "👋 <b>Rock • Paper • Scissors</b>\n"
         "🤑 <b>Coin Flip</b> (/coin)\n"
         "💕 <b>Dice</b> (/dice)\n"
         "😳 <b>Darts</b> (/darts)\n"
@@ -511,15 +490,8 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚽️ <b>Football</b> (/football)\n"
         "6️⃣ <b>Bowling</b> (/bowling)\n"
         "🎰 <b>Slots</b> (/slots)\n"
-        "🏰 <b>Towers</b>\n"
-        "🚀 <b>Limbo</b>\n"
-        "🎲 <b>Dice Rush</b> (/dr)\n"
-        "🎲 <b>7UP</b> (/7up)\n"
-        "🃏 <b>BlackJack</b> (/bj)\n"
-        "💣 <b>Mines</b>\n"
-        "🔒 <b>Vault</b>\n"
-        "🏏 <b>Cricket Dice</b>\n\n"
-        "<i>Interactive games will be added soon. Min bet: ₹10</i>"
+        "🎲 <b>7UP</b> (/7up)\n\n"
+        "<i>Min bet: ₹10</i>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text="🟢 Enter Official Game Group", url=GROUP_LINK)]
@@ -896,10 +868,10 @@ async def process_deposit_screenshot(update: Update, context: ContextTypes.DEFAU
         tx_id = tx.id
 
     await update.message.reply_text(
-        f"✅ <b>Deposit proof submitted successfully!</b>\n\n"
-        f"Amount: ₹{amount}\n"
-        f"UTR: {proof}\n\n"
-        f"Deposit will be credited automatically. It may take 3-5 minutes.",
+        f"✅ <b>Deposit proof submitted!</b>\n\n"
+        f"💵 Amount: ₹{amount}\n"
+        f"📍 UTR: {proof}\n\n"
+        f"⌛ Deposit will be credited automatically. It may take 3-5 minutes.",
         parse_mode="HTML"
     )
     await send_log(context.bot, f"📥 <b>New Deposit #{tx_id}</b>\nUser: @{username} (`{user_id}`)\nAmount: ₹{amount} ({method})\nRef: `{proof}`")
@@ -1068,18 +1040,7 @@ async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYP
 
     args = context.args
     if not args:
-        await message.reply_text(
-            f"Choose rounds below for {game.upper()}",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(text="🟢 1 Round", callback_data=f"pvp_rnd_{game}_1"),
-                    InlineKeyboardButton(text="🟢 2 Rounds", callback_data=f"pvp_rnd_{game}_2"),
-                    InlineKeyboardButton(text="🟢 3 Rounds", callback_data=f"pvp_rnd_{game}_3")
-                ],
-                [InlineKeyboardButton(text="🟢 Cancel", callback_data="pvp_rnd_cancel")]
-            ]),
-            parse_mode="HTML"
-        )
+        await message.reply_text(f"Usage: <code>/{game} [amount] [rounds]</code>", parse_mode="HTML")
         return
 
     raw_amount = args[0]
@@ -1128,17 +1089,6 @@ async def create_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML"
     )
 
-async def cb_pvp_rounds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    if data == "pvp_rnd_cancel":
-        return await query.message.edit_text("Cancelled.", parse_mode="HTML")
-    parts = data.split("_")
-    game = parts[2]
-    rounds = int(parts[3])
-    await query.message.edit_text(f"Selected {rounds} rounds for {game}. Now send command with amount, e.g. <code>/{game} 50 {rounds}</code>", parse_mode="HTML")
-    await query.answer()
-
 async def cmd_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await create_pvp_challenge(update, context, "dice", "🎲")
 
@@ -1163,7 +1113,7 @@ async def cmd_battle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     args = context.args
     if not args:
-        return await message.reply_text("Usage: <code>/battle [@user] [amount]</code>", parse_mode="HTML")
+        return await message.reply_text("Usage: <code>/battle [amount]</code>", parse_mode="HTML")
     await create_pvp_challenge(update, context, "dice", "🎲")
 
 async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1508,11 +1458,16 @@ async def cmd_rain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ADMINS:
         return
     args = context.args
-    if not args:
-        return await update.message.reply_text("Usage: <code>/rain [amount]</code>", parse_mode="HTML")
-    total_amt = float(args[0])
+    if len(args) < 2:
+        return await update.message.reply_text("Usage: <code>/rain [amount] [count]</code>", parse_mode="HTML")
+    try:
+        total_amt = float(args[0])
+        count = int(args[1])
+    except ValueError:
+        return await update.message.reply_text("❌ Invalid amount or count.")
+    
     async with async_session() as session:
-        users = (await session.execute(select(User))).scalars().all()
+        users = (await session.execute(select(User).order_by(desc(User.created_at)).limit(count))).scalars().all()
         if not users:
             return await update.message.reply_text("No users found to rain.")
         share = total_amt / len(users)
@@ -1596,10 +1551,11 @@ async def cb_approve_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tx.type == "DEPOSIT":
             await context.bot.send_message(
                 uid,
-                f"✅ <b>Deposit Approved!</b>\n\n"
-                f"Credited: ₹{amt}\n"
-                f"Balance: ₹{new_b:.2f}\n\n"
-                f"Wager ₹{amt} before withdrawing (1x deposit rule)\nPlay any game to clear it — /wagerstatus to track",
+                f"🏆 <b>Deposit Approved!</b>\n\n"
+                f"💵 Credited: ₹{amt}\n"
+                f"🏦 Balance: ₹{new_b:.2f}\n\n"
+                f"⚠️ Wager ₹{amt} before withdrawing (1× deposit rule)\n"
+                f"Play any game to clear it — /wagerstatus to track",
                 parse_mode="HTML"
             )
         else:
@@ -1691,7 +1647,7 @@ def main():
                 CallbackQueryHandler(cb_dep_paid, pattern="^dep_paid_confirm$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_deposit_utr)
             ],
-            DEP_PHOTO: [MessageHandler(filters.PHOTO, process_deposit_screenshot)]
+            DEP_PHOTO: [MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, process_deposit_screenshot)]
         },
         fallbacks=[]
     )
@@ -1777,7 +1733,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pvp_rounds, pattern="^pvp_rnd_"))
     app.add_handler(CallbackQueryHandler(cb_adm_pending, pattern="^adm_pending$"))
     app.add_handler(CallbackQueryHandler(cb_approve_dep, pattern="^adm_dep_yes_"))
-    app.add_handler(CallbackQueryHandler(cb_reject_dep, pattern="^adm_dep_no_"))
+    app.add_handler(CallbackHandler(cb_reject_dep, pattern="^adm_dep_no_"))
     app.add_handler(CallbackQueryHandler(cb_approve_dep, pattern="^adm_wd_yes_"))
     app.add_handler(CallbackQueryHandler(cb_reject_dep, pattern="^adm_wd_no_"))
 
