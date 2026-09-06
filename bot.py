@@ -26,7 +26,7 @@ from sqlalchemy import BigInteger, String, Float, Boolean, Column, DateTime, Int
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8673935058:AAGjyla-Im0LenfSNeyNJ5btScwcvfGI6oo")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8673935058:AAHiwc-cigA_-XuAzhj-0i0u1iIQTVp4K3w")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:////data/rolex_casino.db")
 GROUP_ID = int(os.getenv("GROUP_ID", "-1004458883943"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1004458883943"))
