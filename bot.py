@@ -1888,7 +1888,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_referral, pattern="^menu_referral$"))
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
     app.add_handler(CallbackQueryHandler(cb_menu_support, pattern="^menu_support$"))
-    app.add_handler(CallbackQueryHandler(cb_setwallet, pattern="^btn_setwallet$"))
+    app.add_handler(CallbackQueryHandler(cmd_setwallet, pattern="^btn_setwallet$"))
     app.add_handler(CallbackQueryHandler(cb_set_crypto_wallet, pattern="^set_w_s"))
     app.add_handler(CallbackQueryHandler(cb_tip_action, pattern="^tip_"))
     app.add_handler(CallbackQueryHandler(cb_odice_action, pattern="^odice_"))
