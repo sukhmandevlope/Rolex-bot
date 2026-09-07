@@ -453,6 +453,12 @@ function parseAmountAndCurrency(
   fallback: Currency,
 ): { amountMinor: number | null; currency: Currency } {
   const tokens = value?.trim().split(/\s+/).filter(Boolean) ?? [];
+  if (
+    tokens.length > 2 ||
+    (tokens.length === 2 && !isSupportedCurrency(tokens[1].toUpperCase()))
+  ) {
+    return { amountMinor: null, currency: fallback };
+  }
   const amountMinor = parseMoney(tokens[0]);
   const currency = parseCurrency(tokens[1], fallback);
   return { amountMinor, currency };
@@ -3269,7 +3275,7 @@ async function expirePvbBattle(
   if (
     !battle ||
     battle.mode !== "pvb" ||
-    !["pending_confirmation", "running"].includes(battle.status)
+      !["pending_confirmation", "running", "rolling"].includes(battle.status)
   ) {
     clearBattleTimeout(battleId);
     return;
@@ -3329,6 +3335,7 @@ async function expirePvpBattle(
           "coin_choice",
           "awaiting_player_one",
           "awaiting_player_two",
+          "rolling",
         ]),
       ),
     )
@@ -3377,6 +3384,7 @@ async function recoverPvbBattleTimeouts(resultBot: TelegramBot): Promise<void> {
       inArray(casinoChallengesTable.status, [
         "pending_confirmation",
         "running",
+          "rolling",
         "coin_choice",
         "awaiting_player_one",
         "awaiting_player_two",
@@ -3725,6 +3733,30 @@ function battleResultText(options: {
   ].join("\n");
 }
 
+function pvbRematchKeyboard(
+  battle: typeof casinoChallengesTable.$inferSelect,
+  creator: typeof casinoPlayersTable.$inferSelect,
+): { inline_keyboard: InlineKeyboardButton[][] } {
+  return {
+    inline_keyboard: [[
+      {
+        text: "🔁 Bet Again",
+        callback_data: ownedCallback(
+          `battle:rematch:${battle.id}:again`,
+          creator.telegramUserId,
+        ),
+      },
+      {
+        text: "⚡ Bet Double",
+        callback_data: ownedCallback(
+          `battle:rematch:${battle.id}:double`,
+          creator.telegramUserId,
+        ),
+      },
+    ]],
+  };
+}
+
 async function runPvpBattle(
   rollBot: TelegramBot,
   resultBot: TelegramBot,
@@ -3952,6 +3984,87 @@ async function createBattle(
     },
   );
   scheduleBattleTimeout(resultBot, battle.id);
+}
+
+async function createPvbRematch(
+  resultBot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  battleId: number,
+  multiplier: "again" | "double",
+): Promise<void> {
+  const [previousBattle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battleId),
+        eq(casinoChallengesTable.mode, "pvb"),
+        eq(casinoChallengesTable.status, "completed"),
+      ),
+    )
+    .limit(1);
+  if (!previousBattle) {
+    await resultBot.sendMessage(chatId, "That PVB result is no longer available for a rematch.");
+    return;
+  }
+
+  const [creator] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.id, previousBattle.creatorPlayerId))
+    .limit(1);
+  if (!creator || creator.telegramUserId !== user.id) {
+    await resultBot.sendMessage(chatId, "Only the player who started that PVB match can use its rematch buttons.");
+    return;
+  }
+
+  const [activeBattle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(
+      and(
+        eq(casinoChallengesTable.creatorPlayerId, creator.id),
+        eq(casinoChallengesTable.mode, "pvb"),
+        inArray(casinoChallengesTable.status, [
+          "pending_confirmation",
+          "running",
+          "rolling",
+        ]),
+      ),
+    )
+    .limit(1);
+  if (activeBattle) {
+    await resultBot.sendMessage(
+      chatId,
+      `You already have an active PVB room (#${activeBattle.id}). Finish or cancel it before starting another.`,
+    );
+    return;
+  }
+
+  const amountMinor =
+    multiplier === "double"
+      ? previousBattle.stakeMinor * 2
+      : previousBattle.stakeMinor;
+  if (!Number.isSafeInteger(amountMinor)) {
+    await resultBot.sendMessage(chatId, "That rematch amount is too large.");
+    return;
+  }
+  await createBattle(
+    resultBot,
+    chatId,
+    user,
+    { gameType: previousBattle.gameType, emoji: previousBattle.emoji },
+    {
+      mode: "pvb",
+      amountMinor,
+      rounds: previousBattle.rounds,
+      rollsPerRound: previousBattle.rollsPerRound,
+      targetWins: previousBattle.targetWins,
+      currency: parseCurrency(previousBattle.currency, "USD"),
+      resultRule: previousBattle.resultRule === "crazy" ? "crazy" : "high",
+    },
+  );
 }
 
 async function joinBattle(
@@ -4276,6 +4389,12 @@ async function promptPvpTurn(
   resultBot: TelegramBot,
   battle: typeof casinoChallengesTable.$inferSelect,
 ): Promise<void> {
+  if (
+    battle.status !== "awaiting_player_one" &&
+    battle.status !== "awaiting_player_two"
+  ) {
+    return;
+  }
   const expectedPlayerId =
     battle.status === "awaiting_player_two"
       ? battle.playerTwoId
@@ -4305,14 +4424,16 @@ async function promptPvpTurn(
       : latestRound || 1;
   const rollIndex =
     rows.filter((row) => row.round === round).length + 1;
+  const remaining = Math.max(1, battle.rollsPerRound - rollIndex + 1);
   const label = casinoPlayerLabel(expectedPlayer, "Player");
   await resultBot.sendMessage(
     battle.chatId,
     [
-      `<b>Room #${String(battle.id).padStart(4, "0")}</b>`,
-      `${label}, send ${battle.emoji} now.`,
-      `Round ${round}/${battle.targetWins ? `${battle.targetWins} wins` : battle.rounds} · Roll ${rollIndex}/${battle.rollsPerRound}`,
-      "Only the invited player can submit this turn. Forwarded emoji messages are rejected.",
+      `<b>Room #${String(battle.id).padStart(4, "0")} — PVP</b>`,
+      `${label}, you throw first in this turn.`,
+      `Round ${round}/${battle.targetWins ? `${battle.targetWins} wins` : battle.rounds} · Throw ${remaining} more`,
+      `Required emoji: <b>${battle.emoji}</b>`,
+      "Send the emoji directly from Telegram. Forwarded, stale, wrong-game, and duplicate rolls are rejected.",
     ].join("\n"),
   );
 }
@@ -4361,6 +4482,7 @@ async function handlePlayerPvpRoll(
         inArray(casinoChallengesTable.status, [
           "awaiting_player_one",
           "awaiting_player_two",
+          "rolling",
         ]),
         or(
           eq(casinoChallengesTable.creatorPlayerId, player.id),
@@ -4370,6 +4492,13 @@ async function handlePlayerPvpRoll(
     )
     .limit(1);
   if (!battle) return false;
+  if (battle.status === "rolling") {
+    await resultBot.sendMessage(
+      message.chat.id,
+      "⏳ Your previous PVP roll is still being processed. Please wait for the round result.",
+    );
+    return true;
+  }
   if (battle.turnDeadlineAt && battle.turnDeadlineAt.getTime() <= Date.now()) {
     await expirePvpBattle(resultBot, battle.id);
     return true;
@@ -4402,6 +4531,23 @@ async function handlePlayerPvpRoll(
     await resultBot.sendMessage(message.chat.id, "That emoji message was already counted.");
     return true;
   }
+  const claimedBattle = await db
+    .update(casinoChallengesTable)
+    .set({ status: "rolling", turnDeadlineAt: null })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, battle.status),
+      ),
+    )
+    .returning();
+  if (!claimedBattle[0]) {
+    await resultBot.sendMessage(
+      message.chat.id,
+      "⏳ That PVP turn is already being processed. Please wait for the result.",
+    );
+    return true;
+  }
   const latestRound = existingRows.reduce(
     (latest, row) => Math.max(latest, row.round),
     0,
@@ -4419,7 +4565,7 @@ async function handlePlayerPvpRoll(
     existingRows.filter(
       (row) => row.playerId === expectedPlayerId && row.round === round,
     ).length + 1;
-  await db
+  const [storedRoll] = await db
     .insert(casinoChallengeRollsTable)
     .values({
       challengeId: battle.id,
@@ -4432,14 +4578,52 @@ async function handlePlayerPvpRoll(
       value: message.dice.value,
       messageId: message.message_id,
     })
-    .onConflictDoNothing();
+    .onConflictDoNothing()
+    .returning();
+  if (!storedRoll) {
+    const deadline = new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS);
+    await db
+      .update(casinoChallengesTable)
+      .set({
+        status: battle.status,
+        turnDeadlineAt: deadline,
+      })
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          eq(casinoChallengesTable.status, "rolling"),
+        ),
+      );
+    scheduleBattleTimeout(resultBot, battle.id);
+    await resultBot.sendMessage(
+      message.chat.id,
+      "That roll slot was already recorded. Send only the next requested emoji.",
+    );
+    return true;
+  }
   if (rollIndex < battle.rollsPerRound) {
+    const nextStatus = battle.status;
     await db
       .update(casinoChallengesTable)
       .set({ turnDeadlineAt: new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS) })
-      .where(eq(casinoChallengesTable.id, battle.id));
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          eq(casinoChallengesTable.status, "rolling"),
+        ),
+      );
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: nextStatus })
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          eq(casinoChallengesTable.status, "rolling"),
+        ),
+      );
     await promptPvpTurn(resultBot, {
       ...battle,
+      status: nextStatus,
       turnDeadlineAt: new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS),
     });
     return true;
@@ -4456,7 +4640,12 @@ async function handlePlayerPvpRoll(
         status: nextBattle.status,
         turnDeadlineAt: nextBattle.turnDeadlineAt,
       })
-      .where(eq(casinoChallengesTable.id, battle.id));
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          eq(casinoChallengesTable.status, "rolling"),
+        ),
+      );
     await promptPvpTurn(resultBot, nextBattle);
     return true;
   }
@@ -4599,6 +4788,11 @@ async function promptPvbRound(
   resultBot: TelegramBot,
   battle: typeof casinoChallengesTable.$inferSelect,
 ): Promise<void> {
+  const [creator] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+    .limit(1);
   const playerRows = await db
     .select()
     .from(casinoChallengeRollsTable)
@@ -4650,16 +4844,18 @@ async function promptPvbRound(
   await resultBot.sendMessage(
     battle.chatId,
     [
-      "PLAYER 🆚 BOT",
+      `<b>${battle.gameType.toUpperCase()} VS BOT</b>`,
       "",
-      roundLabel,
+      `Player: ${casinoPlayerLabel(creator, "Player")}`,
+      `Currency: <b>${currency}</b>`,
+      `Stake: <b>${formatMoney(battle.stakeMinor, currency)}</b>`,
+      `Rounds: <b>${roundLabel}</b>`,
+      `Required emoji: <b>${battle.emoji}</b>`,
       "",
       `MODE = ${modeLabel} ✔️`,
       "",
-      `BET AMOUNT= ${formatMoney(battle.stakeMinor, currency)}`,
-      "",
-      `ROUND ${round}: THE PLAYER ROLLS FIRST: SEND ${battle.emoji} AFTER THIS MESSAGE ➡️`,
-      `You have 60 seconds. Send ${battle.emoji} ${remaining} time${remaining === 1 ? "" : "times"}.`,
+      `ROUND ${round}: ${casinoPlayerLabel(creator, "Player")} throws first ➡️`,
+      `Throw ${remaining} more ${battle.emoji}. You have 60 seconds.`,
     ].join("\n"),
   );
 }
@@ -4874,6 +5070,7 @@ async function runPvbRound(
           currency: parseCurrency(battle.currency, "USD"),
           fairId: battle.fairId ?? "legacy",
         }),
+        creator ? pvbRematchKeyboard(battle, creator) : undefined,
       );
       return;
     }
@@ -4962,8 +5159,9 @@ async function runPvbRound(
         tie,
         payoutMinor: tie || !playerOneWon ? 0 : Math.round(battle.stakeMinor * 1.92),
         currency: parseCurrency(battle.currency, "USD"),
-          fairId: battle.fairId ?? "legacy",
+        fairId: battle.fairId ?? "legacy",
       }),
+      creator ? pvbRematchKeyboard(battle, creator) : undefined,
     );
     return;
   }
@@ -5074,7 +5272,7 @@ async function handlePlayerPvbRoll(
     return true;
   }
   clearBattleTimeout(battle.id);
-  await db
+  const [storedRoll] = await db
     .insert(casinoChallengeRollsTable)
     .values({
       challengeId: battle.id,
@@ -5087,7 +5285,26 @@ async function handlePlayerPvbRoll(
       value: message.dice.value,
       messageId: message.message_id,
     })
-    .onConflictDoNothing();
+    .onConflictDoNothing()
+    .returning();
+  if (!storedRoll) {
+    const deadline = new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS);
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: "running", turnDeadlineAt: deadline })
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          eq(casinoChallengesTable.status, "rolling"),
+        ),
+      );
+    scheduleBattleTimeout(resultBot, battle.id);
+    await resultBot.sendMessage(
+      message.chat.id,
+      "That roll was already counted. Send only the next requested emoji.",
+    );
+    return true;
+  }
 
   if (rollIndex < battle.rollsPerRound) {
     await db
@@ -5099,7 +5316,7 @@ async function handlePlayerPvbRoll(
     scheduleBattleTimeout(resultBot, battle.id);
     await resultBot.sendMessage(
       message.chat.id,
-      `Player roll ${rollIndex}/${battle.rollsPerRound} received for round ${round}. Send ${battle.emoji} again.`,
+      `✅ Throw ${rollIndex}/${battle.rollsPerRound} received for round ${round}. Throw ${battle.rollsPerRound - rollIndex} more ${battle.emoji}.`,
     );
     return true;
   }
@@ -5607,15 +5824,10 @@ async function sendGames(
       "⚽️ <b>Football</b>",
       "6️⃣ <b>Bowling</b>",
       "🎰 <b>Slots</b>",
-      "🏰 <b>Towers</b>",
-      "🚀 <b>Limbo</b>",
       "🎲 <b>Dice Rush (dr)</b>",
       "🎲 <b>7up</b>",
-      "🃏 <b>BlackJack (bj)</b>",
-      "💣 <b>Mines</b>",
-      "🔒 <b>Vault</b>",
       "",
-      "<b>Interactive games will be added soon.</b>",
+      "<b>Reply to a player for PVP, or use PVB to play against the bot.</b>",
       "",
       `Bet limits: ${betLimitText("INR")}`,
     ].join("\n"),
@@ -5815,12 +6027,8 @@ async function handlePowerCommand(
 async function sendHouseBalance(
   bot: TelegramBot,
   chatId: number,
-  userId: number,
+  _userId: number,
 ): Promise<void> {
-  if (!isAdmin(userId)) {
-    await bot.sendMessage(chatId, ADMIN_RESTRICTED_MESSAGE);
-    return;
-  }
   const wallets = await db
     .select()
     .from(casinoHouseWalletsTable)
@@ -5828,7 +6036,7 @@ async function sendHouseBalance(
   await bot.sendMessage(
     chatId,
     [
-      "<b>🏦 House wallet</b>",
+      "<b>🏦 House totals</b>",
       "",
       ...(["INR", "USD"] as Currency[]).map((currency) => {
         const wallet = wallets.find((item) => item.currency === currency);
@@ -7031,6 +7239,21 @@ async function handleMainUpdate(
       if (Number.isInteger(battleId)) {
         await cancelPvbBattle(bot, chatId, callback.from, battleId);
       }
+    } else if (action.startsWith("battle:rematch:")) {
+      const [, , rawBattleId, multiplier] = action.split(":");
+      const battleId = Number(rawBattleId);
+      if (
+        Number.isInteger(battleId) &&
+        (multiplier === "again" || multiplier === "double")
+      ) {
+        await createPvbRematch(
+          bot,
+          chatId,
+          callback.from,
+          battleId,
+          multiplier,
+        );
+      }
     } else if (action.startsWith("battle:join:")) {
       if (!callback.message || !isOfficialGameChat(callback.message.chat)) {
         await bot.sendMessage(chatId, "Battles can only be joined in the official RolexCasino group.");
@@ -7356,7 +7579,11 @@ async function handleMainUpdate(
     } else if (command === "deposit") {
       await beginDeposit(bot, chatId, player);
     } else {
-      await beginWithdrawal(bot, chatId, player);
+      if (args.length > 0) {
+        await handleWithdrawalAmount(bot, chatId, player, args.join(" "));
+      } else {
+        await beginWithdrawal(bot, chatId, player);
+      }
     }
   } else {
     await bot.sendMessage(chatId, "Use /help to see the RolexCasino player commands.");
