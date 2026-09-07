@@ -213,6 +213,52 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const PVP_RESULT_DELAY_MS = 3_000;
+
+function serifBoldCharacter(character: string): string {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === undefined) return character;
+  if (codePoint >= 65 && codePoint <= 90) {
+    return String.fromCodePoint(0x1d400 + codePoint - 65);
+  }
+  if (codePoint >= 97 && codePoint <= 122) {
+    return String.fromCodePoint(0x1d41a + codePoint - 97);
+  }
+  if (codePoint >= 48 && codePoint <= 57) {
+    return String.fromCodePoint(0x1d7ce + codePoint - 48);
+  }
+  return character;
+}
+
+function pvpTypography(text: string): string {
+  return text
+    .split(/(<[^>]*>|&(?:amp|lt|gt|quot|#\d+);)/g)
+    .map((part) => {
+      if (part.startsWith("<") || part.startsWith("&")) return part;
+      return Array.from(part, serifBoldCharacter).join("");
+    })
+    .join("");
+}
+
+async function sendPvpMessage(
+  bot: TelegramBot,
+  chatId: number,
+  text: string,
+  replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+): Promise<TelegramMessage> {
+  return bot.sendMessage(chatId, pvpTypography(text), replyMarkup);
+}
+
+async function sendDelayedPvpResult(
+  bot: TelegramBot,
+  chatId: number,
+  text: string,
+  replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+): Promise<TelegramMessage> {
+  await wait(PVP_RESULT_DELAY_MS);
+  return sendPvpMessage(bot, chatId, text, replyMarkup);
+}
+
 function escapeTelegramText(value: string): string {
   return value.replace(/[&<>]/g, (character) => {
     if (character === "&") return "&amp;";
@@ -4028,7 +4074,8 @@ async function runPvpBattle(
   ]);
   const playerOneLabel = casinoPlayerLabel(playerOne, "Player 1");
   const playerTwoLabel = casinoPlayerLabel(playerTwo, "Player 2");
-  await resultBot.sendMessage(
+  await sendDelayedPvpResult(
+    resultBot,
     battle.chatId,
     battleResultText({
       battleId: battle.id,
@@ -4113,7 +4160,8 @@ async function createBattle(
   if (!battle) throw new Error("Could not create battle");
 
   if (input.mode === "pvp") {
-    await resultBot.sendMessage(
+    await sendPvpMessage(
+      resultBot,
       chatId,
       [
         `PVP ${game.gameType} battle #${battle.id} created.`,
@@ -4322,7 +4370,8 @@ async function joinBattle(
           .limit(1)
           .then(([row]) => row),
       ]);
-      await resultBot.sendMessage(
+      await sendPvpMessage(
+        resultBot,
         chatId,
         [
           `<b>🪙 Coin Flip Room #${String(startedBattle.id).padStart(4, "0")}</b>`,
@@ -4512,6 +4561,7 @@ async function cancelPvbBattle(
 
 async function handleCoinChoice(
   resultBot: TelegramBot,
+  helperBots: Map<string, TelegramBot>,
   chatId: number,
   user: TelegramUser,
   battleId: number,
@@ -4556,14 +4606,25 @@ async function handleCoinChoice(
     return;
   }
   const challengerSide = pickedSide === "HEADS" ? "TAILS" : "HEADS";
-  await resultBot.sendMessage(
+  await sendPvpMessage(
+    resultBot,
     chatId,
     `🪙 ${casinoPlayerLabel(opponentPlayer, "Opponent")} picked ${pickedSide}.`,
   );
-  await resultBot.sendMessage(chatId, "🪙 Coin in the air... 1... 2... 3...");
+  await sendPvpMessage(
+    resultBot,
+    chatId,
+    "🪙 Coin in the air... 1... 2... 3...",
+  );
   await wait(3_000);
+  const coinBot =
+    helperBots.get("coin") ??
+    helperBots.get("dice") ??
+    Array.from(new Set(helperBots.values()))[0] ??
+    resultBot;
   const landedSide = randomInt(0, 2) === 0 ? "HEADS" : "TAILS";
-  await resultBot.sendMessage(chatId, "🪙");
+  await coinBot.sendMessage(chatId, "🪙");
+  await wait(PVP_RESULT_DELAY_MS);
   const playerOneWon = challengerSide === landedSide;
   const settled = await settleBattle({
     battleId: battle.id,
@@ -4584,7 +4645,8 @@ async function handleCoinChoice(
     db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.id, battle.playerTwoId)).limit(1).then(([row]) => row),
   ]);
   const winner = playerOneWon ? challenger : opponent;
-  await resultBot.sendMessage(
+  await sendPvpMessage(
+    resultBot,
     chatId,
     [
       `🪙 <b>Coin Flip #${String(battle.id).padStart(4, "0")} — Result</b>`,
@@ -4641,7 +4703,8 @@ async function promptPvpTurn(
     rows.filter((row) => row.round === round).length + 1;
   const remaining = Math.max(1, battle.rollsPerRound - rollIndex + 1);
   const label = casinoPlayerLabel(expectedPlayer, "Player");
-  await resultBot.sendMessage(
+  await sendPvpMessage(
+    resultBot,
     battle.chatId,
     [
       `<b>Room #${String(battle.id).padStart(4, "0")} — PVP</b>`,
@@ -4916,7 +4979,8 @@ async function handlePlayerPvpRoll(
     battle.playerOneScore + (roundResult.playerOneWon ? 1 : 0);
   const playerTwoScore =
     battle.playerTwoScore + (roundResult.playerTwoWon ? 1 : 0);
-  await resultBot.sendMessage(
+  await sendDelayedPvpResult(
+    resultBot,
     message.chat.id,
     [
       `🏆 Round ${round}: ${
@@ -4955,7 +5019,8 @@ async function handlePlayerPvpRoll(
         ? db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.id, battle.playerTwoId)).limit(1).then(([row]) => row)
         : Promise.resolve(undefined),
     ]);
-    await resultBot.sendMessage(
+    await sendDelayedPvpResult(
+      resultBot,
       message.chat.id,
       battleResultText({
         battleId: battle.id,
@@ -7655,6 +7720,7 @@ async function handleMainUpdate(
       ) {
         await handleCoinChoice(
           bot,
+          helperBots,
           chatId,
           callback.from,
           battleId,
