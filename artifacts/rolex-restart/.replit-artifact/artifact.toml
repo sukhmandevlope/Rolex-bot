@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Rolex Casino"
+description = "A luxury casino lobby demo with play-money chips, featured games, player balance, and an immersive first playable casino experience."
+version = "1.0.0"
+id = "artifacts/rolex-restart"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22445
+
+[services.development]
+run = "pnpm --filter @workspace/rolex-restart run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/rolex-restart", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/rolex-restart/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22445"
+BASE_PATH = "/"

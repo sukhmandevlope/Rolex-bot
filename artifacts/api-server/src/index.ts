@@ -1,6 +1,6 @@
 import app from "./app";
 import { logger } from "./lib/logger";
-import { startTelegramBot } from "./telegram/bot";
+import { startRolexCasinoBots } from "./lib/rolex-casino";
 
 const rawPort = process.env["PORT"];
 
@@ -16,14 +16,21 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-app.listen(port, (err) => {
+const server = app.listen(port, (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);
   }
 
   logger.info({ port }, "Server listening");
-  startTelegramBot().catch((botError) => {
-    logger.error({ err: botError }, "Failed to start Telegram bot");
-  });
 });
+
+void startRolexCasinoBots();
+
+const shutdown = (signal: string) => {
+  logger.info({ signal }, "Shutting down RolexCasino API server");
+  server.close(() => process.exit(0));
+};
+
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));

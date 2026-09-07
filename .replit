@@ -1,0 +1,36 @@
+modules = ["nodejs-24", "python-3.12", "postgresql-16"]
+
+[deployment]
+router = "application"
+deploymentTarget = "vm"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[userenv]
+
+[userenv.shared]
+CASINO_ADMIN_TELEGRAM_IDS = "1053006219, 8362081186, 8860529495"
+CASINO_MAIN_GROUP_CHAT_ID = "-1004458883943"
+CASINO_WIN_LOG_CHAT_ID = "-1004454800723"
+DEPOSIT_BTC_ADDRESS = "bc1qsm7xzn4k8kpxwurzjsredangepvzgh70y0ypzd"
+DEPOSIT_UPI_ADDRESS = "rutvik1209@fam"
+DEPOSIT_BSC_ADDRESS = "0xD8419224A65C3d35C10AE695562463c8445ACb15"
+DEPOSIT_ETHEREUM_ADDRESS = "0xD8419224A65C3d35C10AE695562463c8445ACb15"
+DEPOSIT_SOLANA_ADDRESS = "3bKsCSR2mmconFaExejbkuGfeQNuVQPFttzj9y2MP2mE"
+
+[nix]
+channel = "stable-25_05"
+packages = ["postgresql"]

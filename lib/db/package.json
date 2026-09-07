@@ -8,8 +8,8 @@
     "./schema": "./src/schema/index.ts"
   },
   "scripts": {
-    "push": "drizzle-kit push --config ./drizzle.config.ts && psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f ./immutable-ledger.sql",
-    "push-force": "drizzle-kit push --force --config ./drizzle.config.ts && psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f ./immutable-ledger.sql"
+    "push": "drizzle-kit push --config ./drizzle.config.ts",
+    "push-force": "drizzle-kit push --force --config ./drizzle.config.ts"
   },
   "dependencies": {
     "drizzle-orm": "catalog:",
@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "@types/pg": "^8.20.0",
+    "@types/pg": "^8.20.3",
     "drizzle-kit": "^0.31.10"
   }
 }

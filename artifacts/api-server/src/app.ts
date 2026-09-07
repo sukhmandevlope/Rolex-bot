@@ -26,12 +26,7 @@ app.use(
   }),
 );
 app.use(cors());
-app.use(express.json({
-  limit: "64kb",
-  verify(req, _res, buffer) {
-    (req as typeof req & { rawBody?: Buffer }).rawBody = Buffer.from(buffer);
-  },
-}));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use("/api", router);

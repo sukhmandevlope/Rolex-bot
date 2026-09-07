@@ -1,6 +1,6 @@
-# Rolex Casino Bot
+# [Project name]
 
-A private Telegram casino prototype with play-credit games, PvP challenges, channel verification, player statistics, and admin controls.
+_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
 
 ## Run & Operate
 
@@ -10,8 +10,6 @@ A private Telegram casino prototype with play-credit games, PvP challenges, chan
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required env: `DATABASE_URL` — Postgres connection string
-- Required secret: `TELEGRAM_BOT_TOKEN` — token issued by BotFather
-- Optional env: `ADMIN_TELEGRAM_IDS` — comma-separated Telegram numeric IDs
 
 ## Stack
 
@@ -24,34 +22,23 @@ A private Telegram casino prototype with play-credit games, PvP challenges, chan
 
 ## Where things live
 
-- Telegram bot: `artifacts/api-server/src/telegram/bot.ts`
-- Database schema: `lib/db/src/schema/casino.ts`
+_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
 
 ## Architecture decisions
 
-- The unlicensed prototype uses non-redeemable play credits only.
-- Payment and withdrawal commands are intentionally locked.
-- Regulated payment APIs remain locked until a submitted operator license is independently marked verified and in-date.
-- UPI and crypto flows are provider-backed, non-custodial, and reject private-key or seed-phrase fields.
-- Confirmed money movements use balanced, append-only double-entry records; withdrawals always require review.
-- Game balance changes use row locks and database transactions.
+_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
 
 ## Product
 
-- Telegram onboarding and required-channel verification
-- Game directory, wallet, statistics, leaderboard, and support
-- PvB coin/dice games and initial PvP challenge creation
-- Restricted ban, unban, balance, and platform-stat admin controls
+_Describe the high-level user-facing capabilities of this app once they exist._
 
 ## User preferences
 
-- Product identity: Rolex–casino-bot, English language.
-- Community channel: `@RolexCasinos`.
+_Populate as you build — explicit user instructions worth remembering across sessions._
 
 ## Gotchas
 
-- The bot must be a channel administrator for reliable membership checks.
-- Never enable real-money payment settlement without licensing and compliance controls.
+_Populate as you build — sharp edges, "always run X before Y" rules._
 
 ## Pointers
 

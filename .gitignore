@@ -1,8 +1,5 @@
 # See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
 
-# Environment configuration
-.env
-
 # compiled output
 dist
 tmp
@@ -49,4 +46,9 @@ Thumbs.db
 
 # Replit
 .cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
 .local/
