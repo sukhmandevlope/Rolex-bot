@@ -38,6 +38,52 @@ export const casinoPlayersTable = pgTable("casino_players", {
     .$onUpdate(() => new Date()),
 });
 
+export const casinoDailyBonusSettingsTable = pgTable(
+  "casino_daily_bonus_settings",
+  {
+    id: serial("id").primaryKey(),
+    amountMinor: integer("amount_minor").notNull().default(0),
+    currency: varchar("currency", { length: 3 }).notNull().default("INR"),
+    eligibleUsers: integer("eligible_users").notNull().default(0),
+    updatedByTelegramUserId: bigint("updated_by_telegram_user_id", {
+      mode: "number",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+);
+
+export const casinoGameBetSettingsTable = pgTable(
+  "casino_game_bet_settings",
+  {
+    id: serial("id").primaryKey(),
+    gameType: varchar("game_type", { length: 40 }).notNull(),
+    currency: varchar("currency", { length: 3 }).notNull(),
+    minimumBetMinor: integer("minimum_bet_minor").notNull(),
+    updatedByTelegramUserId: bigint("updated_by_telegram_user_id", {
+      mode: "number",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => ({
+    gameCurrencyUnique: unique("casino_game_bet_setting_game_currency_unique").on(
+      table.gameType,
+      table.currency,
+    ),
+  }),
+);
+
 export const casinoWalletsTable = pgTable(
   "casino_wallets",
   {
