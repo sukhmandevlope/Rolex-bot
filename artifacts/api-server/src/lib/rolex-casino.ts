@@ -5108,6 +5108,15 @@ async function handlePlayerPvbRoll(
     await runPvbRound(resultBot, helperBots, claimedBattle, round);
   } catch (error) {
     logger.error({ err: error, battleId: battle.id, round }, "Verified PvB helper result failed");
+    await db
+      .delete(casinoChallengeRollsTable)
+      .where(
+        and(
+          eq(casinoChallengeRollsTable.challengeId, battle.id),
+          eq(casinoChallengeRollsTable.actorType, "player"),
+          eq(casinoChallengeRollsTable.messageId, message.message_id),
+        ),
+      );
     const deadline = new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS);
     await db
       .update(casinoChallengesTable)
