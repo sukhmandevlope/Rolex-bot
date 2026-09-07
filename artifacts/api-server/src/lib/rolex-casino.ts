@@ -4266,18 +4266,18 @@ async function joinBattle(
     await resultBot.sendMessage(chatId, "That PVP battle is no longer open.");
     return;
   }
-  if (battle.creatorPlayerId === user.id) {
+  const player = await ensurePlayer(user);
+  if (battle.creatorPlayerId === player.id) {
     await resultBot.sendMessage(chatId, "The battle creator cannot join as their own opponent.");
     return;
   }
-  if (battle.playerTwoId !== null && battle.playerTwoId !== user.id) {
+  if (battle.playerTwoId !== null && battle.playerTwoId !== player.id) {
     await resultBot.sendMessage(
       chatId,
       "This PVP challenge was sent to another player.",
     );
     return;
   }
-  const player = await ensurePlayer(user);
   const wallet = await ensureWallet(player.id, parseCurrency(battle.currency, "USD"));
   if (wallet.balanceMinor < battle.stakeMinor) {
     await resultBot.sendMessage(chatId, "You do not have enough balance to join this battle.");
@@ -4297,35 +4297,60 @@ async function joinBattle(
     await resultBot.sendMessage(chatId, "Another player joined this battle first.");
     return;
   }
-  await resultBot.sendMessage(
-    chatId,
-    `PVP battle #${battle.id} is starting. ${
-      battle.targetWins
-        ? `First to ${battle.targetWins} round wins`
-        : `${battle.rounds} rounds`
-    } × ${battle.rollsPerRound} rolls.`,
-  );
+  const isCoinBattle = claimedBattle.gameType === "coin";
   const [startedBattle] = await db
     .update(casinoChallengesTable)
     .set({
-      status: "awaiting_player_one",
+      status: isCoinBattle ? "coin_choice" : "awaiting_player_one",
       turnDeadlineAt: new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS),
     })
     .where(eq(casinoChallengesTable.id, claimedBattle.id))
     .returning();
   if (startedBattle) {
     if (startedBattle.gameType === "coin") {
+      const [challenger, opponent] = await Promise.all([
+        db
+          .select()
+          .from(casinoPlayersTable)
+          .where(eq(casinoPlayersTable.id, startedBattle.creatorPlayerId))
+          .limit(1)
+          .then(([row]) => row),
+        db
+          .select()
+          .from(casinoPlayersTable)
+          .where(eq(casinoPlayersTable.id, startedBattle.playerTwoId as number))
+          .limit(1)
+          .then(([row]) => row),
+      ]);
       await resultBot.sendMessage(
         chatId,
         [
           `<b>🪙 Coin Flip Room #${String(startedBattle.id).padStart(4, "0")}</b>`,
+          "",
+          `Challenger: ${casinoPlayerLabel(challenger, "Challenger")}`,
+          `Opponent: ${casinoPlayerLabel(opponent, "Opponent")}`,
           `Stake: ${formatMoney(startedBattle.stakeMinor, parseCurrency(startedBattle.currency, "USD"))}`,
-          "Accepter, choose Heads or Tails. The challenger receives the other side automatically.",
+          "Win: 1.92x",
+          "",
+          `${casinoPlayerLabel(opponent, "Opponent")}, choose your side:`,
+          "The challenger receives the opposite side automatically.",
         ].join("\n"),
         {
           inline_keyboard: [[
-            { text: "Heads", callback_data: `coin:choose:${startedBattle.id}:HEADS` },
-            { text: "Tails", callback_data: `coin:choose:${startedBattle.id}:TAILS` },
+            {
+              text: "Heads",
+              callback_data: ownedCallback(
+                `coin:choose:${startedBattle.id}:HEADS`,
+                opponent?.telegramUserId ?? user.id,
+              ),
+            },
+            {
+              text: "Tails",
+              callback_data: ownedCallback(
+                `coin:choose:${startedBattle.id}:TAILS`,
+                opponent?.telegramUserId ?? user.id,
+              ),
+            },
           ]],
         },
       );
@@ -4352,12 +4377,13 @@ async function declineBattle(
     await resultBot.sendMessage(chatId, "That PVP battle is no longer open.");
     return;
   }
-  if (battle.playerTwoId !== null && battle.playerTwoId !== user.id) {
+  const player = await ensurePlayer(user);
+  if (battle.playerTwoId !== null && battle.playerTwoId !== player.id) {
     await resultBot.sendMessage(chatId, "This PVP challenge was sent to another player.");
     return;
   }
   if (battle.playerTwoId === null) {
-    if (battle.creatorPlayerId !== user.id) {
+    if (battle.creatorPlayerId !== player.id) {
       await resultBot.sendMessage(chatId, "Only the challenge maker can cancel this open PVP room.");
       return;
     }
@@ -4370,8 +4396,8 @@ async function declineBattle(
         eq(casinoChallengesTable.id, battle.id),
         eq(casinoChallengesTable.status, "open"),
         or(
-          eq(casinoChallengesTable.creatorPlayerId, user.id),
-          eq(casinoChallengesTable.playerTwoId, user.id),
+          eq(casinoChallengesTable.creatorPlayerId, player.id),
+          eq(casinoChallengesTable.playerTwoId, player.id),
         ),
       ),
     )
@@ -4505,7 +4531,12 @@ async function handleCoinChoice(
     await resultBot.sendMessage(chatId, "That coin room is no longer waiting for a choice.");
     return;
   }
-  if (battle.playerTwoId !== user.id) {
+  const [opponentPlayer] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.telegramUserId, user.id))
+    .limit(1);
+  if (!opponentPlayer || battle.playerTwoId !== opponentPlayer.id) {
     await resultBot.sendMessage(chatId, "Only the accepted opponent can choose the coin side.");
     return;
   }
@@ -4516,7 +4547,7 @@ async function handleCoinChoice(
       and(
         eq(casinoChallengesTable.id, battle.id),
         eq(casinoChallengesTable.status, "coin_choice"),
-        eq(casinoChallengesTable.playerTwoId, user.id),
+        eq(casinoChallengesTable.playerTwoId, opponentPlayer.id),
       ),
     )
     .returning();
@@ -4527,11 +4558,12 @@ async function handleCoinChoice(
   const challengerSide = pickedSide === "HEADS" ? "TAILS" : "HEADS";
   await resultBot.sendMessage(
     chatId,
-    `🪙 ${casinoPlayerLabel(await db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.id, battle.playerTwoId)).limit(1).then(([row]) => row), "Opponent")} picked ${pickedSide}.`,
+    `🪙 ${casinoPlayerLabel(opponentPlayer, "Opponent")} picked ${pickedSide}.`,
   );
   await resultBot.sendMessage(chatId, "🪙 Coin in the air... 1... 2... 3...");
   await wait(3_000);
   const landedSide = randomInt(0, 2) === 0 ? "HEADS" : "TAILS";
+  await resultBot.sendMessage(chatId, "🪙");
   const playerOneWon = challengerSide === landedSide;
   const settled = await settleBattle({
     battleId: battle.id,
