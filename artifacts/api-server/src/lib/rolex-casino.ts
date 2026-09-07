@@ -64,6 +64,7 @@ type TelegramMessage = {
   message_id: number;
   chat: TelegramChat;
   from?: TelegramUser;
+  date?: number;
   text?: string;
   caption?: string;
   dice?: { emoji: string; value: number };
@@ -3219,28 +3220,32 @@ function parseBattleArguments(args: string[], fallbackCurrency: Currency): {
     .slice(offset)
     .filter((arg) => arg.toLowerCase() !== "crazy");
   const amountMinor = parseMoney(battleArgs[0]);
-  const pattern = battleArgs[1]?.match(/^(\d+)d(\d+)(w)?$/i);
+  const pattern = battleArgs.find((arg) => /^(\d+)d(\d+)(w)?$/i.test(arg))?.match(/^(\d+)d(\d+)(w)?$/i);
   const targetWins = pattern?.[3]
     ? Math.min(3, Math.max(1, Math.trunc(Number(pattern[2]) || 1)))
     : null;
+  const currencyToken = battleArgs.find((arg) => isSupportedCurrency(arg.toUpperCase()));
+  const plainRoundToken = battleArgs.find(
+    (arg, index) =>
+      index > 0 &&
+      /^\d+$/.test(arg) &&
+      !pattern?.[0].includes(arg),
+  );
   const rollsPerRound = Math.min(
     3,
     Math.max(
       1,
-      Math.trunc(Number(pattern?.[1] ?? battleArgs[2] ?? 1) || 1),
+      Math.trunc(Number(pattern?.[1] ?? 1) || 1),
     ),
   );
   const rounds = Math.min(
     3,
     Math.max(
       1,
-      Math.trunc(Number(pattern?.[2] ?? battleArgs[1] ?? 1) || 1),
+      Math.trunc(Number(pattern?.[2] ?? plainRoundToken ?? 1) || 1),
     ),
   );
-  const currency = parseCurrency(
-    pattern ? battleArgs[2] : battleArgs[3],
-    fallbackCurrency,
-  );
+  const currency = parseCurrency(currencyToken, fallbackCurrency);
   return { mode, amountMinor, rounds, rollsPerRound, targetWins, currency, resultRule };
 }
 
@@ -3261,7 +3266,11 @@ async function expirePvbBattle(
     .from(casinoChallengesTable)
     .where(eq(casinoChallengesTable.id, battleId))
     .limit(1);
-  if (!battle || battle.mode !== "pvb" || battle.status !== "running") {
+  if (
+    !battle ||
+    battle.mode !== "pvb" ||
+    !["pending_confirmation", "running"].includes(battle.status)
+  ) {
     clearBattleTimeout(battleId);
     return;
   }
@@ -3290,12 +3299,14 @@ async function expirePvbBattle(
   const timeoutOutcome = battleTimeoutOutcome(battle.stakeMinor);
   await resultBot.sendMessage(
     battle.chatId,
-    [
-      "⏰ Time expired.",
-      "The player did not finish the required rolls within 60 seconds.",
-      `The stake ${formatMoney(timeoutOutcome.refundMinor, parseCurrency(battle.currency, "USD"))} was refunded.`,
-      "Challenge cancelled automatically.",
-    ].join("\n"),
+    battle.status === "pending_confirmation"
+      ? "⏰ PVB room expired because Play was not confirmed in time. No balance was changed."
+      : [
+          "⏰ Time expired.",
+          "The player did not finish the required rolls within 60 seconds.",
+          `The stake ${formatMoney(timeoutOutcome.refundMinor, parseCurrency(battle.currency, "USD"))} was refunded.`,
+          "Challenge cancelled automatically.",
+        ].join("\n"),
   );
 }
 
@@ -3364,6 +3375,7 @@ async function recoverPvbBattleTimeouts(resultBot: TelegramBot): Promise<void> {
     .from(casinoChallengesTable)
     .where(
       inArray(casinoChallengesTable.status, [
+        "pending_confirmation",
         "running",
         "coin_choice",
         "awaiting_player_one",
@@ -3665,15 +3677,24 @@ function battleResultText(options: {
         ? options.playerOneLabel
         : options.playerTwoLabel;
     return [
-      `🏆 <b>Round ${index + 1}</b>: ${winner}`,
-      `Score: ${round.playerOneScore} — ${round.playerTwoScore}`,
+      `🏆 Round ${index + 1}: ${winner} ${roundTie ? "🤝" : "✅"} (${round.playerOneScore}-${round.playerTwoScore})`,
     ];
   });
 
+  const playerOneRoundWins = options.rounds.filter((round) =>
+    options.crazyMode
+      ? round.playerOneScore < round.playerTwoScore
+      : round.playerOneScore > round.playerTwoScore,
+  ).length;
+  const playerTwoRoundWins = options.rounds.filter((round) =>
+    options.crazyMode
+      ? round.playerTwoScore < round.playerOneScore
+      : round.playerTwoScore > round.playerOneScore,
+  ).length;
   const winnerLabel = options.playerOneWon
     ? options.playerOneLabel
     : options.playerTwoLabel;
-  const matchPrefix = options.gameType.slice(0, 2).toUpperCase();
+  const matchPrefix = options.gameType.slice(0, 3).toUpperCase();
   const payoutLabel = options.tie
     ? "Stake refunded: 1.00x"
     : options.playerOneWon
@@ -3690,7 +3711,9 @@ function battleResultText(options: {
     "",
     ...roundLines,
     "",
-    options.tie ? "<b>🤝 Match tied</b>" : `<b>🏆 Winner: ${winnerLabel}</b>`,
+    options.tie
+      ? `<b>🤝 Match tied (${playerOneRoundWins}-${playerTwoRoundWins})</b>`
+      : `<b>🏆 ${winnerLabel} wins ${playerOneRoundWins}-${playerTwoRoundWins}!</b>`,
     payoutLabel,
     options.tie
       ? "No balance was lost; the stake was returned."
@@ -3900,7 +3923,35 @@ async function createBattle(
     return;
   }
 
-  await promptPvbRound(resultBot, battle);
+  await resultBot.sendMessage(
+    chatId,
+    [
+      `<b>🤖 ${game.gameType.toUpperCase()} — PLAYER VS BOT</b>`,
+      "",
+      `Stake: ${formatMoney(input.amountMinor, input.currency)}`,
+      input.targetWins
+        ? `First to ${input.targetWins} round wins · ${input.rollsPerRound} roll${input.rollsPerRound === 1 ? "" : "s"} per round`
+        : `${input.rounds} round${input.rounds === 1 ? "" : "s"} · ${input.rollsPerRound} roll${input.rollsPerRound === 1 ? "" : "s"} per round`,
+      input.resultRule === "crazy"
+        ? "Crazy mode: the lowest score wins each round."
+        : "Highest score wins each round.",
+      "",
+      "Press Play to confirm, or Cancel to close this room.",
+    ].join("\n"),
+    {
+      inline_keyboard: [[
+        {
+          text: "🤖 Play with Bot",
+          callback_data: ownedCallback(`battle:pvb:play:${battle.id}`, player.telegramUserId),
+        },
+        {
+          text: "Cancel",
+          callback_data: ownedCallback(`battle:pvb:cancel:${battle.id}`, player.telegramUserId),
+        },
+      ]],
+    },
+  );
+  scheduleBattleTimeout(resultBot, battle.id);
 }
 
 async function joinBattle(
@@ -4034,6 +4085,106 @@ async function declineBattle(
     cancelled
       ? "PVP challenge declined. No balance was changed."
       : "That PVP challenge was already accepted or cancelled.",
+  );
+}
+
+async function confirmPvbBattle(
+  resultBot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  battleId: number,
+): Promise<void> {
+  const [battle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(eq(casinoChallengesTable.id, battleId))
+    .limit(1);
+  if (
+    !battle ||
+    battle.mode !== "pvb" ||
+    battle.status !== "pending_confirmation"
+  ) {
+    await resultBot.sendMessage(chatId, "That PVB room is no longer waiting for confirmation.");
+    return;
+  }
+  const [creator] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+    .limit(1);
+  if (!creator || creator.telegramUserId !== user.id) {
+    await resultBot.sendMessage(chatId, "Only the player who created this PVB room can confirm it.");
+    return;
+  }
+  const wallet = await ensureWallet(creator.id, parseCurrency(battle.currency, "USD"));
+  if (wallet.balanceMinor < battle.stakeMinor) {
+    await resultBot.sendMessage(chatId, "Your balance is no longer sufficient for this battle.");
+    return;
+  }
+  const deadline = new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS);
+  const [startedBattle] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "running", turnDeadlineAt: deadline })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "pending_confirmation"),
+      ),
+    )
+    .returning();
+  if (!startedBattle) {
+    await resultBot.sendMessage(chatId, "That PVB room was already started or cancelled.");
+    return;
+  }
+  await resultBot.sendMessage(
+    chatId,
+    `✅ PVB room #${battle.id} confirmed. Send ${battle.emoji} directly to play round 1.`,
+  );
+  await promptPvbRound(resultBot, startedBattle);
+}
+
+async function cancelPvbBattle(
+  resultBot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  battleId: number,
+): Promise<void> {
+  const [battle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(eq(casinoChallengesTable.id, battleId))
+    .limit(1);
+  if (
+    !battle ||
+    battle.mode !== "pvb" ||
+    battle.status !== "pending_confirmation"
+  ) {
+    await resultBot.sendMessage(chatId, "That PVB room is no longer waiting for confirmation.");
+    return;
+  }
+  const [creator] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+    .limit(1);
+  if (!creator || creator.telegramUserId !== user.id) {
+    await resultBot.sendMessage(chatId, "Only the player who created this PVB room can cancel it.");
+    return;
+  }
+  const [cancelled] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "cancelled", turnDeadlineAt: null, completedAt: new Date() })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "pending_confirmation"),
+      ),
+    )
+    .returning();
+  clearBattleTimeout(battle.id);
+  await resultBot.sendMessage(
+    chatId,
+    cancelled ? "PVB room cancelled. No balance was changed." : "That PVB room was already closed.",
   );
 }
 
@@ -4231,15 +4382,10 @@ async function handlePlayerPvpRoll(
     await resultBot.sendMessage(message.chat.id, "It is not your turn in this PVP room.");
     return true;
   }
-  if (
-    message.dice.emoji !== battle.emoji ||
-    message.forward_from ||
-    message.forward_origin ||
-    message.is_automatic_forward
-  ) {
+  if (!isFreshDirectDiceMessage(message, battle.emoji)) {
     await resultBot.sendMessage(
       message.chat.id,
-      `❌ Invalid emoji message. Send the required ${battle.emoji} directly, not as a forward.`,
+      `❌ Invalid emoji message. Send the required ${battle.emoji} directly, not as a forward or another game emoji.`,
     );
     return true;
   }
@@ -4252,6 +4398,10 @@ async function handlePlayerPvpRoll(
         eq(casinoChallengeRollsTable.actorType, "player"),
       ),
     );
+  if (existingRows.some((row) => row.messageId === message.message_id)) {
+    await resultBot.sendMessage(message.chat.id, "That emoji message was already counted.");
+    return true;
+  }
   const latestRound = existingRows.reduce(
     (latest, row) => Math.max(latest, row.round),
     0,
@@ -4337,6 +4487,22 @@ async function handlePlayerPvpRoll(
         row.round === round,
     )
     .reduce((total, row) => total + row.value, 0);
+  const [playerOne, playerTwo] = await Promise.all([
+    db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+      .limit(1)
+      .then(([row]) => row),
+    battle.playerTwoId
+      ? db
+          .select()
+          .from(casinoPlayersTable)
+          .where(eq(casinoPlayersTable.id, battle.playerTwoId))
+          .limit(1)
+          .then(([row]) => row)
+      : Promise.resolve(undefined),
+  ]);
   const roundResult = scoreBattleRound(
     [playerOneRound],
     [playerTwoRound],
@@ -4349,13 +4515,13 @@ async function handlePlayerPvpRoll(
   await resultBot.sendMessage(
     message.chat.id,
     [
-      `🏆 Round ${round} result`,
-      `Score: ${playerOneRound} — ${playerTwoRound}`,
-      roundResult.playerOneScore === roundResult.playerTwoScore
-        ? "🤝 Round tied"
-        : roundResult.playerOneWon
-          ? "Challenger wins the round"
-          : "Accepter wins the round",
+      `🏆 Round ${round}: ${
+        roundResult.playerOneScore === roundResult.playerTwoScore
+          ? "Tie"
+          : roundResult.playerOneWon
+            ? casinoPlayerLabel(playerOne, "Challenger")
+            : casinoPlayerLabel(playerTwo, "Opponent")
+      } ${roundResult.playerOneScore === roundResult.playerTwoScore ? "🤝" : "✅"} (${playerOneRound}-${playerTwoRound})`,
     ].join("\n"),
   );
   const complete = battle.targetWins
@@ -4509,22 +4675,68 @@ function buildPvbRoundScores(
       .filter((row) => row.actorType === "player" && row.round === round)
       .sort((left, right) => left.rollIndex - right.rollIndex)
       .map((row) => row.value);
-    const helperValues = helpers.flatMap((helper) =>
-      rows
-        .filter(
-          (row) =>
-            row.actorType === "helper" &&
-            row.actorKey === helper.label &&
-            row.round === round,
-        )
-        .sort((left, right) => left.rollIndex - right.rollIndex)
-        .map((row) => row.value),
-    );
+    const helperValues = rows
+      .filter((row) => row.actorType === "helper" && row.round === round)
+      .sort((left, right) => left.rollIndex - right.rollIndex)
+      .map((row) => row.value);
     return {
       playerOneScore: playerValues.reduce((total, value) => total + value, 0),
       playerTwoScore: helperValues.reduce((total, value) => total + value, 0),
     };
   });
+}
+
+function isFreshDirectDiceMessage(
+  message: TelegramMessage,
+  expectedEmoji: string,
+): boolean {
+  if (
+    !message.dice ||
+    message.dice.emoji !== expectedEmoji ||
+    message.forward_from ||
+    message.forward_origin ||
+    message.is_automatic_forward
+  ) {
+    return false;
+  }
+  if (message.date) {
+    const ageSeconds = Math.floor(Date.now() / 1000) - message.date;
+    if (ageSeconds > 120 || ageSeconds < -10) return false;
+  }
+  return true;
+}
+
+async function sendVerifiedBotDice(
+  helper: TelegramBot,
+  fallback: TelegramBot,
+  chatId: number,
+  expectedEmoji: string,
+  battleId: number,
+): Promise<{ roll: TelegramMessage; actorKey: string }> {
+  const candidates = helper === fallback ? [helper] : [helper, fallback];
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      const roll = await candidate.sendDice(chatId, expectedEmoji);
+      if (
+        roll.chat.id !== chatId ||
+        !roll.dice ||
+        roll.dice.emoji !== expectedEmoji ||
+        !Number.isFinite(roll.dice.value)
+      ) {
+        lastError = new Error(
+          `${candidate.label} returned an unexpected ${expectedEmoji} result for battle ${battleId}`,
+        );
+        continue;
+      }
+      return { roll, actorKey: candidate.label };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`No verified helper result for battle ${battleId}`);
 }
 
 async function runPvbRound(
@@ -4542,28 +4754,29 @@ async function runPvbRound(
 
   for (let rollIndex = 1; rollIndex <= battle.rollsPerRound; rollIndex += 1) {
     const helper = helpers[(rollIndex - 1) % helpers.length];
-    let roll: TelegramMessage;
-    try {
-      // Use one helper per configured roll, cycling only if a future limit exceeds the helper pool.
-      roll = await helper.sendDice(battle.chatId, battle.emoji);
-    } catch (error) {
-      logger.warn(
-        { err: error, helper: helper.label, battleId: battle.id },
-        "PvB helper roll failed; using the main bot for this roll",
-      );
-      roll = await resultBot.sendDice(battle.chatId, battle.emoji);
+    const verified = await sendVerifiedBotDice(
+      helper,
+      resultBot,
+      battle.chatId,
+      battle.emoji,
+      battle.id,
+    );
+    const roll = verified.roll;
+    const verifiedDice = roll.dice;
+    if (!verifiedDice) {
+      throw new Error(`Verified helper result did not include dice for battle ${battle.id}`);
     }
     await db
       .insert(casinoChallengeRollsTable)
       .values({
         challengeId: battle.id,
         actorType: "helper",
-        actorKey: helper.label,
+        actorKey: verified.actorKey,
         playerId: null,
         round,
         rollIndex,
-        emoji: roll.dice?.emoji ?? battle.emoji,
-        value: roll.dice?.value ?? 0,
+        emoji: verifiedDice.emoji,
+        value: verifiedDice.value,
         messageId: roll.message_id,
       })
       .onConflictDoNothing();
@@ -4587,30 +4800,11 @@ async function runPvbRound(
     .sort((left, right) => left.rollIndex - right.rollIndex)
     .map((row) => row.value);
   const playerRound = sumBattleRolls(playerRoundValues);
-  const helperScores = helpers.map((helper) => ({
-    label: helper.label,
-    score: rows
-      .filter(
-        (row) =>
-          row.actorType === "helper" &&
-          row.actorKey === helper.label &&
-          row.round === round,
-      )
-      .reduce((total, row) => total + row.value, 0),
-  }));
-  const houseRound = helperScores.reduce((total, helper) => total + helper.score, 0);
-  const helperRoundValues = helpers
-    .flatMap((helper) =>
-      rows
-        .filter(
-          (row) =>
-            row.actorType === "helper" &&
-            row.actorKey === helper.label &&
-            row.round === round,
-        )
-        .sort((left, right) => left.rollIndex - right.rollIndex)
-        .map((row) => row.value),
-    );
+  const helperRoundValues = rows
+    .filter((row) => row.actorType === "helper" && row.round === round)
+    .sort((left, right) => left.rollIndex - right.rollIndex)
+    .map((row) => row.value);
+  const houseRound = helperRoundValues.reduce((total, value) => total + value, 0);
   const helperExpression = helperRoundValues.join("+");
   const playerExpression = playerRoundValues.join("+");
   const crazyMode = battle.resultRule === "crazy";
@@ -4624,10 +4818,9 @@ async function runPvbRound(
   await resultBot.sendMessage(
     battle.chatId,
     [
-      `🏆 Round ${round}: ${
-        playerWinsRound ? creatorLabel : houseWinsRound ? botLabel : "Draw"
-      } !`,
-      `${playerExpression}=${playerRound} · ${helperExpression}=${houseRound}`,
+      `🏆 Round ${round}: ${playerWinsRound ? "You" : houseWinsRound ? botLabel : "Tie"} ${
+        playerWinsRound || houseWinsRound ? "✅" : "🤝"
+      } (${playerRound}-${houseRound})`,
     ].join("\n"),
   );
 
@@ -4703,23 +4896,16 @@ async function runPvbRound(
   }
 
   if (round >= battle.rounds) {
-    const roundScores = Array.from({ length: battle.rounds }, (_, index) => index + 1).map(
+     const roundScores = Array.from({ length: battle.rounds }, (_, index) => index + 1).map(
       (roundNumber) => {
         const playerValues = rows
           .filter((row) => row.actorType === "player" && row.round === roundNumber)
           .sort((left, right) => left.rollIndex - right.rollIndex)
           .map((row) => row.value);
-        const helperValues = helpers.flatMap((helper) =>
-          rows
-            .filter(
-              (row) =>
-                row.actorType === "helper" &&
-                row.actorKey === helper.label &&
-                row.round === roundNumber,
-            )
-            .sort((left, right) => left.rollIndex - right.rollIndex)
-            .map((row) => row.value),
-        );
+         const helperValues = rows
+           .filter((row) => row.actorType === "helper" && row.round === roundNumber)
+           .sort((left, right) => left.rollIndex - right.rollIndex)
+           .map((row) => row.value);
         return {
           playerScore: playerValues.reduce((total, value) => total + value, 0),
           houseScore: helperValues.reduce((total, value) => total + value, 0),
@@ -4728,10 +4914,14 @@ async function runPvbRound(
         };
       },
     );
-    const playerScore = roundScores.reduce((total, score) => total + score.playerScore, 0);
-    const houseScore = roundScores.reduce((total, score) => total + score.houseScore, 0);
-    const playerOneWon = crazyMode ? playerScore < houseScore : playerScore > houseScore;
-    const tie = playerScore === houseScore;
+     const playerScore = roundScores.filter((score) =>
+       crazyMode ? score.playerScore < score.houseScore : score.playerScore > score.houseScore,
+     ).length;
+     const houseScore = roundScores.filter((score) =>
+       crazyMode ? score.houseScore < score.playerScore : score.houseScore > score.playerScore,
+     ).length;
+     const playerOneWon = playerScore > houseScore;
+     const tie = playerScore === houseScore;
     await settleBattle({
       battleId: battle.id,
       chatId: battle.chatId,
@@ -4741,8 +4931,8 @@ async function runPvbRound(
       gameType: battle.gameType,
       currency: parseCurrency(battle.currency, "USD"),
       stakeMinor: battle.stakeMinor,
-      playerOneScore: playerScore,
-      playerTwoScore: houseScore,
+         playerOneScore: playerScore,
+         playerTwoScore: houseScore,
       playerOneWon,
       fairId: battle.fairId ?? createFairId(),
     });
@@ -4808,14 +4998,13 @@ async function handlePlayerPvbRoll(
     await expirePvbBattle(resultBot, battle.id);
     return true;
   }
-  if (message.dice.emoji !== battle.emoji) {
+  if (!isFreshDirectDiceMessage(message, battle.emoji)) {
     await resultBot.sendMessage(
       message.chat.id,
-      `Use ${battle.emoji} for this round. The player must roll before the helpers.`,
+      `❌ Invalid ${battle.emoji} message. Send the fresh emoji directly, not a forward or a different game emoji.`,
     );
     return true;
   }
-  clearBattleTimeout(battle.id);
 
   const playerRows = await db
     .select()
@@ -4826,6 +5015,10 @@ async function handlePlayerPvbRoll(
         eq(casinoChallengeRollsTable.actorType, "player"),
       ),
     );
+  if (playerRows.some((row) => row.messageId === message.message_id)) {
+    await resultBot.sendMessage(message.chat.id, "That emoji message was already counted for this room.");
+    return true;
+  }
   let round = 1;
   let rollIndex = 1;
   if (battle.targetWins) {
@@ -4851,6 +5044,36 @@ async function handlePlayerPvbRoll(
       }
     }
   }
+  if (round > battle.rounds) {
+    await resultBot.sendMessage(message.chat.id, "This PVB room has already completed its rounds.");
+    return true;
+  }
+  if (
+    playerRows.some(
+      (row) => row.round === round && row.rollIndex === rollIndex,
+    )
+  ) {
+    await resultBot.sendMessage(
+      message.chat.id,
+      `Round ${round} roll ${rollIndex} is already recorded. Wait for the bot result.`,
+    );
+    return true;
+  }
+  const [claimedBattle] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "rolling", turnDeadlineAt: null })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "running"),
+      ),
+    )
+    .returning();
+  if (!claimedBattle) {
+    await resultBot.sendMessage(message.chat.id, "That roll is already being processed. Please wait for the round result.");
+    return true;
+  }
+  clearBattleTimeout(battle.id);
   await db
     .insert(casinoChallengeRollsTable)
     .values({
@@ -4881,12 +5104,23 @@ async function handlePlayerPvbRoll(
     return true;
   }
 
-  await db
-    .update(casinoChallengesTable)
-    .set({ status: "rolling", turnDeadlineAt: null })
-    .where(eq(casinoChallengesTable.id, battle.id));
-  await runPvbRound(resultBot, helperBots, battle, round);
-  if (round < battle.rounds) {
+  try {
+    await runPvbRound(resultBot, helperBots, claimedBattle, round);
+  } catch (error) {
+    logger.error({ err: error, battleId: battle.id, round }, "Verified PvB helper result failed");
+    const deadline = new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS);
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: "running", turnDeadlineAt: deadline })
+      .where(eq(casinoChallengesTable.id, battle.id));
+    scheduleBattleTimeout(resultBot, battle.id);
+    await resultBot.sendMessage(
+      message.chat.id,
+      `⚠️ The ${battle.gameType} bot result could not be verified. Please send ${battle.emoji} again for this round.`,
+    );
+    return true;
+  }
+  if (round < battle.rounds && battle.status !== "completed") {
     await db
       .update(casinoChallengesTable)
       .set({ status: "running" })
@@ -6313,7 +6547,19 @@ async function handleWithdrawalAmount(
 ): Promise<void> {
   const parsed = parseAmountAndCurrency(value, parseCurrency(player.preferredCurrency, "USD"));
   if (!parsed.amountMinor || !isSupportedCurrency(parsed.currency)) {
-    await bot.sendMessage(chatId, "Enter a valid amount, for example <code>1000 INR</code>.");
+    await bot.sendMessage(
+      chatId,
+      [
+        "❌ Enter one exact withdrawal amount.",
+        "A range such as <code>100-200</code> is not a valid amount.",
+        "Example: <code>1000 INR</code> or <code>10 USD</code>.",
+      ].join("\n"),
+      {
+        inline_keyboard: [[
+          { text: "Cancel withdrawal", callback_data: ownedCallback("withdraw:cancel", player.telegramUserId) },
+        ]],
+      },
+    );
     return;
   }
   const { amountMinor, currency } = parsed;
@@ -6766,6 +7012,16 @@ async function handleMainUpdate(
       await handleTipCallback(bot, chatId, player, action);
     } else if (action.startsWith("escrow:")) {
       await handleEscrowCallback(bot, chatId, player, action);
+    } else if (action.startsWith("battle:pvb:play:")) {
+      const battleId = Number(action.split(":")[3]);
+      if (Number.isInteger(battleId)) {
+        await confirmPvbBattle(bot, chatId, callback.from, battleId);
+      }
+    } else if (action.startsWith("battle:pvb:cancel:")) {
+      const battleId = Number(action.split(":")[3]);
+      if (Number.isInteger(battleId)) {
+        await cancelPvbBattle(bot, chatId, callback.from, battleId);
+      }
     } else if (action.startsWith("battle:join:")) {
       if (!callback.message || !isOfficialGameChat(callback.message.chat)) {
         await bot.sendMessage(chatId, "Battles can only be joined in the official RolexCasino group.");
