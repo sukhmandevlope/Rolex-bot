@@ -6,7 +6,9 @@ import {
   casinoChallengeRollsTable,
   casinoChallengesTable,
   casinoCashRequestsTable,
+  casinoDailyBonusSettingsTable,
   casinoEscrowsTable,
+  casinoGameBetSettingsTable,
   casinoGameRoundsTable,
   casinoHouseWalletsTable,
   casinoJackpotParticipantsTable,
@@ -124,6 +126,16 @@ type GameResult = {
 const SUPPORTED_CURRENCIES = ["INR", "USD"] as const;
 const MIN_BET_INR_MINOR = 1_000;
 const MAX_BET_INR_MINOR = 50_000;
+const CONFIGURABLE_GAME_TYPES = new Set([
+  "dice",
+  "darts",
+  "bowling",
+  "basketball",
+  "football",
+  "slots",
+  "7up",
+  "dr",
+]);
 const MIN_DEPOSIT_MINOR: Record<Currency, number> = { INR: 5_000, USD: 50 };
 const MAX_DEPOSIT_MINOR: Record<Currency, number> = { INR: 500_000, USD: 5_000 };
 const MIN_WITHDRAWAL_MINOR: Record<Currency, number> = {
@@ -315,16 +327,46 @@ function convertMinor(amountMinor: number, from: Currency, to: Currency): number
     : amountMinor * INR_PER_USD;
 }
 
-function betInRange(amountMinor: number, currency: Currency): boolean {
-  const amountInrMinor = convertMinor(amountMinor, currency, "INR");
-  return amountInrMinor >= MIN_BET_INR_MINOR && amountInrMinor <= MAX_BET_INR_MINOR;
-}
-
-function betLimitText(currency: Currency): string {
-  const minMinor =
-    currency === "INR"
+async function configuredMinimumBetMinor(
+  gameType: string | undefined,
+  currency: Currency,
+): Promise<number> {
+  if (!gameType) {
+    return currency === "INR"
       ? MIN_BET_INR_MINOR
       : Math.ceil(MIN_BET_INR_MINOR / INR_PER_USD);
+  }
+  const [setting] = await db
+    .select()
+    .from(casinoGameBetSettingsTable)
+    .where(
+      and(
+        eq(casinoGameBetSettingsTable.gameType, gameType),
+        eq(casinoGameBetSettingsTable.currency, currency),
+      ),
+    )
+    .limit(1);
+  if (setting) return setting.minimumBetMinor;
+  return currency === "INR"
+    ? MIN_BET_INR_MINOR
+    : Math.ceil(MIN_BET_INR_MINOR / INR_PER_USD);
+}
+
+async function betInRange(
+  amountMinor: number,
+  currency: Currency,
+  gameType?: string,
+): Promise<boolean> {
+  const amountInrMinor = convertMinor(amountMinor, currency, "INR");
+  const minimumMinor = await configuredMinimumBetMinor(gameType, currency);
+  return amountMinor >= minimumMinor && amountInrMinor <= MAX_BET_INR_MINOR;
+}
+
+function betLimitText(currency: Currency, minimumMinor?: number): string {
+  const minMinor = minimumMinor ??
+    (currency === "INR"
+      ? MIN_BET_INR_MINOR
+      : Math.ceil(MIN_BET_INR_MINOR / INR_PER_USD));
   const maxMinor =
     currency === "INR"
       ? MAX_BET_INR_MINOR
@@ -332,6 +374,34 @@ function betLimitText(currency: Currency): string {
   const min = formatMoney(minMinor, currency);
   const max = formatMoney(maxMinor, currency);
   return `Bet limits: ${min} minimum to ${max} maximum (1 USD = ₹${INR_PER_USD}).`;
+}
+
+async function configuredBetLimitText(
+  currency: Currency,
+  gameType: string,
+): Promise<string> {
+  return betLimitText(
+    currency,
+    await configuredMinimumBetMinor(gameType, currency),
+  );
+}
+
+function normalizeConfigurableGameType(value: string | undefined): string | null {
+  const normalized = value?.toLowerCase().replace(/[-_]/g, "");
+  const aliases: Record<string, string> = {
+    dice: "dice",
+    darts: "darts",
+    bowling: "bowling",
+    basket: "basketball",
+    basketball: "basketball",
+    football: "football",
+    slots: "slots",
+    "7up": "7up",
+    dr: "dr",
+    dicerush: "dr",
+  };
+  const gameType = aliases[normalized ?? ""];
+  return gameType && CONFIGURABLE_GAME_TYPES.has(gameType) ? gameType : null;
 }
 
 function commandFrom(text: string | undefined): {
@@ -1913,6 +1983,8 @@ async function sendMainHelp(
   chatId: number,
   ownerTelegramUserId: number,
 ): Promise<void> {
+  const diceMinimum = await configuredBetLimitText("INR", "dice");
+  const slotsMinimum = await configuredBetLimitText("INR", "slots");
   await bot.sendMessage(
     chatId,
     [
@@ -1928,7 +2000,7 @@ async function sendMainHelp(
       "<b>/mygames</b> — view your latest 10 rounds",
       "<b>/stats</b> — view your performance card",
       "",
-      "<b>Bet limits:</b> ₹10–₹500 or $0.10–$5.00.",
+      `<b>Game minimums:</b> Dice ${diceMinimum}; Slots ${slotsMinimum}. Use /games for every game.`,
       "",
       "Use the buttons below or send a command to continue.",
     ].join("\n"),
@@ -2214,6 +2286,114 @@ async function gameHistoryCardPng(
     });
     process.stdin.end(gameHistoryCardSvg(name, rounds));
   });
+}
+
+type ReferralLeaderboardItem = {
+  rank: number;
+  name: string;
+  referrals: number;
+  earnings: string;
+};
+
+function referralLeaderboardSvg(
+  items: ReferralLeaderboardItem[],
+): string {
+  const rows = items.length > 0
+    ? items.map((item, index) => {
+        const y = 250 + index * 58;
+        return [
+          `<text x="78" y="${y}" fill="#f6c453" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.rank}</text>`,
+          `<text x="150" y="${y}" fill="#ffffff" font-size="23" font-family="DejaVu Sans, sans-serif">${escapeXml(item.name)}</text>`,
+          `<text x="780" y="${y}" text-anchor="end" fill="#76e3a3" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.referrals}</text>`,
+          `<text x="1080" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="21" font-family="DejaVu Sans, sans-serif">${escapeXml(item.earnings)}</text>`,
+          `<line x1="78" y1="${y + 19}" x2="1080" y2="${y + 19}" stroke="#ffffff" stroke-opacity=".08"/>`,
+        ].join("");
+      }).join("")
+    : `<text x="600" y="330" text-anchor="middle" fill="#a9bad2" font-size="25" font-family="DejaVu Sans, sans-serif">No verified referrals yet</text>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900">
+  <defs><linearGradient id="refBg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#101a31"/><stop offset="1" stop-color="#182948"/>
+  </linearGradient></defs>
+  <rect width="1200" height="900" rx="42" fill="url(#refBg)"/>
+  <circle cx="1070" cy="85" r="200" fill="#eab308" opacity=".12"/>
+  <circle cx="90" cy="820" r="210" fill="#2563eb" opacity=".11"/>
+  <rect x="42" y="42" width="1116" height="816" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
+  <text x="78" y="112" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="78" y="174" fill="#ffffff" font-size="40" font-family="DejaVu Sans, sans-serif" font-weight="bold">REFERRAL LEADERBOARD</text>
+  <text x="78" y="214" fill="#9db0cb" font-size="20" font-family="DejaVu Sans, sans-serif">VERIFIED INVITES · TOP 10 PLAYERS</text>
+  <text x="150" y="236" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif">PLAYER</text>
+  <text x="780" y="236" text-anchor="end" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif">REFERRALS</text>
+  <text x="1080" y="236" text-anchor="end" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif">EARNED (INR)</text>
+  ${rows}
+  <text x="78" y="825" fill="#7185a3" font-size="17" font-family="DejaVu Sans, sans-serif">A referral is verified when a new player opens the bot from a referral link.</text>
+</svg>`;
+}
+
+async function referralLeaderboardPng(
+  items: ReferralLeaderboardItem[],
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(new Error(`Could not render referral leaderboard image: ${Buffer.concat(errors).toString("utf8")}`));
+      }
+    });
+    process.stdin.end(referralLeaderboardSvg(items));
+  });
+}
+
+async function sendReferralLeaderboard(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<void> {
+  const referredPlayers = await db
+    .select({
+      referrerId: casinoPlayersTable.referredByPlayerId,
+    })
+    .from(casinoPlayersTable)
+    .where(sql`${casinoPlayersTable.referredByPlayerId} IS NOT NULL`);
+  const counts = new Map<number, number>();
+  for (const row of referredPlayers) {
+    if (row.referrerId != null) {
+      counts.set(row.referrerId, (counts.get(row.referrerId) ?? 0) + 1);
+    }
+  }
+  const referrerIds = [...counts.keys()];
+  const players = referrerIds.length > 0
+    ? await db
+        .select()
+        .from(casinoPlayersTable)
+        .where(inArray(casinoPlayersTable.id, referrerIds))
+    : [];
+  const playerById = new Map(players.map((player) => [player.id, player]));
+  const items = referrerIds
+    .map((referrerId) => {
+      const player = playerById.get(referrerId);
+      return {
+        name: player?.username
+          ? `@${player.username}`
+          : player?.displayName ?? "Player",
+        referrals: counts.get(referrerId) ?? 0,
+        earningsMinor: player?.referralEarningsMinor ?? 0,
+        earnings: formatMoney(player?.referralEarningsMinor ?? 0, "INR"),
+      };
+    })
+    .sort((left, right) =>
+      right.referrals - left.referrals ||
+      right.earningsMinor - left.earningsMinor,
+    )
+    .slice(0, 10)
+    .map((item, index) => ({ ...item, rank: index + 1 }));
+  const image = await referralLeaderboardPng(items);
+  await bot.sendPhoto(chatId, image, "<b>🤝 Referral leaderboard</b>\nTop verified inviters");
 }
 
 async function sendReferral(
@@ -3894,8 +4074,11 @@ async function createBattle(
     );
     return;
   }
-  if (!betInRange(input.amountMinor, input.currency)) {
-    await resultBot.sendMessage(chatId, betLimitText(input.currency));
+  if (!(await betInRange(input.amountMinor, input.currency, game.gameType))) {
+    await resultBot.sendMessage(
+      chatId,
+      await configuredBetLimitText(input.currency, game.gameType),
+    );
     return;
   }
   const player = await ensurePlayer(user);
@@ -4828,11 +5011,9 @@ async function promptPvbRound(
     if (round > battle.rounds) return;
   }
   const remaining = battle.rollsPerRound - rollCount;
-  const roundLabel = battle.targetWins
-    ? `${battle.targetWins} ROUNDS⏰ × ${battle.rollsPerRound} ROLLS 🔥`
-    : `${battle.rounds} ROUNDS⏰ × ${battle.rollsPerRound} ROLLS 🔥`;
-  const modeLabel = battle.resultRule === "crazy" ? "CRAZY" : "NORMAL";
-  const currency = parseCurrency(battle.currency, "USD");
+  const creatorLabel = creator?.username
+    ? `@${creator.username}`
+    : creator?.displayName ?? "Player";
   await db
     .update(casinoChallengesTable)
     .set({
@@ -4844,18 +5025,9 @@ async function promptPvbRound(
   await resultBot.sendMessage(
     battle.chatId,
     [
-      `<b>${battle.gameType.toUpperCase()} VS BOT</b>`,
-      "",
-      `Player: ${casinoPlayerLabel(creator, "Player")}`,
-      `Currency: <b>${currency}</b>`,
-      `Stake: <b>${formatMoney(battle.stakeMinor, currency)}</b>`,
-      `Rounds: <b>${roundLabel}</b>`,
-      `Required emoji: <b>${battle.emoji}</b>`,
-      "",
-      `MODE = ${modeLabel} ✔️`,
-      "",
-      `ROUND ${round}: ${casinoPlayerLabel(creator, "Player")} throws first ➡️`,
-      `Throw ${remaining} more ${battle.emoji}. You have 60 seconds.`,
+      `<b>Round ${round}</b> · ${escapeTelegramText(creatorLabel)}`,
+      `Send ${battle.emoji} directly in this group.`,
+      `${remaining} ${remaining === 1 ? "emoji" : "emojis"} remaining. You have 60 seconds.`,
     ].join("\n"),
   );
 }
@@ -5014,9 +5186,10 @@ async function runPvbRound(
   await resultBot.sendMessage(
     battle.chatId,
     [
-      `🏆 Round ${round}: ${playerWinsRound ? "You" : houseWinsRound ? botLabel : "Tie"} ${
+      `🏆 Round ${round}: ${playerWinsRound ? creatorLabel : houseWinsRound ? botLabel : "Tie"} ${
         playerWinsRound || houseWinsRound ? "✅" : "🤝"
-      } (${playerRound}-${houseRound})`,
+      } (${houseRound} - ${playerRound})`,
+      `${creatorLabel}: ${playerRound} · ${botLabel}: ${houseRound}`,
     ].join("\n"),
   );
 
@@ -5373,8 +5546,14 @@ async function playSimpleMainGame(
   const player = await ensurePlayer(user);
   const wallet = await ensureWallet(player.id, currency);
   const stakeMinor = allIn ? wallet.balanceMinor : amountMinor;
-  if (!stakeMinor || !betInRange(stakeMinor, currency)) {
-    await bot.sendMessage(chatId, betLimitText(currency));
+  if (
+    !stakeMinor ||
+    !(await betInRange(stakeMinor, currency, gameType))
+  ) {
+    await bot.sendMessage(
+      chatId,
+      await configuredBetLimitText(currency, gameType),
+    );
     return;
   }
   if (wallet.balanceMinor < stakeMinor) {
@@ -5812,6 +5991,15 @@ async function sendGames(
   helperLinks: Map<string, string>,
   ownerTelegramUserId: number,
 ): Promise<void> {
+  const configuredLimits = await Promise.all(
+    ["dice", "darts", "basketball", "football", "bowling", "slots"].map(
+      async (gameType) => [
+        gameType,
+        await configuredBetLimitText("INR", gameType),
+      ] as const,
+    ),
+  );
+  const limitByGame = new Map(configuredLimits);
   await bot.sendMessage(
     chatId,
     [
@@ -5829,7 +6017,14 @@ async function sendGames(
       "",
       "<b>Reply to a player for PVP, or use PVB to play against the bot.</b>",
       "",
-      `Bet limits: ${betLimitText("INR")}`,
+      `Game minimums: ${[
+        ["Dice", "dice"],
+        ["Darts", "darts"],
+        ["Basketball", "basketball"],
+        ["Football", "football"],
+        ["Bowling", "bowling"],
+        ["Slots", "slots"],
+      ].map(([label, gameType]) => `${label}: ${limitByGame.get(gameType)}`).join("\n")}`,
     ].join("\n"),
     {
       inline_keyboard: [[
@@ -6048,6 +6243,30 @@ async function sendHouseBalance(
   );
 }
 
+async function sendDailyBonusSettings(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<void> {
+  const [settings] = await db
+    .select()
+    .from(casinoDailyBonusSettingsTable)
+    .limit(1);
+  if (!settings || settings.amountMinor <= 0 || settings.eligibleUsers <= 0) {
+    await bot.sendMessage(chatId, "Daily bonus is not configured yet. Use /setdaily AMOUNT USERS INR|USD.");
+    return;
+  }
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>🎁 Daily bonus configured</b>",
+      "",
+      `Amount: <b>${formatMoney(settings.amountMinor, parseCurrency(settings.currency, "INR"))}</b>`,
+      `Eligible users: <b>${settings.eligibleUsers}</b>`,
+      "This configuration is stored for the daily bonus distribution.",
+    ].join("\n"),
+  );
+}
+
 async function handleAdminCommand(
   bot: TelegramBot,
   chatId: number,
@@ -6061,6 +6280,104 @@ async function handleAdminCommand(
 
   if (command === "hb") {
     await sendHouseBalance(bot, chatId, userId);
+    return true;
+  }
+
+  if (command === "setdaily") {
+    if (!isAdmin(userId)) {
+      await bot.sendMessage(chatId, ADMIN_RESTRICTED_MESSAGE);
+      return true;
+    }
+    const amountMinor = parseMoney(args[0]);
+    const eligibleUsers = Number(args[1]);
+    const currencyToken = args[2]?.toUpperCase();
+    const currency = parseCurrency(currencyToken, "INR");
+    if (
+      !amountMinor ||
+      !Number.isInteger(eligibleUsers) ||
+      eligibleUsers <= 0 ||
+      (currencyToken !== undefined && !isSupportedCurrency(currencyToken))
+    ) {
+      await bot.sendMessage(chatId, "Usage: /setdaily AMOUNT USERS INR|USD\nExample: /setdaily 25 100 INR");
+      return true;
+    }
+    await db
+      .insert(casinoDailyBonusSettingsTable)
+      .values({
+        id: 1,
+        amountMinor,
+        currency,
+        eligibleUsers,
+        updatedByTelegramUserId: userId,
+      })
+      .onConflictDoUpdate({
+        target: casinoDailyBonusSettingsTable.id,
+        set: {
+          amountMinor,
+          currency,
+          eligibleUsers,
+          updatedByTelegramUserId: userId,
+          updatedAt: new Date(),
+        },
+      });
+    await bot.sendMessage(
+      chatId,
+      `✅ Daily bonus saved: ${formatMoney(amountMinor, currency)} for ${eligibleUsers} eligible users.`,
+    );
+    return true;
+  }
+
+  if (
+    command === "set" ||
+    normalizeConfigurableGameType(command.slice(3)) !== null
+  ) {
+    if (!isAdmin(userId)) {
+      await bot.sendMessage(chatId, ADMIN_RESTRICTED_MESSAGE);
+      return true;
+    }
+    const gameToken = command === "set" ? args[0] : command.slice(3);
+    const gameType = normalizeConfigurableGameType(gameToken);
+    const valueArgs = command === "set" ? args.slice(1) : args;
+    const amountMinor = parseMoney(valueArgs[0]);
+    const currencyToken = valueArgs[1]?.toUpperCase();
+    const currency = parseCurrency(currencyToken, "INR");
+    if (
+      !gameType ||
+      !amountMinor ||
+      (currencyToken !== undefined && !isSupportedCurrency(currencyToken)) ||
+      amountMinor > (currency === "INR"
+        ? MAX_BET_INR_MINOR
+        : Math.floor(MAX_BET_INR_MINOR / INR_PER_USD))
+    ) {
+      await bot.sendMessage(
+        chatId,
+        "Usage: /set GAME AMOUNT INR|USD or /setdice AMOUNT INR|USD\nExample: /set dice 25 INR",
+      );
+      return true;
+    }
+    await db
+      .insert(casinoGameBetSettingsTable)
+      .values({
+        gameType,
+        currency,
+        minimumBetMinor: amountMinor,
+        updatedByTelegramUserId: userId,
+      })
+      .onConflictDoUpdate({
+        target: [
+          casinoGameBetSettingsTable.gameType,
+          casinoGameBetSettingsTable.currency,
+        ],
+        set: {
+          minimumBetMinor: amountMinor,
+          updatedByTelegramUserId: userId,
+          updatedAt: new Date(),
+        },
+      });
+    await bot.sendMessage(
+      chatId,
+      `✅ ${gameType} minimum bet saved: ${formatMoney(amountMinor, currency)}.`,
+    );
     return true;
   }
 
@@ -6143,6 +6460,8 @@ async function handleAdminCommand(
         "/balanceadd USER_ID AMOUNT INR|USD",
         "/balancededuct USER_ID AMOUNT INR|USD",
         "/rain AMOUNT INR|USD — credit every registered user",
+        "/setdaily AMOUNT USERS INR|USD — save daily bonus configuration",
+        "/set GAME AMOUNT INR|USD or /setdice AMOUNT — set a game minimum",
         "/users — list recent registered users",
       ].join("\n"),
     );
@@ -7455,6 +7774,8 @@ async function handleMainUpdate(
     await sendMyStats(bot, chatId, player);
   } else if (command === "rank" || command === "leaderboard") {
     await sendLeaderboard(bot, chatId);
+  } else if (command === "reflead" || command === "referralleaderboard") {
+    await sendReferralLeaderboard(bot, chatId);
   } else if (command === "wagerstatus") {
     await sendWagerStatus(
       bot,
@@ -7580,6 +7901,7 @@ async function handleMainUpdate(
       await beginDeposit(bot, chatId, player);
     } else {
       if (args.length > 0) {
+        pendingWithdrawals.set(player.telegramUserId, { stage: "amount" });
         await handleWithdrawalAmount(bot, chatId, player, args.join(" "));
       } else {
         await beginWithdrawal(bot, chatId, player);
