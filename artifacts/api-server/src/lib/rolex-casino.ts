@@ -51,6 +51,15 @@ import {
   escrowErrorText,
   releaseEscrow,
 } from "./rolex-casino-escrow";
+import {
+  blackjackCardLabel,
+  blackjackHandValue,
+  blackjackHit,
+  blackjackMultiplier,
+  blackjackStand,
+  createBlackjackGame,
+} from "./rolex-casino-blackjack";
+import type { BlackjackGame, BlackjackStatus } from "./rolex-casino-blackjack";
 
 type TelegramUser = {
   id: number;
@@ -142,6 +151,7 @@ const CONFIGURABLE_GAME_TYPES = new Set([
   "dr",
   "limbo",
   "mines",
+  "bj",
 ]);
 const LIMBO_MIN_BET_INR_MINOR = 2_000;
 const MIN_DEPOSIT_MINOR: Record<Currency, number> = { INR: 5_000, USD: 50 };
@@ -197,6 +207,19 @@ type MinesGame = {
 
 const activeMinesGames = new Map<string, MinesGame>();
 const minesFairRecords = new Map<string, MinesGame>();
+type BlackjackRoom = {
+  roomId: string;
+  userId: number;
+  playerId: number;
+  chatId: number;
+  amountMinor: number;
+  currency: Currency;
+  fairId: string;
+  game: BlackjackGame;
+  messageId?: number;
+};
+
+const activeBlackjackRooms = new Map<string, BlackjackRoom>();
 const withdrawalConfirmations = new Map<
   string,
   {
@@ -290,13 +313,13 @@ function applyPremiumEmojis(
   const copyableCode = options?.copyableCode
     ? escapeTelegramText(options.copyableCode)
     : null;
-  const hasHtmlMarkup = /<\/?(?:b|strong|code|i|u)>/.test(text);
+  const hasHtmlMarkup = /<\/?(?:b|strong|code|i|u|blockquote)>/.test(text);
   if (premiumEmojiByUnicode.size === 0 && !copyableCode && !hasHtmlMarkup) return { text };
 
   let formatted = escapeTelegramText(text);
   if (hasHtmlMarkup) {
     formatted = formatted.replace(
-      /&lt;(\/?(?:b|strong|code|i|u))&gt;/g,
+      /&lt;(\/?(?:b|strong|code|i|u|blockquote))&gt;/g,
       "<$1>",
     );
   }
@@ -471,6 +494,8 @@ function normalizeConfigurableGameType(value: string | undefined): string | null
     dr: "dr",
     dicerush: "dr",
     limbo: "limbo",
+    bj: "bj",
+    blackjack: "bj",
   };
   const gameType = aliases[normalized ?? ""];
   return gameType && CONFIGURABLE_GAME_TYPES.has(gameType) ? gameType : null;
@@ -1292,11 +1317,12 @@ async function settleGame(input: {
   stakeMinor: number;
   rollValue: number;
   result: GameResult;
+  fairId?: string;
 }): Promise<{ balanceMinor: number; fairId: string }> {
   const wallet = await ensureWallet(input.playerId, input.currency);
   const payoutMinor = Math.floor(input.stakeMinor * input.result.multiplier);
   const transactionId = randomUUID();
-  const fairId = createFairId();
+  const fairId = input.fairId ?? createFairId();
   const houseWallet = await ensureHouseWallet(input.currency);
   const jackpot = await ensureJackpot(input.currency);
   const [jackpotParticipant] = await db
@@ -3363,23 +3389,26 @@ type EscrowCardData = {
 };
 
 function escrowCardSvg(data: EscrowCardData): string {
+  const statusColor = data.status === "COMPLETED"
+    ? "#70e59a"
+    : data.status === "CANCELLED"
+      ? "#ff8a9a"
+      : "#f5d477";
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
-  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#101a31"/><stop offset="1" stop-color="#182948"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#e5ad43"/><stop offset="1" stop-color="#ffe6a1"/></linearGradient></defs>
-  <rect width="1200" height="720" rx="42" fill="url(#bg)"/><circle cx="1060" cy="80" r="210" fill="#3b82f6" opacity=".12"/><circle cx="120" cy="680" r="230" fill="#f59e0b" opacity=".08"/>
-  <rect x="42" y="42" width="1116" height="636" rx="32" fill="none" stroke="#fff" stroke-opacity=".14"/>
-  <text x="86" y="112" fill="#f6c453" font-size="25" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO ESCROW</text>
-  <text x="86" y="180" fill="#fff" font-size="42" font-family="DejaVu Sans" font-weight="bold">Secure transaction</text>
-  <rect x="86" y="215" width="390" height="68" rx="34" fill="#f6c453" fill-opacity=".16" stroke="#f6c453" stroke-opacity=".75"/>
-  <text x="281" y="259" text-anchor="middle" fill="#ffe6a1" font-size="28" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.code)}</text>
-  <text x="86" y="346" fill="#8da2bd" font-size="20" font-family="DejaVu Sans">BUYER</text><text x="86" y="384" fill="#fff" font-size="27" font-family="DejaVu Sans">${escapeXml(data.buyer)}</text>
-  <text x="650" y="346" fill="#8da2bd" font-size="20" font-family="DejaVu Sans">SELLER</text><text x="650" y="384" fill="#fff" font-size="27" font-family="DejaVu Sans">${escapeXml(data.seller)}</text>
-  <line x1="86" y1="426" x2="1114" y2="426" stroke="#fff" stroke-opacity=".14"/>
-  <text x="86" y="480" fill="#8da2bd" font-size="20" font-family="DejaVu Sans">AMOUNT HELD</text><text x="86" y="528" fill="url(#gold)" font-size="40" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
-  <text x="650" y="480" fill="#8da2bd" font-size="20" font-family="DejaVu Sans">SERVICE FEE</text><text x="650" y="528" fill="#fff" font-size="32" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.fee)} · 0.2%</text>
-  <text x="86" y="610" fill="#76e3a3" font-size="25" font-family="DejaVu Sans" font-weight="bold">STATUS: ${escapeXml(data.status)}</text>
-  <text x="86" y="646" fill="#f6c453" font-size="18" font-family="DejaVu Sans">${escapeXml(data.cancelStatus)}</text>
-  <text x="86" y="680" fill="#7185a3" font-size="17" font-family="DejaVu Sans">Sandbox only · Fee is charged when escrow is created.</text>
-</svg>`;
+  <defs><linearGradient id="felt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#061d25"/><stop offset="1" stop-color="#123d3b"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#bb8a2d"/><stop offset=".5" stop-color="#ffe9a2"/><stop offset="1" stop-color="#c99b3b"/></linearGradient></defs>
+  <rect width="1200" height="720" rx="42" fill="url(#felt)"/><circle cx="1060" cy="80" r="230" fill="#d0a848" opacity=".08"/><circle cx="120" cy="680" r="250" fill="#4fd1c5" opacity=".07"/><rect x="38" y="38" width="1124" height="644" rx="30" fill="none" stroke="#d9b55c" stroke-opacity=".42" stroke-width="2"/>
+  <text x="78" y="104" fill="#f5d477" font-size="24" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text>
+  <text x="78" y="166" fill="#fff" font-size="43" font-family="DejaVu Sans" font-weight="bold">SECURE ESCROW</text>
+  <rect x="78" y="202" width="350" height="70" rx="35" fill="#d9b55c" fill-opacity=".13" stroke="#d9b55c" stroke-opacity=".75" stroke-width="2"/><text x="253" y="247" text-anchor="middle" fill="#ffe9a2" font-size="29" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.code)}</text>
+  <rect x="920" y="82" width="190" height="52" rx="26" fill="${statusColor}" fill-opacity=".16" stroke="${statusColor}" stroke-opacity=".72"/><text x="1015" y="116" text-anchor="middle" fill="${statusColor}" font-size="18" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
+  <text x="78" y="340" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">BUYER</text><text x="78" y="380" fill="#fff" font-size="28" font-family="DejaVu Sans">${escapeXml(data.buyer)}</text>
+  <text x="650" y="340" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">SELLER</text><text x="650" y="380" fill="#fff" font-size="28" font-family="DejaVu Sans">${escapeXml(data.seller)}</text>
+  <line x1="78" y1="424" x2="1122" y2="424" stroke="#d9b55c" stroke-opacity=".24"/>
+  <text x="78" y="474" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">AMOUNT HELD</text><text x="78" y="530" fill="url(#gold)" font-size="43" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
+  <text x="650" y="474" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">SERVICE FEE</text><text x="650" y="526" fill="#fff" font-size="32" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.fee)}</text><text x="650" y="554" fill="#9cc4bd" font-size="17" font-family="DejaVu Sans">0.2% · charged at creation</text>
+  <text x="78" y="620" fill="${statusColor}" font-size="24" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.cancelStatus)}</text>
+  <text x="78" y="656" fill="#80aaa4" font-size="17" font-family="DejaVu Sans">Buyer accepts · seller releases · both can request cancellation</text>
+ </svg>`;
 }
 
 async function escrowCardPng(data: EscrowCardData): Promise<Buffer> {
@@ -4251,6 +4280,7 @@ function battleResultText(options: {
   playerOneWon: boolean;
   crazyMode: boolean;
   tie: boolean;
+  stakeMinor: number;
   payoutMinor: number;
   currency: Currency;
   fairId: string;
@@ -4266,7 +4296,8 @@ function battleResultText(options: {
         ? options.playerOneLabel
         : options.playerTwoLabel;
     return [
-      `🏆 Round ${index + 1}: ${winner} ${roundTie ? "🤝" : "✅"} (${round.playerOneScore}-${round.playerTwoScore})`,
+      `<b>Round ${index + 1}</b> · ${roundTie ? "🤝 Draw" : `🏆 <b>${winner}</b> wins`}`,
+      `Score: <b>${round.playerOneScore}</b> — <b>${round.playerTwoScore}</b>`,
     ];
   });
 
@@ -4284,25 +4315,29 @@ function battleResultText(options: {
     ? options.playerOneLabel
     : options.playerTwoLabel;
   const matchPrefix = options.gameType.slice(0, 3).toUpperCase();
+  const stakeLabel = formatMoney(options.stakeMinor, options.currency);
   const payoutLabel = options.tie
-    ? "Stake refunded: 1.00x"
-    : options.playerOneWon
-      ? `Payout: ${formatMoney(options.payoutMinor, options.currency)} (1.92x)`
-      : options.mode === "pvb"
-        ? `Payout: ${formatMoney(0, options.currency)} — the house bot won this match.`
-        : `Payout: ${formatMoney(options.payoutMinor, options.currency)} (1.92x)`;
+    ? `<b>Stake refunded:</b> <b>${stakeLabel}</b>`
+    : options.playerOneWon || options.mode === "pvp"
+      ? `<b>Win:</b> <b>${formatMoney(options.payoutMinor, options.currency)}</b> <i>(1.92×)</i>`
+      : `<b>Win:</b> <b>${formatMoney(0, options.currency)}</b> — the house bot won this match.`;
+  const winnerLine = options.tie
+    ? "<b>Result:</b> Draw"
+    : `<b>Winner:</b> <b>${winnerLabel}</b>`;
   return [
     `<b>🎮 ${options.gameType.toUpperCase()} ${options.mode.toUpperCase()} RESULT</b>`,
     `Match ID: <code>${matchPrefix}-${String(options.battleId).padStart(6, "0")}</code>`,
     `Fair ID: <code>${options.fairId}</code>`,
-    `Challenger: ${options.playerOneLabel}`,
-    `Opponent: ${options.playerTwoLabel}`,
+    "",
+    `<blockquote><b>Players</b>`,
+    `Challenger: <b>${options.playerOneLabel}</b>`,
+    `Opponent: <b>${options.playerTwoLabel}</b>`,
+    `<b>Stake:</b> <b>${stakeLabel}</b> each`,
     "",
     ...roundLines,
+    "</blockquote>",
     "",
-    options.tie
-      ? `<b>🤝 Match tied (${playerOneRoundWins}-${playerTwoRoundWins})</b>`
-      : `<b>🏆 ${winnerLabel} wins ${playerOneRoundWins}-${playerTwoRoundWins}!</b>`,
+    `${winnerLine} · <b>${playerOneRoundWins} — ${playerTwoRoundWins}</b>`,
     payoutLabel,
     options.tie
       ? "No balance was lost; the stake was returned."
@@ -4444,6 +4479,7 @@ async function runPvpBattle(
       playerOneWon,
       crazyMode,
       tie,
+      stakeMinor: battle.stakeMinor,
       payoutMinor: tie ? 0 : Math.round(battle.stakeMinor * 1.92),
       currency: parseCurrency(battle.currency, "USD"),
       fairId: battle.fairId ?? "legacy",
@@ -5414,6 +5450,7 @@ async function handlePlayerPvpRoll(
         playerOneWon,
         crazyMode: battle.resultRule === "crazy",
         tie: matchTie,
+        stakeMinor: battle.stakeMinor,
         payoutMinor: matchTie ? 0 : Math.round(battle.stakeMinor * 1.92),
         currency: parseCurrency(battle.currency, "USD"),
         fairId: settled.fairId,
@@ -5723,6 +5760,7 @@ async function runPvbRound(
           playerOneWon,
           crazyMode,
           tie,
+          stakeMinor: battle.stakeMinor,
           payoutMinor: tie || !playerOneWon ? 0 : Math.round(battle.stakeMinor * 1.92),
           currency: parseCurrency(battle.currency, "USD"),
           fairId: battle.fairId ?? "legacy",
@@ -5815,6 +5853,7 @@ async function runPvbRound(
         playerOneWon,
         crazyMode,
         tie,
+        stakeMinor: battle.stakeMinor,
         payoutMinor: tie || !playerOneWon ? 0 : Math.round(battle.stakeMinor * 1.92),
         currency: parseCurrency(battle.currency, "USD"),
         fairId: battle.fairId ?? "legacy",
@@ -6115,21 +6154,18 @@ async function playSimpleMainGame(
     await sendDelayedGameResult(
       bot,
       chatId,
-      [
-        `${outcome.outcome === "WIN" ? "🏆🎉" : "❌"} ${gameType === "7up" ? "7UP PVB" : gameType.toUpperCase()} ${outcome.outcome}`,
-        gameType === "coin"
-          ? `Result: ${outcome.outcome}`
-          : gameType === "7up"
-            ? `House dice: ${rollValues.join(" + ")} = ${rollValue}`
-            : `Result: ${rollValue}`,
-        gameType === "7up"
-          ? `Selection: ${choice?.toUpperCase()} · Multiplier: ${outcome.multiplier.toFixed(2)}×`
-          : "",
-        `Stake: ${formatMoney(stakeMinor, currency)}`,
-        `Payout: ${formatMoney(payoutMinor, currency)}`,
-        `Balance: ${formatMoney(settled.balanceMinor, currency)}`,
-        `Fair ID: <code>${settled.fairId}</code>`,
-      ].join("\n"),
+      simpleGameResultText({
+        gameType,
+        choice,
+        rollValues,
+        rollValue,
+        outcome,
+        stakeMinor,
+        payoutMinor,
+        currency,
+        balanceMinor: settled.balanceMinor,
+        fairId: settled.fairId,
+      }),
     );
     await auditTransaction(
       bot,
@@ -7069,6 +7105,7 @@ async function sendGames(
       "🎲 <b>7up</b>",
       "🚀 <b>Limbo</b>",
       "💣 <b>Mines</b>",
+      "♠️ <b>Blackjack</b> — <code>/bj AMOUNT INR|USD</code>",
       "",
       "<b>Reply to a player for PVP, or use PVB to play against the bot.</b>",
       "",
@@ -7081,6 +7118,7 @@ async function sendGames(
         ["Slots", "slots"],
         ["Limbo", "limbo"],
         ["Mines", "mines"],
+        ["Blackjack", "bj"],
       ].map(([label, gameType]) => `${label}: ${limitByGame.get(gameType)}`).join("\n")}`,
     ].join("\n"),
     {
@@ -8995,6 +9033,15 @@ async function handleMainUpdate(
       if (Number.isInteger(battleId)) {
         await declineBattle(bot, chatId, callback.from, battleId);
       }
+    } else if (action.startsWith("bj:")) {
+      if (!callback.message || !isOfficialGameChat(callback.message.chat)) {
+        await bot.sendMessage(chatId, "Blackjack is available only in the official RolexCasino group.");
+        return;
+      }
+      const [, rawAction, roomId] = action.split(":");
+      if ((rawAction === "hit" || rawAction === "stand") && roomId) {
+        await handleBlackjackAction(bot, chatId, callback.from, roomId, rawAction);
+      }
     } else if (action.startsWith("jackpot:join:")) {
       if (!callback.message || !isOfficialGameChat(callback.message.chat)) {
         await bot.sendMessage(chatId, "Jackpot entries are available only in the official RolexCasino group.");
@@ -9102,6 +9149,8 @@ async function handleMainUpdate(
     command === "dr" ||
     command === "limbo" ||
     command === "mines" ||
+    command === "bj" ||
+    command === "blackjack" ||
     command === "jackpot";
   if (isGameplayCommand && !isOfficialGameChat(message.chat)) {
     await bot.sendMessage(
@@ -9328,6 +9377,10 @@ async function handleMainUpdate(
     } else {
       await sendMinesSelection(bot, chatId, amountMinor, currency, player.telegramUserId);
     }
+  } else if (command === "bj" || command === "blackjack") {
+    const amountMinor = parseMoney(args[0]);
+    const currency = parseCurrency(args[1], parseCurrency(player.preferredCurrency, "USD"));
+    await startBlackjack(bot, chatId, message.from, amountMinor, currency);
   } else if (command === "7up") {
     const choice = args[0]?.toLowerCase();
     const amountMinor = parseMoney(args[1]);
@@ -9436,11 +9489,18 @@ async function playHelperGame(
       bot,
       chatId,
       [
-        `${result.outcome}`,
-        `Roll: ${rollValue}`,
-        `Stake: ${formatMoney(stakeMinor, currency)}`,
-        `Payout: ${formatMoney(payoutMinor, currency)}`,
-        `Balance: ${formatMoney(settled.balanceMinor, currency)}`,
+        `<b>🎲 ${bot.gameType.toUpperCase()} RESULT</b>`,
+        "",
+        "<blockquote>",
+        `<b>Roll:</b> ${rollValue}`,
+        `<b>Multiplier:</b> <b>${result.multiplier.toFixed(2)}×</b>`,
+        `<b>Bet:</b> <b>${formatMoney(stakeMinor, currency)} → ${formatMoney(payoutMinor, currency)}</b>`,
+        `🎲 <b>Result:</b> ${result.outcome}`,
+        "</blockquote>",
+        result.multiplier > 0
+          ? `<b>🏆 YOU WON ${formatMoney(payoutMinor, currency)}</b>`
+          : `<b>❌ YOU LOST ${formatMoney(stakeMinor, currency)}</b>`,
+        `Balance: <b>${formatMoney(settled.balanceMinor, currency)}</b>`,
         `Fair ID: <code>${settled.fairId}</code>`,
       ].join("\n"),
       {
@@ -9468,6 +9528,284 @@ async function playHelperGame(
     }
     throw error;
   }
+}
+
+function dicePickLabel(choice: string | undefined): string {
+  switch (choice) {
+    case "high":
+      return "4, 5, 6";
+    case "low":
+      return "1, 2, 3";
+    case "odd":
+      return "1, 3, 5";
+    case "even":
+      return "2, 4, 6";
+    case "up":
+      return "7–12";
+    case "down":
+      return "2–6";
+    default:
+      return choice?.toUpperCase() ?? "—";
+  }
+}
+
+function simpleGameResultText(options: {
+  gameType: string;
+  choice?: string;
+  rollValues: number[];
+  rollValue: number;
+  outcome: GameResult;
+  stakeMinor: number;
+  payoutMinor: number;
+  currency: Currency;
+  balanceMinor: number;
+  fairId: string;
+}): string {
+  const isPredict = options.gameType === "dr";
+  const title = isPredict ? "🎲 Predict (Dice)" : `${options.gameType.toUpperCase()} RESULT`;
+  const rollLabel = options.gameType === "7up"
+    ? `${options.rollValues.join(" + ")} = ${options.rollValue}`
+    : String(options.rollValue);
+  return [
+    `<b>${options.outcome.multiplier > 0 ? "🏆🎉" : "❌"} ${title}</b>`,
+    "",
+    "<blockquote>",
+    isPredict ? `<b>Your pick:</b> ${dicePickLabel(options.choice)}` : "",
+    `<b>Multiplier:</b> <b>${options.outcome.multiplier.toFixed(2)}×</b>`,
+    `<b>Bet:</b> <b>${formatMoney(options.stakeMinor, options.currency)} → ${formatMoney(options.payoutMinor, options.currency)}</b>`,
+    `🎲 <b>Rolled value:</b> <b>${rollLabel}</b> ${options.outcome.multiplier > 0 ? "✔️" : "✖️"}`,
+    "</blockquote>",
+    options.outcome.multiplier > 0
+      ? `<b>🏆 YOU WON ${formatMoney(options.payoutMinor, options.currency)}</b>`
+      : `<b>❌ YOU LOST ${formatMoney(options.stakeMinor, options.currency)}</b>`,
+    `Balance: <b>${formatMoney(options.balanceMinor, options.currency)}</b>`,
+    `Fair ID: <code>${options.fairId}</code>`,
+  ].filter(Boolean).join("\n");
+}
+
+function blackjackCardsLabel(cards: import("./rolex-casino-blackjack").BlackjackCard[]): string {
+  return cards.map(blackjackCardLabel).join("  ");
+}
+
+function blackjackStatusText(status: BlackjackStatus): string {
+  switch (status) {
+    case "player_blackjack":
+      return "BLACKJACK";
+    case "won":
+      return "YOU WIN";
+    case "lost":
+      return "DEALER WINS";
+    case "push":
+      return "PUSH";
+    default:
+      return "YOUR TURN";
+  }
+}
+
+function blackjackCaption(
+  room: BlackjackRoom,
+  settled?: { balanceMinor: number; fairId: string },
+): string {
+  const { game } = room;
+  const active = game.status === "active";
+  const dealerCards = active
+    ? `${blackjackCardLabel(game.dealerCards[0])}  🂠`
+    : blackjackCardsLabel(game.dealerCards);
+  const payoutMinor = Math.round(room.amountMinor * blackjackMultiplier(game.status));
+  return [
+    `<b>♠️ ROLEX-CASINO BLACKJACK · ROOM ${room.roomId}</b>`,
+    "",
+    `<b>Dealer:</b> ${dealerCards}${active ? "" : `  · <b>${blackjackHandValue(game.dealerCards)}</b>`}`,
+    `<b>You:</b> ${blackjackCardsLabel(game.playerCards)}  · <b>${blackjackHandValue(game.playerCards)}</b>`,
+    "",
+    `<b>Bet:</b> <b>${formatMoney(room.amountMinor, room.currency)}</b>`,
+    active
+      ? "<i>Hit for another card or stand to reveal the dealer.</i>"
+      : `<b>${blackjackStatusText(game.status)}</b> · <b>${formatMoney(payoutMinor, room.currency)}</b>`,
+    settled ? `Balance: <b>${formatMoney(settled.balanceMinor, room.currency)}</b>` : "",
+    `Fair ID: <code>${settled?.fairId ?? room.fairId}</code>`,
+  ].filter(Boolean).join("\n");
+}
+
+function blackjackKeyboard(
+  room: BlackjackRoom,
+): { inline_keyboard: InlineKeyboardButton[][] } | undefined {
+  if (room.game.status !== "active") return undefined;
+  return {
+    inline_keyboard: [[
+      {
+        text: "Hit",
+        callback_data: ownedCallback(`bj:hit:${room.roomId}`, room.userId),
+      },
+      {
+        text: "Stand",
+        callback_data: ownedCallback(`bj:stand:${room.roomId}`, room.userId),
+      },
+    ]],
+  };
+}
+
+function blackjackCardSvg(room: BlackjackRoom): string {
+  const { game } = room;
+  const dealerCards = game.status === "active"
+    ? [game.dealerCards[0], null]
+    : game.dealerCards;
+  const cardMarkup = (
+    cards: (import("./rolex-casino-blackjack").BlackjackCard | null)[],
+    y: number,
+  ) => cards.map((card, index) => {
+    const x = 80 + index * 145;
+    const label = card ? escapeXml(blackjackCardLabel(card)) : "🂠";
+    const color = card && ["♥", "♦"].includes(card.suit) ? "#ef7890" : "#f2f4f7";
+    return `<g transform="translate(${x} ${y})"><rect width="118" height="158" rx="16" fill="#f8fafc" stroke="#d6b45e" stroke-width="3"/><text x="59" y="83" text-anchor="middle" fill="${color}" font-size="38" font-family="DejaVu Sans" font-weight="bold">${label}</text></g>`;
+  }).join("");
+  const resultColor =
+    game.status === "won" || game.status === "player_blackjack" ? "#70e59a" :
+      game.status === "lost" ? "#ff7d91" : "#f3cf69";
+  const result = game.status === "active" ? "YOUR TURN" : blackjackStatusText(game.status);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <defs><linearGradient id="felt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#061d25"/><stop offset="1" stop-color="#123d3b"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#bb8a2d"/><stop offset=".5" stop-color="#ffe9a2"/><stop offset="1" stop-color="#c99b3b"/></linearGradient></defs>
+  <rect width="1200" height="700" rx="38" fill="url(#felt)"/><circle cx="1040" cy="110" r="240" fill="#d0a848" opacity=".08"/><circle cx="180" cy="620" r="260" fill="#4fd1c5" opacity=".07"/><rect x="36" y="36" width="1128" height="628" rx="28" fill="none" stroke="#d9b55c" stroke-opacity=".38" stroke-width="2"/>
+  <text x="72" y="96" fill="#f5d477" font-size="24" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text><text x="72" y="145" fill="#fff" font-size="42" font-family="DejaVu Sans" font-weight="bold">BLACKJACK</text><text x="1090" y="106" text-anchor="end" fill="#b7d8d0" font-size="20" font-family="DejaVu Sans">ROOM ${escapeXml(room.roomId)}</text>
+  <text x="72" y="210" fill="#9cc4bd" font-size="20" font-family="DejaVu Sans" font-weight="bold">DEALER · ${game.status === "active" ? "HIDDEN CARD" : `${blackjackHandValue(game.dealerCards)} POINTS`}</text>${cardMarkup(dealerCards, 232)}
+  <line x1="72" y1="424" x2="1128" y2="424" stroke="#d9b55c" stroke-opacity=".22"/><text x="72" y="466" fill="#9cc4bd" font-size="20" font-family="DejaVu Sans" font-weight="bold">PLAYER · ${blackjackHandValue(game.playerCards)} POINTS</text>${cardMarkup(game.playerCards, 486)}
+  <text x="690" y="530" fill="${resultColor}" font-size="35" font-family="DejaVu Sans" font-weight="bold">${result}</text><text x="690" y="575" fill="#fff" font-size="25" font-family="DejaVu Sans">BET ${escapeXml(formatMoney(room.amountMinor, room.currency))}</text><text x="690" y="618" fill="url(#gold)" font-size="20" font-family="DejaVu Sans">FAIR RANDOM RESULT</text>
+  </svg>`;
+}
+
+async function blackjackCardPng(room: BlackjackRoom): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render blackjack image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(blackjackCardSvg(room));
+  });
+}
+
+async function finishBlackjackRoom(bot: TelegramBot, room: BlackjackRoom): Promise<void> {
+  const payoutMultiplier = blackjackMultiplier(room.game.status);
+  const settled = await settleGame({
+    playerId: room.playerId,
+    helperBot: "blackjack-main",
+    gameType: "bj",
+    currency: room.currency,
+    stakeMinor: room.amountMinor,
+    rollValue: blackjackHandValue(room.game.playerCards),
+    result: {
+      outcome: room.game.status === "push" ? "PUSH" : payoutMultiplier > 0 ? "WIN" : "LOSS",
+      multiplier: payoutMultiplier,
+    },
+    fairId: room.fairId,
+  });
+  activeBlackjackRooms.delete(room.roomId);
+  const image = await blackjackCardPng(room);
+  const caption = blackjackCaption(room, settled);
+  if (room.messageId) {
+    await bot.editPhoto(room.chatId, room.messageId, image, caption);
+  } else {
+    const sent = await bot.sendPhoto(room.chatId, image, caption);
+    room.messageId = sent.message_id;
+  }
+  if (payoutMultiplier > 0) {
+    await broadcastPlayerWin(bot, room.playerId, "blackjack", Math.round(room.amountMinor * payoutMultiplier), room.currency);
+  }
+  await auditTransaction(
+    bot,
+    [
+      "Type: blackjack settlement",
+      `Player: ${room.userId}`,
+      `Room: ${room.roomId}`,
+      `Stake: ${formatMoney(room.amountMinor, room.currency)}`,
+      `Payout: ${formatMoney(Math.round(room.amountMinor * payoutMultiplier), room.currency)}`,
+      `Fair ID: <code>${room.fairId}</code>`,
+      `Outcome: ${room.game.status}`,
+    ].join("\n"),
+  );
+}
+
+async function updateBlackjackRoom(bot: TelegramBot, room: BlackjackRoom): Promise<void> {
+  const image = await blackjackCardPng(room);
+  const caption = blackjackCaption(room);
+  if (room.messageId) {
+    await bot.editPhoto(room.chatId, room.messageId, image, caption, blackjackKeyboard(room));
+  }
+}
+
+async function startBlackjack(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  amountMinor: number | null,
+  currency: Currency,
+): Promise<void> {
+  if (!amountMinor) {
+    await bot.sendMessage(chatId, "<b>Usage:</b> /bj AMOUNT INR|USD\n\nExample: <code>/bj 100 INR</code>");
+    return;
+  }
+  const existing = [...activeBlackjackRooms.values()].find((room) => room.userId === user.id);
+  if (existing) {
+    await bot.sendMessage(chatId, `You already have an active Blackjack room <b>${existing.roomId}</b>. Finish it before starting another.`);
+    return;
+  }
+  if (!(await betInRange(amountMinor, currency, "bj"))) {
+    await bot.sendMessage(chatId, await configuredBetLimitText(currency, "bj"));
+    return;
+  }
+  const player = await ensurePlayer(user);
+  const wallet = await ensureWallet(player.id, currency);
+  if (wallet.balanceMinor < amountMinor) {
+    await bot.sendMessage(chatId, `<b>❌ Insufficient balance</b>\nAvailable: <b>${formatMoney(wallet.balanceMinor, currency)}</b>`);
+    return;
+  }
+  const room: BlackjackRoom = {
+    roomId: randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase(),
+    userId: user.id,
+    playerId: player.id,
+    chatId,
+    amountMinor,
+    currency,
+    fairId: createFairId(),
+    game: createBlackjackGame(() => randomInt(0, 1_000_000) / 1_000_000),
+  };
+  activeBlackjackRooms.set(room.roomId, room);
+  try {
+    const sent = await bot.sendPhoto(
+      chatId,
+      await blackjackCardPng(room),
+      blackjackCaption(room),
+      blackjackKeyboard(room),
+    );
+    room.messageId = sent.message_id;
+    if (room.game.status !== "active") await finishBlackjackRoom(bot, room);
+  } catch (error) {
+    activeBlackjackRooms.delete(room.roomId);
+    throw error;
+  }
+}
+
+async function handleBlackjackAction(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  roomId: string,
+  action: "hit" | "stand",
+): Promise<void> {
+  const room = activeBlackjackRooms.get(roomId);
+  if (!room || room.userId !== user.id || room.chatId !== chatId || room.game.status !== "active") {
+    await bot.sendMessage(chatId, "That Blackjack room is no longer active.");
+    return;
+  }
+  if (action === "hit") blackjackHit(room.game);
+  else blackjackStand(room.game);
+  if (room.game.status === "active") await updateBlackjackRoom(bot, room);
+  else await finishBlackjackRoom(bot, room);
 }
 
 async function handleHelperUpdate(bot: TelegramBot, update: TelegramUpdate): Promise<void> {
