@@ -116,51 +116,6 @@ type InlineKeyboardButton = {
   url?: string;
 };
 
-function buttonTone(text: string): "green" | "blue" | "red" {
-  const normalized = text.toLowerCase();
-  if (
-    /\b(cancel|reject|decline|delete|remove|debit|close|no)\b/.test(normalized) ||
-    normalized.includes("❌") ||
-    normalized.includes("🔴")
-  ) {
-    return "red";
-  }
-  if (
-    /\b(join|open|deposit|withdraw|confirm|approve|accept|release|save|submit|play|cash|roll|select|continue|yes|claim|retry|again)\b/.test(
-      normalized,
-    ) ||
-    normalized.includes("✅") ||
-    normalized.includes("🟢")
-  ) {
-    return "green";
-  }
-  return "blue";
-}
-
-function colorizeButtonText(text: string): string {
-  if (/^[🟢🔵🔴]\s/.test(text)) return text;
-  const toneEmoji = {
-    green: "🟢",
-    blue: "🔵",
-    red: "🔴",
-  }[buttonTone(text)];
-  return `${toneEmoji} ${text}`;
-}
-
-function colorizeReplyMarkup(
-  replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
-): { inline_keyboard: InlineKeyboardButton[][] } | undefined {
-  if (!replyMarkup) return undefined;
-  return {
-    inline_keyboard: replyMarkup.inline_keyboard.map((row) =>
-      row.map((button) => ({
-        ...button,
-        text: colorizeButtonText(button.text),
-      })),
-    ),
-  };
-}
-
 type BotConfig = {
   label: string;
   token: string;
@@ -829,12 +784,11 @@ class TelegramBot {
     },
   ): Promise<TelegramMessage> {
     const formatted = applyPremiumEmojis(text);
-    const styledMarkup = colorizeReplyMarkup(replyMarkup);
     return this.call<TelegramMessage>("sendMessage", {
       chat_id: chatId,
       text: formatted.text,
       ...(formatted.parseMode ? { parse_mode: formatted.parseMode } : {}),
-      ...(styledMarkup ? { reply_markup: styledMarkup } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
   }
 
@@ -845,13 +799,12 @@ class TelegramBot {
     replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
   ): Promise<TelegramMessage> {
     const formatted = applyPremiumEmojis(text);
-    const styledMarkup = colorizeReplyMarkup(replyMarkup);
     return this.call<TelegramMessage>("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
       text: formatted.text,
       ...(formatted.parseMode ? { parse_mode: formatted.parseMode } : {}),
-      ...(styledMarkup ? { reply_markup: styledMarkup } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
   }
 
@@ -878,8 +831,7 @@ class TelegramBot {
       form.append("caption", formattedCaption.text);
       if (formattedCaption.parseMode) form.append("parse_mode", formattedCaption.parseMode);
     }
-    const styledMarkup = colorizeReplyMarkup(replyMarkup);
-    if (styledMarkup) form.append("reply_markup", JSON.stringify(styledMarkup));
+    if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
     const response = await fetch(
       `https://api.telegram.org/bot${this.config.token}/sendPhoto`,
       { method: "POST", body: form },
@@ -900,13 +852,12 @@ class TelegramBot {
     replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
   ): Promise<TelegramMessage> {
     const formattedCaption = caption ? applyPremiumEmojis(caption) : undefined;
-    const styledMarkup = colorizeReplyMarkup(replyMarkup);
     return this.call<TelegramMessage>("sendPhoto", {
       chat_id: chatId,
       photo: fileId,
       ...(formattedCaption ? { caption: formattedCaption.text } : {}),
       ...(formattedCaption?.parseMode ? { parse_mode: formattedCaption.parseMode } : {}),
-      ...(styledMarkup ? { reply_markup: styledMarkup } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
   }
 
@@ -946,8 +897,7 @@ class TelegramBot {
       photo.byteOffset + photo.byteLength,
     ) as ArrayBuffer;
     form.append("rolex-escrow.png", new Blob([photoBytes], { type: "image/png" }), "rolex-escrow.png");
-    const styledMarkup = colorizeReplyMarkup(replyMarkup);
-    if (styledMarkup) form.append("reply_markup", JSON.stringify(styledMarkup));
+    if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
     const response = await fetch(
       `https://api.telegram.org/bot${this.config.token}/editMessageMedia`,
       { method: "POST", body: form },
