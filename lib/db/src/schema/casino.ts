@@ -55,7 +55,59 @@ export const casinoDailyBonusSettingsTable = pgTable(
       .notNull()
       .defaultNow()
       .$onUpdate(() => new Date()),
+    nextDistributionAt: timestamp("next_distribution_at", {
+      withTimezone: true,
+    }),
   },
+);
+
+export const casinoWeeklyBonusSettingsTable = pgTable(
+  "casino_weekly_bonus_settings",
+  {
+    id: serial("id").primaryKey(),
+    amountMinor: integer("amount_minor").notNull().default(0),
+    currency: varchar("currency", { length: 3 }).notNull().default("INR"),
+    eligibleUsers: integer("eligible_users").notNull().default(0),
+    updatedByTelegramUserId: bigint("updated_by_telegram_user_id", {
+      mode: "number",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+    nextDistributionAt: timestamp("next_distribution_at", {
+      withTimezone: true,
+    }),
+  },
+);
+
+export const casinoBonusClaimsTable = pgTable(
+  "casino_bonus_claims",
+  {
+    id: serial("id").primaryKey(),
+    kind: varchar("kind", { length: 10 }).notNull(),
+    periodKey: varchar("period_key", { length: 80 }).notNull(),
+    playerId: integer("player_id")
+      .notNull()
+      .references(() => casinoPlayersTable.id),
+    currency: varchar("currency", { length: 3 }).notNull(),
+    amountMinor: integer("amount_minor").notNull(),
+    selected: boolean("selected").notNull().default(false),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    bonusPlayerPeriodUnique: unique("casino_bonus_claim_player_period_unique").on(
+      table.kind,
+      table.periodKey,
+      table.playerId,
+    ),
+  }),
 );
 
 export const casinoGameBetSettingsTable = pgTable(
