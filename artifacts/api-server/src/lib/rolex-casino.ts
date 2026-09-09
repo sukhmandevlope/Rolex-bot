@@ -3236,6 +3236,7 @@ function applyRolexGoldBlackTheme(svg: string): string {
     "#70e59a": "#f2c95d",
     "#9affba": "#ffe29a",
     "#e56d86": "#9e6c1e",
+    "#ff8291": "#d09a2f",
   };
   return Object.entries(colors).reduce(
     (themed, [from, to]) => themed.split(from).join(to),
@@ -3487,23 +3488,73 @@ async function sendMainWelcome(
   privateChat: boolean,
   ownerTelegramUserId: number,
 ): Promise<void> {
-  await bot.sendMessage(
-    chatId,
-    [
-      `<b>✨ Welcome, ${escapeTelegramText(displayName)}!</b>`,
-      "",
-      "<b>‼️ I'm Rolex–Casino-Bot</b>",
-      "",
-      privateChat
-        ? "Your private account and wallet center is ready."
-        : "Games are available in this official RolexCasino group.",
-      "",
-      "Use /help to see how to play, deposit, withdraw, and get support.",
-      "",
-      "All balances and cash requests are protected by the casino ledger.",
-    ].join("\n"),
-    mainMenu(helperLinks, ownerTelegramUserId),
-  );
+  const caption = [
+    `<b>Hey ${escapeTelegramText(displayName)}, welcome to Rolex Casino!</b>`,
+    "",
+    "Send /help for commands.",
+  ].join("\n");
+  const menu = mainMenu(helperLinks, ownerTelegramUserId);
+  try {
+    await bot.sendPhoto(
+      chatId,
+      await welcomeCardPng({
+        name: displayName,
+        privateChat,
+      }),
+      caption,
+      menu,
+    );
+  } catch (error) {
+    logger.warn({ err: error, chatId }, "Welcome image delivery failed; sending text fallback");
+    await bot.sendMessage(chatId, caption, menu);
+  }
+}
+
+type WelcomeCardData = {
+  name: string;
+  privateChat: boolean;
+};
+
+function welcomeCardSvg(data: WelcomeCardData): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <defs>
+    <linearGradient id="welcome-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#050505"/><stop offset=".55" stop-color="#17100a"/><stop offset="1" stop-color="#2a1707"/>
+    </linearGradient>
+    <linearGradient id="welcome-gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#a66d18"/><stop offset=".5" stop-color="#ffe29a"/><stop offset="1" stop-color="#c58e2e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="760" rx="42" fill="url(#welcome-bg)"/>
+  <circle cx="1050" cy="80" r="230" fill="#d29a35" opacity=".13"/>
+  <circle cx="120" cy="700" r="220" fill="#8a5b16" opacity=".14"/>
+  <rect x="42" y="42" width="1116" height="676" rx="32" fill="none" stroke="#c59437" stroke-opacity=".7" stroke-width="2"/>
+  <path d="M600 88l18 38 42 6-30 29 7 42-37-20-37 20 7-42-30-29 42-6z" fill="#f6c453" opacity=".9"/>
+  <text x="600" y="225" text-anchor="middle" fill="#f6c453" font-size="30" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEXCASINO</text>
+  <text x="600" y="310" text-anchor="middle" fill="#ffffff" font-size="50" font-family="DejaVu Sans" font-weight="bold">WELCOME TO THE TABLE</text>
+  <text x="600" y="372" text-anchor="middle" fill="url(#welcome-gold)" font-size="42" font-family="DejaVu Sans" font-weight="bold">${escapeXml(svgLabel(data.name, 26))}</text>
+  <line x1="245" y1="418" x2="955" y2="418" stroke="#c59437" stroke-opacity=".55"/>
+  <text x="600" y="482" text-anchor="middle" fill="#f0d78d" font-size="30" font-family="DejaVu Sans" font-weight="bold">PLAY DICE · DARTS · SLOTS · BLACKJACK</text>
+  <text x="600" y="540" text-anchor="middle" fill="#d6b86b" font-size="24" font-family="DejaVu Sans">${data.privateChat ? "Your private wallet and account center is ready." : "Games are available in the official RolexCasino group."}</text>
+  <rect x="350" y="590" width="500" height="66" rx="33" fill="#f6c453" fill-opacity=".14" stroke="#f6c453" stroke-opacity=".8"/>
+  <text x="600" y="632" text-anchor="middle" fill="#ffe29a" font-size="26" font-family="DejaVu Sans" font-weight="bold">SEND /HELP FOR COMMANDS</text>
+</svg>`;
+}
+
+async function welcomeCardPng(data: WelcomeCardData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render welcome image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(applyRolexGoldBlackTheme(welcomeCardSvg(data)));
+  });
 }
 
 async function sendMainHelp(
@@ -3996,39 +4047,50 @@ function gameHistoryCardSvg(
   name: string,
   rounds: GameHistoryCardItem[],
 ): string {
+  const wins = rounds.filter((round) => round.outcome === "WIN").length;
+  const losses = rounds.filter((round) => round.outcome === "LOSS").length;
+  const ties = rounds.filter((round) => round.outcome === "TIE").length;
   const rows = rounds
     .map((round, index) => {
       const color =
         round.outcome === "WIN"
-          ? "#76e3a3"
+          ? "#f6c453"
           : round.outcome === "TIE"
-            ? "#f6c453"
+            ? "#d6b86b"
             : "#ff8291";
       const date = new Date(round.createdAt).toLocaleDateString("en-IN");
-      const y = 305 + index * 58;
+      const y = 350 + index * 53;
       return [
-        `<rect x="56" y="${y - 34}" width="1088" height="48" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".08"/>`,
-        `<text x="82" y="${y}" fill="#ffffff" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold">${index + 1}. ${escapeXml(svgLabel(round.gameType.toUpperCase(), 12))}</text>`,
-        `<text x="350" y="${y}" fill="#c5d3e6" font-size="23" font-family="DejaVu Sans, sans-serif">${escapeXml(round.currency)} ${escapeXml(formatMoney(round.stakeMinor, round.currency as Currency))}</text>`,
-        `<text x="610" y="${y}" fill="${color}" font-size="24" font-family="DejaVu Sans, sans-serif" font-weight="bold">${round.outcome}</text>`,
-        `<text x="790" y="${y}" fill="#c5d3e6" font-size="21" font-family="DejaVu Sans, sans-serif">${escapeXml(date)}</text>`,
+        `<rect x="56" y="${y - 31}" width="1088" height="44" rx="14" fill="#ffffff" fill-opacity=".045" stroke="#c59437" stroke-opacity=".16"/>`,
+        `<text x="82" y="${y}" fill="#ffffff" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">${index + 1}. ${escapeXml(svgLabel(round.gameType.toUpperCase(), 15))}</text>`,
+        `<text x="390" y="${y}" fill="#d6b86b" font-size="21" font-family="DejaVu Sans, sans-serif">${escapeXml(round.currency)} ${escapeXml(formatMoney(round.stakeMinor, round.currency as Currency))}</text>`,
+        `<rect x="650" y="${y - 24}" width="128" height="31" rx="15" fill="${color}" fill-opacity=".15" stroke="${color}" stroke-opacity=".55"/>`,
+        `<text x="714" y="${y - 2}" text-anchor="middle" fill="${color}" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">${round.outcome}</text>`,
+        `<text x="840" y="${y}" fill="#c4a76a" font-size="20" font-family="DejaVu Sans, sans-serif">${escapeXml(date)}</text>`,
       ].join("");
     })
     .join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="920" viewBox="0 0 1200 920">
   <defs><linearGradient id="historyBg" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0" stop-color="#101a31"/><stop offset="1" stop-color="#182948"/>
+    <stop offset="0" stop-color="#050505"/><stop offset=".6" stop-color="#17100a"/><stop offset="1" stop-color="#2a1707"/>
   </linearGradient></defs>
   <rect width="1200" height="920" rx="42" fill="url(#historyBg)"/>
-  <rect x="42" y="42" width="1116" height="836" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
+  <circle cx="1080" cy="90" r="220" fill="#d29a35" opacity=".1"/>
+  <circle cx="90" cy="850" r="180" fill="#8a5b16" opacity=".12"/>
+  <rect x="42" y="42" width="1116" height="836" rx="32" fill="none" stroke="#c59437" stroke-opacity=".62"/>
   <text x="70" y="105" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="4">ROLEXCASINO</text>
-  <text x="70" y="164" fill="#ffffff" font-size="48" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(name, 24))}</text>
-  <text x="70" y="207" fill="#9db0cb" font-size="23" font-family="DejaVu Sans, sans-serif" letter-spacing="2">LATEST 10 GAME RESULTS</text>
-  <text x="82" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">GAME</text>
-  <text x="350" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">STAKE</text>
-  <text x="610" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">RESULT</text>
-  <text x="790" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">DATE</text>
+  <text x="70" y="164" fill="#ffffff" font-size="48" font-family="DejaVu Sans, sans-serif" font-weight="bold">GAME HISTORY</text>
+  <text x="70" y="207" fill="#d6b86b" font-size="23" font-family="DejaVu Sans, sans-serif">${escapeXml(svgLabel(name, 28))} · LAST ${rounds.length} RESULTS</text>
+  <rect x="70" y="232" width="1030" height="58" rx="18" fill="#f6c453" fill-opacity=".08" stroke="#c59437" stroke-opacity=".32"/>
+  <text x="110" y="269" fill="#ffe29a" font-size="20" font-family="DejaVu Sans, sans-serif" font-weight="bold">WINS ${wins}</text>
+  <text x="380" y="269" fill="#d6b86b" font-size="20" font-family="DejaVu Sans, sans-serif" font-weight="bold">TIES ${ties}</text>
+  <text x="650" y="269" fill="#c4a76a" font-size="20" font-family="DejaVu Sans, sans-serif" font-weight="bold">LOSSES ${losses}</text>
+  <text x="82" y="322" fill="#b99650" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">GAME</text>
+  <text x="390" y="322" fill="#b99650" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">STAKE</text>
+  <text x="650" y="322" fill="#b99650" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">RESULT</text>
+  <text x="840" y="322" fill="#b99650" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">DATE</text>
   ${rows}
+  <text x="70" y="870" fill="#8f713d" font-size="17" font-family="DejaVu Sans, sans-serif">RolexCasino verified game activity · All amounts shown in settlement currency</text>
 </svg>`;
 }
 
