@@ -9,6 +9,7 @@ import {
   casinoCashRequestsTable,
   casinoCryptoTipsTable,
   casinoDailyBonusSettingsTable,
+  casinoDailyLossRewardsTable,
   casinoWeeklyBonusSettingsTable,
   casinoEscrowsTable,
   casinoGameBetSettingsTable,
@@ -16,6 +17,8 @@ import {
   casinoGiveawayClaimsTable,
   casinoGiveawaySettingsTable,
   casinoHouseWalletsTable,
+  casinoHouseRoyalePlayersTable,
+  casinoHouseRoyalesTable,
   casinoJackpotParticipantsTable,
   casinoJackpotsTable,
   casinoLedgerEntriesTable,
@@ -127,6 +130,15 @@ type TelegramResponse<T> = {
   };
 };
 
+type TelegramUserProfilePhotos = {
+  total_count: number;
+  photos: Array<Array<{ file_id: string; width: number; height: number }>>;
+};
+
+type TelegramFile = {
+  file_path?: string;
+};
+
 type TelegramSticker = {
   file_id?: string;
   emoji?: string;
@@ -148,6 +160,7 @@ type BotConfig = {
   token: string;
   gameType?: "slots" | "dice" | "darts";
   emoji?: string;
+  customEmojiId?: string;
 };
 
 type GameResult = {
@@ -175,6 +188,7 @@ const CONFIGURABLE_GAME_TYPES = new Set([
 const LIMBO_MIN_BET_INR_MINOR = 2_000;
 const MIN_DEPOSIT_MINOR: Record<Currency, number> = { INR: 5_000, USD: 50 };
 const MAX_DEPOSIT_MINOR: Record<Currency, number> = { INR: 500_000, USD: 5_000 };
+const DEPOSIT_FEE_RATE: Record<Currency, number> = { INR: 0.01, USD: 0.03 };
 const MIN_WITHDRAWAL_MINOR: Record<Currency, number> = {
   INR: 10_000,
   USD: 100,
@@ -232,8 +246,9 @@ const settlingMinesGames = new Set<string>();
 const clientSeeds = new Map<number, string>();
 const currencyMenuMessages = new Map<number, { chatId: number; messageId: number }>();
 let rouletteStickerIds: string[] = [];
-let lastRouletteStickerIndex = -1;
+const rouletteStickerIdsByNumber = new Map<number, string>();
 let activeMainBot: TelegramBot | null = null;
+let activeGiveawayBot: TelegramBot | null = null;
 type BlackjackRoom = {
   roomId: string;
   userId: number;
@@ -273,6 +288,7 @@ const helperConfigs: BotConfig[] = [
     token: process.env.TELEGRAM_HELPER_BOT_1_TOKEN ?? "",
     gameType: "slots",
     emoji: "🎰",
+    customEmojiId: "6249287461332062273",
   },
   {
     label: "dice-helper",
@@ -299,9 +315,10 @@ async function sendDelayedGameResult(
   chatId: number,
   text: string,
   replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+  options?: PremiumEmojiOptions,
 ): Promise<TelegramMessage> {
   await wait(PVP_RESULT_DELAY_MS);
-  return bot.sendMessage(chatId, text, replyMarkup);
+  return bot.sendMessage(chatId, text, replyMarkup, options);
 }
 
 async function sendPvpMessage(
@@ -333,9 +350,29 @@ function escapeTelegramText(value: string): string {
 
 const premiumEmojiByUnicode = new Map<string, string>();
 
+type PremiumEmojiOptions = {
+  copyableCode?: string;
+  emojiOverrides?: Record<string, string>;
+};
+
+const SLOT_PREMIUM_EMOJI_OPTIONS: PremiumEmojiOptions = {
+  emojiOverrides: { "🎰": "6249287461332062273" },
+};
+
+const ROULETTE_PREMIUM_EMOJI_OPTIONS: PremiumEmojiOptions = {
+  emojiOverrides: { "🎰": "5017339507666584402" },
+};
+
+function premiumEmojiOptionsForGame(gameType?: string): PremiumEmojiOptions | undefined {
+  if (gameType === "slots") return SLOT_PREMIUM_EMOJI_OPTIONS;
+  if (gameType === "roulette") return ROULETTE_PREMIUM_EMOJI_OPTIONS;
+  return undefined;
+}
+
 const requestedPremiumEmojiOverrides: Record<string, string> = {
   "✅": "5938109560249127910",
   "❌": "5938290000415167172",
+  "💰": "5864068125112144897",
   "🚀": "6262728561484894770",
   "⚠️": "5938167138580741203",
   "💵": "5938026800524301051",
@@ -354,7 +391,6 @@ const requestedPremiumEmojiOverrides: Record<string, string> = {
   "💣": "5469654973308476699",
   "⚽": "5123352773844271919",
   "🏀": "5120609599707153336",
-  "🎰": "6249287461332062273",
 };
 
 for (const [unicode, customEmojiId] of Object.entries(requestedPremiumEmojiOverrides)) {
@@ -363,7 +399,7 @@ for (const [unicode, customEmojiId] of Object.entries(requestedPremiumEmojiOverr
 
 function applyPremiumEmojis(
   text: string,
-  options?: { copyableCode?: string },
+  options?: PremiumEmojiOptions,
 ): {
   text: string;
   parseMode?: "HTML";
@@ -391,11 +427,12 @@ function applyPremiumEmojis(
     ([left], [right]) => right.length - left.length,
   )) {
     if (!formatted.includes(unicode)) continue;
+    const resolvedCustomEmojiId = options?.emojiOverrides?.[unicode] ?? customEmojiId;
     const token = `\uE000${replacementIndex}\uE001`;
     formatted = formatted.split(unicode).join(token);
     replacements.push({
       token,
-      tag: `<tg-emoji emoji-id="${customEmojiId}">${unicode}</tg-emoji>`,
+      tag: `<tg-emoji emoji-id="${resolvedCustomEmojiId}">${unicode}</tg-emoji>`,
     });
     replacementIndex += 1;
   }
@@ -437,21 +474,20 @@ type DisplayCurrency =
 
 const DISPLAY_CURRENCIES: Array<{
   code: DisplayCurrency;
-  flag: string;
   name: string;
 }> = [
-  { code: "USD", flag: "🇺🇸", name: "US Dollar" },
-  { code: "INR", flag: "🇮🇳", name: "Indian Rupee" },
-  { code: "JPY", flag: "🇯🇵", name: "Japanese Yen" },
-  { code: "CNY", flag: "🇨🇳", name: "Chinese Yuan" },
-  { code: "KRW", flag: "🇰🇷", name: "Korean Won" },
-  { code: "SGD", flag: "🇸🇬", name: "Singapore Dollar" },
-  { code: "HKD", flag: "🇭🇰", name: "Hong Kong Dollar" },
-  { code: "THB", flag: "🇹🇭", name: "Thai Baht" },
-  { code: "MYR", flag: "🇲🇾", name: "Malaysian Ringgit" },
-  { code: "IDR", flag: "🇮🇩", name: "Indonesian Rupiah" },
-  { code: "PHP", flag: "🇵🇭", name: "Philippine Peso" },
-  { code: "BDT", flag: "🇧🇩", name: "Bangladeshi Taka" },
+  { code: "USD", name: "US Dollar" },
+  { code: "INR", name: "Indian Rupee" },
+  { code: "JPY", name: "Japanese Yen" },
+  { code: "CNY", name: "Chinese Yuan" },
+  { code: "KRW", name: "Korean Won" },
+  { code: "SGD", name: "Singapore Dollar" },
+  { code: "HKD", name: "Hong Kong Dollar" },
+  { code: "THB", name: "Thai Baht" },
+  { code: "MYR", name: "Malaysian Ringgit" },
+  { code: "IDR", name: "Indonesian Rupiah" },
+  { code: "PHP", name: "Philippine Peso" },
+  { code: "BDT", name: "Bangladeshi Taka" },
 ];
 
 const FALLBACK_INR_RATES: Record<DisplayCurrency, number> = {
@@ -832,6 +868,10 @@ function depositLimitText(currency: Currency): string {
   return `Deposit limits: ${formatMoney(MIN_DEPOSIT_MINOR[currency], currency)} to ${formatMoney(MAX_DEPOSIT_MINOR[currency], currency)}.`;
 }
 
+function depositFeeMinor(amountMinor: number, currency: Currency): number {
+  return Math.max(1, Math.ceil(amountMinor * DEPOSIT_FEE_RATE[currency]));
+}
+
 function withdrawalFeeMinor(amountMinor: number): number {
   return Math.max(1, Math.ceil(amountMinor * WITHDRAWAL_FEE_RATE));
 }
@@ -896,6 +936,10 @@ class TelegramBot {
   private offset = 0;
   private username = "";
   private readonly config: BotConfig;
+  private readonly profilePhotoCache = new Map<
+    number,
+    { expiresAt: number; dataUri: string | null }
+  >();
 
   constructor(config: BotConfig) {
     this.config = config;
@@ -992,14 +1036,53 @@ class TelegramBot {
     return this.call<TelegramStickerSet>("getStickerSet", { name });
   }
 
+  async getUserProfilePhoto(userId: number): Promise<string | null> {
+    const cached = this.profilePhotoCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) return cached.dataUri;
+    try {
+      const photos = await this.call<TelegramUserProfilePhotos>(
+        "getUserProfilePhotos",
+        { user_id: userId, limit: 1 },
+        { timeoutMs: 8_000, maxAttempts: 1 },
+      );
+      const fileId = photos.photos[0]?.[0]?.file_id;
+      if (!fileId) {
+        this.profilePhotoCache.set(userId, { expiresAt: Date.now() + 300_000, dataUri: null });
+        return null;
+      }
+      const file = await this.call<TelegramFile>(
+        "getFile",
+        { file_id: fileId },
+        { timeoutMs: 8_000, maxAttempts: 1 },
+      );
+      if (!file.file_path) return null;
+      const response = await fetch(
+        `https://api.telegram.org/file/bot${this.config.token}/${file.file_path}`,
+        { signal: AbortSignal.timeout(8_000) },
+      );
+      if (!response.ok) throw new Error(`profile photo download returned ${response.status}`);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const extension = file.file_path.split(".").pop()?.toLowerCase();
+      const mime = extension === "png" ? "image/png" : "image/jpeg";
+      const dataUri = `data:${mime};base64,${bytes.toString("base64")}`;
+      this.profilePhotoCache.set(userId, { expiresAt: Date.now() + 300_000, dataUri });
+      return dataUri;
+    } catch (error) {
+      logger.debug({ err: error, userId, bot: this.config.label }, "Telegram profile photo unavailable");
+      this.profilePhotoCache.set(userId, { expiresAt: Date.now() + 60_000, dataUri: null });
+      return null;
+    }
+  }
+
   async sendMessage(
     chatId: number,
     text: string,
     replyMarkup?: {
       inline_keyboard: InlineKeyboardButton[][];
     },
+    options?: PremiumEmojiOptions,
   ): Promise<TelegramMessage> {
-    const formatted = applyPremiumEmojis(text);
+    const formatted = applyPremiumEmojis(text, options);
     return this.call<TelegramMessage>("sendMessage", {
       chat_id: chatId,
       text: formatted.text,
@@ -1013,12 +1096,29 @@ class TelegramBot {
     messageId: number,
     text: string,
     replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+    options?: PremiumEmojiOptions,
   ): Promise<TelegramMessage> {
-    const formatted = applyPremiumEmojis(text);
+    const formatted = applyPremiumEmojis(text, options);
     return this.call<TelegramMessage>("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
       text: formatted.text,
+      ...(formatted.parseMode ? { parse_mode: formatted.parseMode } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    });
+  }
+
+  async editMessageCaption(
+    chatId: number,
+    messageId: number,
+    caption: string,
+    replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+  ): Promise<TelegramMessage> {
+    const formatted = applyPremiumEmojis(caption);
+    return this.call<TelegramMessage>("editMessageCaption", {
+      chat_id: chatId,
+      message_id: messageId,
+      caption: formatted.text,
       ...(formatted.parseMode ? { parse_mode: formatted.parseMode } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
@@ -1161,6 +1261,13 @@ class TelegramBot {
     });
   }
 
+  async deleteMessage(chatId: number, messageId: number): Promise<void> {
+    await this.call("deleteMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+  }
+
   async sendDice(chatId: number, emoji = this.emoji): Promise<TelegramMessage> {
     return this.call<TelegramMessage>("sendDice", {
       chat_id: chatId,
@@ -1212,7 +1319,12 @@ async function loadPremiumEmojiPack(bot: TelegramBot): Promise<void> {
     const stickerSet = await bot.getStickerSet(packName);
     let loaded = 0;
     for (const sticker of stickerSet.stickers) {
-      if (sticker.emoji && sticker.custom_emoji_id && !premiumEmojiByUnicode.has(sticker.emoji)) {
+      if (
+        sticker.emoji &&
+        sticker.emoji !== "🎰" &&
+        sticker.custom_emoji_id &&
+        !premiumEmojiByUnicode.has(sticker.emoji)
+      ) {
         premiumEmojiByUnicode.set(sticker.emoji, sticker.custom_emoji_id);
         loaded += 1;
       }
@@ -1231,17 +1343,71 @@ async function loadPremiumEmojiPack(bot: TelegramBot): Promise<void> {
 
 async function loadRouletteStickerPack(bot: TelegramBot): Promise<void> {
   try {
-    const stickerSet = await bot.getStickerSet("roulete");
-    rouletteStickerIds = stickerSet.stickers
-      .map((sticker) => sticker.file_id)
-      .filter((fileId): fileId is string => Boolean(fileId));
+    let stickerSet: TelegramStickerSet | null = null;
+    let packName = "roulete";
+    for (const candidate of ["roulete", "roulette"]) {
+      try {
+        stickerSet = await bot.getStickerSet(candidate);
+        packName = candidate;
+        break;
+      } catch {
+        // Support both the legacy pack name and its correctly-spelled alias.
+      }
+    }
+    if (!stickerSet) throw new Error("ROULETTE_STICKER_SET_NOT_FOUND");
+    rouletteStickerIds = [];
+    rouletteStickerIdsByNumber.clear();
+    const usesRouletePackLayout =
+      packName === "roulete" && stickerSet.stickers.length === 38;
+    for (const [index, sticker] of stickerSet.stickers.entries()) {
+      if (!sticker.file_id) continue;
+      rouletteStickerIds.push(sticker.file_id);
+      const number =
+        rouletteStickerNumber(sticker.emoji) ??
+        rouletteStickerNumberFromRouletePackIndex(
+          index,
+          stickerSet.stickers.length,
+        );
+      if (number !== null) {
+        rouletteStickerIdsByNumber.set(number, sticker.file_id);
+      }
+    }
     logger.info(
-      { stickerCount: rouletteStickerIds.length },
+      {
+        packName,
+        stickerCount: rouletteStickerIds.length,
+        numberedStickerCount: rouletteStickerIdsByNumber.size,
+        mapping: usesRouletePackLayout ? "roulete-pack-layout" : "metadata-only",
+      },
       "RolexCasino roulette sticker pack loaded",
     );
   } catch (error) {
     logger.warn({ err: error }, "Roulette sticker pack unavailable at startup");
   }
+}
+
+function rouletteStickerNumber(emoji?: string): number | null {
+  if (!emoji) return null;
+  if (emoji.includes("🔟")) return 10;
+  const digits = emoji.match(/\d/g)?.join("") ?? "";
+  if (!digits) return null;
+  const number = Number(digits);
+  return Number.isInteger(number) && number >= 1 && number <= 36
+    ? number
+    : null;
+}
+
+function rouletteStickerNumberFromRouletePackIndex(
+  index: number,
+  stickerCount: number,
+): number | null {
+  // The linked `roulete` pack contains, in order, two non-playable entries
+  // (00 and 0), followed by the 1–36 result animations. Telegram exposes all
+  // of them with the same 🎰 emoji and no numeric metadata, so the pack's
+  // documented artwork layout is the only reliable mapping for this pack.
+  if (stickerCount !== 38) return null;
+  const number = index - 1;
+  return number >= 1 && number <= 36 ? number : null;
 }
 
 function winLogChatId(): number | null {
@@ -1874,11 +2040,8 @@ async function balanceText(
     0,
   );
   return [
-    `💰 Display currency: <b>${preferredCurrency}</b>`,
-    `INR wallet: ${formatMoney(wallets.find((wallet) => wallet.currency === "INR")?.balanceMinor ?? 0, "INR")}`,
-    `USD wallet: ${formatMoney(wallets.find((wallet) => wallet.currency === "USD")?.balanceMinor ?? 0, "USD")}`,
-    `📊 Total value: <b>${formatDisplayAmount(totalInrMinor, preferredCurrency)}</b>`,
-    `📈 1 USD ≈ ₹${INR_PER_USD} · 1 ${preferredCurrency} ≈ ₹${(1 / (displayRatesInr[preferredCurrency] ?? 1)).toFixed(4)}`,
+    `💰 Selected currency: <b>${preferredCurrency} ${formatDisplayAmount(totalInrMinor, preferredCurrency)}</b>`,
+    `💵 USD value: <b>${formatDisplayAmount(totalInrMinor, "USD")}</b>`,
   ].join("\n");
 }
 
@@ -2016,6 +2179,13 @@ async function settleGame(input: {
           updatedAt: new Date(),
         },
       });
+
+    await recordDailyLoss(
+      tx,
+      input.playerId,
+      input.currency,
+      Math.max(0, totalDebit - payoutMinor),
+    );
 
     return { balanceMinor: updatedWallet.balanceMinor, fairId };
   });
@@ -2182,6 +2352,7 @@ async function createDepositRequest(
   amountMinor: number,
   currency: Currency,
 ): Promise<typeof casinoCashRequestsTable.$inferSelect> {
+  const feeMinor = depositFeeMinor(amountMinor, currency);
   const [request] = await db
     .insert(casinoCashRequestsTable)
     .values({
@@ -2189,6 +2360,7 @@ async function createDepositRequest(
       requestType: "deposit",
       currency,
       amountMinor,
+      feeMinor,
       status: "created",
       fairId: createFairId(),
       note: noteForCashRequest({ kind: "deposit", stage: "network" }),
@@ -2367,10 +2539,14 @@ async function approveCashRequest(
       .returning();
     if (!claimed) return null;
     const wallet = await ensureWallet(request.playerId, currency);
+    const creditedAmountMinor = Math.max(
+      0,
+      request.amountMinor - request.feeMinor,
+    );
     const [updatedWallet] = await tx
       .update(casinoWalletsTable)
       .set({
-        balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${request.amountMinor}`,
+        balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${creditedAmountMinor}`,
         updatedAt: new Date(),
       })
       .where(eq(casinoWalletsTable.id, wallet.id))
@@ -2380,15 +2556,34 @@ async function approveCashRequest(
       walletId: wallet.id,
       transactionId: randomUUID(),
       entryType: "deposit_credit",
-      amountMinor: request.amountMinor,
+      amountMinor: creditedAmountMinor,
       description: `Verified ${currency} deposit #${requestId}`,
     });
+    await tx
+      .insert(casinoHouseWalletsTable)
+      .values({ currency })
+      .onConflictDoNothing();
+    const [houseWallet] = await tx
+      .select()
+      .from(casinoHouseWalletsTable)
+      .where(eq(casinoHouseWalletsTable.currency, currency))
+      .limit(1);
+    if (!houseWallet) throw new Error("HOUSE_WALLET_NOT_FOUND");
+    if (request.feeMinor > 0) {
+      await tx
+        .update(casinoHouseWalletsTable)
+        .set({
+          balanceMinor: sql`${casinoHouseWalletsTable.balanceMinor} + ${request.feeMinor}`,
+          updatedAt: new Date(),
+        })
+        .where(eq(casinoHouseWalletsTable.id, houseWallet.id));
+    }
     await tx
       .insert(casinoWagerRequirementsTable)
       .values({
         playerId: request.playerId,
         currency,
-        requiredMinor: request.amountMinor,
+        requiredMinor: creditedAmountMinor,
         completedMinor: 0,
       })
       .onConflictDoUpdate({
@@ -2397,11 +2592,15 @@ async function approveCashRequest(
           casinoWagerRequirementsTable.currency,
         ],
         set: {
-          requiredMinor: sql`${casinoWagerRequirementsTable.requiredMinor} + ${request.amountMinor}`,
+          requiredMinor: sql`${casinoWagerRequirementsTable.requiredMinor} + ${creditedAmountMinor}`,
           updatedAt: new Date(),
         },
       });
-    return updatedWallet.balanceMinor;
+    return {
+      balanceMinor: updatedWallet.balanceMinor,
+      creditedAmountMinor,
+      feeMinor: request.feeMinor,
+    };
   });
   if (result === null) return "unavailable";
   const [player] = await db
@@ -2414,10 +2613,12 @@ async function approveCashRequest(
       player.telegramUserId,
       [
         "✅ <b>Deposit Approved</b>",
-        `Credited: ${formatMoney(request.amountMinor, currency)}`,
-        `Balance: ${formatMoney(result, currency)}`,
+        `Deposit amount: ${formatMoney(request.amountMinor, currency)}`,
+        `Fee: ${formatMoney(result.feeMinor, currency)} (${currency === "USD" ? "3%" : "1%"})`,
+        `Credited: ${formatMoney(result.creditedAmountMinor, currency)}`,
+        `Balance: ${formatMoney(result.balanceMinor, currency)}`,
         `Fair ID: <code>${request.fairId ?? "legacy"}</code>`,
-        `Wager requirement added: ${formatMoney(request.amountMinor, currency)} (1×)`,
+        `Wager requirement added: ${formatMoney(result.creditedAmountMinor, currency)} (1×)`,
         "Track progress with /wagerstatus.",
       ].join("\n"),
     );
@@ -2429,6 +2630,8 @@ async function approveCashRequest(
       `Request: #${request.id}`,
       `Player: ${request.playerId}`,
       `Amount: ${formatMoney(request.amountMinor, currency)}`,
+      `Fee: ${formatMoney(result.feeMinor, currency)} (${currency === "USD" ? "3%" : "1%"})`,
+      `Credited: ${formatMoney(result.creditedAmountMinor, currency)}`,
       `Fair ID: <code>${request.fairId ?? "legacy"}</code>`,
       "Status: wallet credited; 1× wagering added",
     ].join("\n"),
@@ -2788,6 +2991,7 @@ const MAIN_BOT_COMMANDS = [
   ["stats", "View your stats"],
   ["refer", "View referral rewards"],
   ["daily", "View daily bonus"],
+  ["rackback", "View daily loss rebate"],
   ["weeklybonus", "View weekly bonus"],
   ["giveaway", "View latest giveaway"],
   ["join", "Join latest giveaway"],
@@ -2796,6 +3000,298 @@ const MAIN_BOT_COMMANDS = [
   ["language", "Choose bot language"],
   ["support", "Contact support"],
 ].map(([command, description]) => ({ command, description }));
+
+const RACKBACK_RATE_BPS = 100;
+const RACKBACK_TIMEZONE = "Asia/Calcutta";
+type CasinoDbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+function rackbackLocalParts(date: Date): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+} {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: RACKBACK_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: string): number =>
+    Number(parts.find((part) => part.type === type)?.value ?? 0);
+  return {
+    year: value("year"),
+    month: value("month"),
+    day: value("day"),
+    hour: value("hour"),
+    minute: value("minute"),
+  };
+}
+
+function rackbackDayKey(date: Date): string {
+  const parts = rackbackLocalParts(date);
+  return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function rackbackLocalMidnight(date: Date, dayOffset = 0): Date {
+  const parts = rackbackLocalParts(date);
+  // Asia/Calcutta is UTC+05:30 and has no daylight-saving transitions.
+  return new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day + dayOffset) -
+      5.5 * 60 * 60 * 1_000,
+  );
+}
+
+function rackbackPreviousDayKey(date: Date): string {
+  return rackbackDayKey(new Date(rackbackLocalMidnight(date).getTime() - 1));
+}
+
+function rackbackClaimWindowOpen(date: Date): boolean {
+  const midnight = rackbackLocalMidnight(date);
+  return date.getTime() >= midnight.getTime() &&
+    date.getTime() < midnight.getTime() + 60_000;
+}
+
+function rackbackNextClaimAt(date: Date): Date {
+  return rackbackLocalMidnight(date, 1);
+}
+
+function rackbackCountdown(date: Date, target: Date): string {
+  const totalMinutes = Math.max(
+    0,
+    Math.ceil((target.getTime() - date.getTime()) / 60_000),
+  );
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+}
+
+async function recordDailyLoss(
+  tx: CasinoDbTransaction,
+  playerId: number,
+  currency: Currency,
+  lossMinor: number,
+  createdAt = new Date(),
+): Promise<void> {
+  if (lossMinor <= 0) return;
+  const dayKey = rackbackDayKey(createdAt);
+  await tx
+    .insert(casinoDailyLossRewardsTable)
+    .values({
+      playerId,
+      dayKey,
+      currency,
+      lossMinor,
+      rewardMinor: 0,
+      status: "pending",
+    })
+    .onConflictDoUpdate({
+      target: [
+        casinoDailyLossRewardsTable.playerId,
+        casinoDailyLossRewardsTable.dayKey,
+        casinoDailyLossRewardsTable.currency,
+      ],
+      set: {
+        lossMinor: sql`${casinoDailyLossRewardsTable.lossMinor} + ${lossMinor}`,
+        updatedAt: createdAt,
+      },
+    });
+}
+
+async function distributeDueDailyLossRewards(): Promise<void> {
+  const now = new Date();
+  if (!rackbackClaimWindowOpen(now)) return;
+  const previousDayKey = rackbackPreviousDayKey(now);
+  const pendingRows = await db
+    .select()
+    .from(casinoDailyLossRewardsTable)
+    .where(
+      and(
+        eq(casinoDailyLossRewardsTable.dayKey, previousDayKey),
+        eq(casinoDailyLossRewardsTable.status, "pending"),
+      ),
+    );
+
+  for (const row of pendingRows) {
+    const currency = parseCurrency(row.currency, "INR");
+    const rewardMinor = Math.floor(
+      (row.lossMinor * RACKBACK_RATE_BPS) / 10_000,
+    );
+    const wallet = await ensureWallet(row.playerId, currency);
+    try {
+      await db.transaction(async (tx) => {
+        const [claimed] = await tx
+          .update(casinoDailyLossRewardsTable)
+          .set({
+            rewardMinor,
+            status: "claimed",
+            claimedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(casinoDailyLossRewardsTable.id, row.id),
+              eq(casinoDailyLossRewardsTable.status, "pending"),
+            ),
+          )
+          .returning();
+        if (!claimed) return;
+        const [updatedWallet] = await tx
+          .update(casinoWalletsTable)
+          .set({
+            balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${rewardMinor}`,
+            updatedAt: now,
+          })
+          .where(eq(casinoWalletsTable.id, wallet.id))
+          .returning();
+        if (!updatedWallet) throw new Error("RACKBACK_WALLET_UPDATE_FAILED");
+        if (rewardMinor > 0) {
+          await tx.insert(casinoLedgerEntriesTable).values({
+            walletId: wallet.id,
+            transactionId: randomUUID(),
+            entryType: "rakeback_reward",
+            amountMinor: rewardMinor,
+            description: `1% daily loss rebate for ${row.dayKey}`,
+          });
+        }
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, playerId: row.playerId, dayKey: row.dayKey },
+        "Daily loss rebate distribution failed",
+      );
+    }
+  }
+}
+
+type RackbackCardData = {
+  name: string;
+  inrLoss: string;
+  usdLoss: string;
+  inrReward: string;
+  usdReward: string;
+  status: string;
+  nextReward: string;
+  hoursLeft: string;
+};
+
+function rackbackCardSvg(data: RackbackCardData): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10182e"/><stop offset="1" stop-color="#183b45"/></linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#e5ad43"/><stop offset="1" stop-color="#ffe6a1"/></linearGradient>
+  </defs>
+  <rect width="1200" height="820" rx="42" fill="url(#bg)"/>
+  <circle cx="1080" cy="80" r="210" fill="#f6c453" opacity=".12"/>
+  <circle cx="100" cy="760" r="180" fill="#2563eb" opacity=".12"/>
+  <rect x="42" y="42" width="1116" height="736" rx="32" fill="none" stroke="#f6c453" stroke-opacity=".38" stroke-width="2"/>
+  <text x="86" y="108" fill="#f6c453" font-size="28" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="170" fill="#ffffff" font-size="48" font-family="DejaVu Sans" font-weight="bold">DAILY LOSS REBATE</text>
+  <text x="86" y="208" fill="#9db0cb" font-size="22" font-family="DejaVu Sans">1% BACK ON NET LOSS · ${escapeXml(data.name)}</text>
+  <rect x="70" y="250" width="500" height="178" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <rect x="630" y="250" width="500" height="178" rx="24" fill="#f6c453" fill-opacity=".07" stroke="#f6c453" stroke-opacity=".32"/>
+  <text x="104" y="296" fill="#8da2bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">TODAY'S LOSS RECORDED</text>
+  <text x="104" y="350" fill="#ffffff" font-size="31" font-family="DejaVu Sans" font-weight="bold">INR ${escapeXml(data.inrLoss)}</text>
+  <text x="104" y="394" fill="#ffffff" font-size="31" font-family="DejaVu Sans" font-weight="bold">USD ${escapeXml(data.usdLoss)}</text>
+  <text x="664" y="296" fill="#8da2bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">LAST DAILY REWARD</text>
+  <text x="664" y="350" fill="url(#gold)" font-size="31" font-family="DejaVu Sans" font-weight="bold">INR ${escapeXml(data.inrReward)}</text>
+  <text x="664" y="394" fill="url(#gold)" font-size="31" font-family="DejaVu Sans" font-weight="bold">USD ${escapeXml(data.usdReward)}</text>
+  <line x1="86" y1="468" x2="1114" y2="468" stroke="#ffffff" stroke-opacity=".14"/>
+  <text x="86" y="526" fill="#8da2bd" font-size="22" font-family="DejaVu Sans" font-weight="bold">STATUS</text>
+  <text x="310" y="526" fill="#76e3a3" font-size="28" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
+  <text x="86" y="584" fill="#8da2bd" font-size="22" font-family="DejaVu Sans" font-weight="bold">NEXT REWARD</text>
+  <text x="310" y="584" fill="#ffffff" font-size="25" font-family="DejaVu Sans">${escapeXml(data.nextReward)}</text>
+  <text x="86" y="640" fill="#8da2bd" font-size="22" font-family="DejaVu Sans" font-weight="bold">TIME LEFT</text>
+  <text x="310" y="640" fill="#f6c453" font-size="31" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.hoursLeft)}</text>
+  <text x="86" y="714" fill="#9db0cb" font-size="18" font-family="DejaVu Sans">Losses record from 00:01 through 23:59. Rewards credit during the 00:00 claim window.</text>
+  <text x="86" y="744" fill="#7185a3" font-size="17" font-family="DejaVu Sans">Claim cycle resets daily at 00:01 · Settlement wallets remain separate.</text>
+</svg>`;
+}
+
+async function rackbackCardPng(data: RackbackCardData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render daily loss rebate image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(rackbackCardSvg(data));
+  });
+}
+
+async function sendRackbackStatus(
+  bot: TelegramBot,
+  chatId: number,
+  player: typeof casinoPlayersTable.$inferSelect,
+): Promise<void> {
+  await distributeDueDailyLossRewards();
+  const now = new Date();
+  const currentDayKey = rackbackDayKey(now);
+  const previousDayKey = rackbackPreviousDayKey(now);
+  const rows = await db
+    .select()
+    .from(casinoDailyLossRewardsTable)
+    .where(
+      and(
+        eq(casinoDailyLossRewardsTable.playerId, player.id),
+        inArray(casinoDailyLossRewardsTable.dayKey, [
+          currentDayKey,
+          previousDayKey,
+        ]),
+      ),
+    );
+  const currentRows = rows.filter((row) => row.dayKey === currentDayKey);
+  const previousRows = rows.filter((row) => row.dayKey === previousDayKey);
+  const currentLoss = (currency: Currency): number =>
+    currentRows
+      .filter((row) => parseCurrency(row.currency, "INR") === currency)
+      .reduce((total, row) => total + row.lossMinor, 0);
+  const previousReward = (currency: Currency): number =>
+    previousRows
+      .filter((row) => parseCurrency(row.currency, "INR") === currency)
+      .reduce(
+        (total, row) =>
+          total +
+          (row.rewardMinor > 0
+            ? row.rewardMinor
+            : Math.floor((row.lossMinor * RACKBACK_RATE_BPS) / 10_000)),
+        0,
+      );
+  const claimWindowOpen = rackbackClaimWindowOpen(now);
+  const nextClaimAt = rackbackNextClaimAt(now);
+  const image = await rackbackCardPng({
+    name: player.username ? `@${player.username}` : player.displayName,
+    inrLoss: formatMoney(currentLoss("INR"), "INR"),
+    usdLoss: formatMoney(currentLoss("USD"), "USD"),
+    inrReward: formatMoney(previousReward("INR"), "INR"),
+    usdReward: formatMoney(previousReward("USD"), "USD"),
+    status: claimWindowOpen ? "CLAIM WINDOW OPEN" : "RECORDING TODAY'S LOSSES",
+    nextReward: claimWindowOpen
+      ? "Now (00:00–00:01)"
+      : nextClaimAt.toLocaleString("en-IN", {
+          timeZone: RACKBACK_TIMEZONE,
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    hoursLeft: claimWindowOpen
+      ? "Open now"
+      : rackbackCountdown(now, nextClaimAt),
+  });
+  await bot.sendPhoto(
+    chatId,
+    image,
+    "<b>💰 Daily loss rebate</b>\n1% of net daily losses is credited automatically at 00:00.",
+  );
+}
 
 async function sendCurrencyRates(bot: TelegramBot, chatId: number): Promise<void> {
   await refreshDisplayRates();
@@ -2844,7 +3340,7 @@ function currencyKeyboard(
   for (let index = 0; index < DISPLAY_CURRENCIES.length; index += 3) {
     rows.push(
       DISPLAY_CURRENCIES.slice(index, index + 3).map((item) => ({
-        text: `${item.flag} ${item.code}${preferredCurrency === item.code ? " ✅" : ""}`,
+        text: `${item.code}${preferredCurrency === item.code ? " ✅" : ""}`,
         callback_data: ownedCallback(`currency:set:${item.code}`, ownerTelegramUserId),
       })),
     );
@@ -2969,6 +3465,7 @@ async function sendMainHelp(
       "<b>/setwallet</b> — save a payout destination",
       "<b>/refer</b> — get your verified referral link and rewards",
       "<b>/daily</b> — check your bot-selected daily bonus result",
+      "<b>/rackback</b> — view your daily loss rebate status",
       "<b>/weeklybonus</b> — check your bot-selected weekly bonus result",
       "<b>/global</b> — all-time top 10 by wager",
       "<b>/weekly</b> — top 10 by wager in the last 7 days",
@@ -3035,24 +3532,98 @@ async function sendProfile(
   chatId: number,
   player: typeof casinoPlayersTable.$inferSelect,
 ): Promise<void> {
-  await bot.sendMessage(
+  const [inrWallet, usdWallet] = await Promise.all([
+    ensureWallet(player.id, "INR"),
+    ensureWallet(player.id, "USD"),
+  ]);
+  const avatarDataUri = await bot.getUserProfilePhoto(player.telegramUserId);
+  const image = await profileCardPng({
+    name: player.displayName,
+    username: player.username ? `@${player.username}` : "not set",
+    playerId: String(player.telegramUserId),
+    preferredCurrency: parseDisplayCurrency(player.preferredCurrency, "USD"),
+    payoutWallet: maskPayoutWallet(player.payoutWallet),
+    referralCode: player.referralCode ?? "not set",
+    inrBalance: formatMoney(inrWallet.balanceMinor, "INR"),
+    usdBalance: formatMoney(usdWallet.balanceMinor, "USD"),
+    avatarDataUri,
+  });
+  await bot.sendPhoto(
     chatId,
-    [
-      "👤 RolexCasino player profile",
-      "",
-      `Player ID: ${player.telegramUserId}`,
-      `Name: ${player.displayName}`,
-      `Username: ${player.username ? `@${player.username}` : "not set"}`,
-      `Preferred currency: ${player.preferredCurrency}`,
-      `Payout wallet: ${maskPayoutWallet(player.payoutWallet)}`,
-      `Referral code: ${player.referralCode ?? "not set"}`,
-      "",
-      await balanceText(
-        player.id,
-        parseDisplayCurrency(player.preferredCurrency, "USD"),
-      ),
-    ].join("\n"),
+    image,
+    `👤 ${escapeTelegramText(player.username ? `@${player.username}` : player.displayName)} · Profile`,
   );
+}
+
+type ProfileCardData = {
+  name: string;
+  username: string;
+  playerId: string;
+  preferredCurrency: DisplayCurrency;
+  payoutWallet: string;
+  referralCode: string;
+  inrBalance: string;
+  usdBalance: string;
+  avatarDataUri: string | null;
+};
+
+function profileCardSvg(data: ProfileCardData): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <defs>
+    <linearGradient id="profile-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080d19"/><stop offset=".55" stop-color="#151a2c"/><stop offset="1" stop-color="#252b43"/>
+    </linearGradient>
+    <linearGradient id="profile-gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e7ad42"/><stop offset="1" stop-color="#ffe6a1"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="760" rx="42" fill="url(#profile-bg)"/>
+  <circle cx="1080" cy="80" r="210" fill="#6e83ff" opacity=".16"/>
+  <circle cx="70" cy="730" r="250" fill="#f6c453" opacity=".08"/>
+  <rect x="42" y="42" width="1116" height="676" rx="32" fill="none" stroke="#7184cf" stroke-opacity=".6" stroke-width="2"/>
+  <text x="86" y="112" fill="#8ea6ff" font-size="28" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  ${svgAvatar(data.avatarDataUri, 150, 188, 82, data.name, "#7184cf")}
+  <text x="275" y="178" fill="#ffffff" font-size="52" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(data.name, 22))}</text>
+  <text x="275" y="220" fill="#aeb9df" font-size="25" font-family="DejaVu Sans, sans-serif" letter-spacing="2">PLAYER PROFILE · ACCOUNT CARD</text>
+  <rect x="900" y="182" width="205" height="46" rx="23" fill="#70e59a" fill-opacity=".16" stroke="#70e59a" stroke-opacity=".7"/>
+  <text x="1002" y="212" text-anchor="middle" fill="#70e59a" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">ACCOUNT ACTIVE</text>
+  <rect x="900" y="88" width="205" height="70" rx="35" fill="#f6c453" fill-opacity=".18" stroke="#f6c453" stroke-opacity=".8" stroke-width="2"/>
+  <text x="1002" y="133" text-anchor="middle" fill="#f6c453" font-size="27" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.preferredCurrency)}</text>
+  <line x1="86" y1="276" x2="1114" y2="276" stroke="#7184cf" stroke-opacity=".35"/>
+  <text x="86" y="326" fill="#8da2bd" font-size="21" font-family="DejaVu Sans, sans-serif" font-weight="bold">USERNAME</text>
+  <text x="86" y="364" fill="#ffffff" font-size="28" font-family="DejaVu Sans, sans-serif">${escapeXml(svgLabel(data.username, 30))}</text>
+  <text x="510" y="326" fill="#8da2bd" font-size="21" font-family="DejaVu Sans, sans-serif" font-weight="bold">PLAYER ID</text>
+  <text x="510" y="364" fill="#ffffff" font-size="28" font-family="DejaVu Sans, sans-serif">${escapeXml(svgLabel(data.playerId, 22))}</text>
+  <rect x="70" y="410" width="500" height="150" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#7184cf" stroke-opacity=".55"/>
+  <rect x="626" y="410" width="500" height="150" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#7184cf" stroke-opacity=".55"/>
+  <rect x="70" y="410" width="500" height="8" rx="4" fill="#7184cf"/>
+  <rect x="626" y="410" width="500" height="8" rx="4" fill="#e56d86"/>
+  <text x="104" y="456" fill="#8da2bd" font-size="22" font-family="DejaVu Sans, sans-serif" font-weight="bold">INR WALLET</text>
+  <text x="104" y="516" fill="url(#profile-gold)" font-size="42" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.inrBalance)}</text>
+  <text x="660" y="456" fill="#8da2bd" font-size="22" font-family="DejaVu Sans, sans-serif" font-weight="bold">USD WALLET</text>
+  <text x="660" y="516" fill="url(#profile-gold)" font-size="42" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.usdBalance)}</text>
+  <text x="86" y="612" fill="#8da2bd" font-size="21" font-family="DejaVu Sans, sans-serif" font-weight="bold">REFERRAL CODE</text>
+  <text x="86" y="650" fill="#ffffff" font-size="27" font-family="DejaVu Sans, sans-serif">${escapeXml(svgLabel(data.referralCode, 30))}</text>
+  <text x="510" y="612" fill="#8da2bd" font-size="21" font-family="DejaVu Sans, sans-serif" font-weight="bold">PAYOUT WALLET</text>
+  <text x="510" y="650" fill="#ffffff" font-size="27" font-family="DejaVu Sans, sans-serif">${escapeXml(svgLabel(data.payoutWallet, 32))}</text>
+  <text x="86" y="692" fill="#7185a3" font-size="18" font-family="DejaVu Sans, sans-serif">INR and USD are settlement wallets · balances shown separately for clarity</text>
+</svg>`;
+}
+
+async function profileCardPng(data: ProfileCardData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render profile image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(profileCardSvg(data));
+  });
 }
 
 async function sendSupport(bot: TelegramBot, chatId: number): Promise<void> {
@@ -3087,12 +3658,13 @@ async function sendWallet(
   chatId: number,
   player: typeof casinoPlayersTable.$inferSelect,
 ): Promise<void> {
+  const preferredCurrency = parseDisplayCurrency(player.preferredCurrency, "USD");
   await bot.sendMessage(
     chatId,
     [
       "<b>🏦 Your Wallet</b>",
       "",
-      await balanceText(player.id, parseDisplayCurrency(player.preferredCurrency, "USD")),
+      await balanceText(player.id, preferredCurrency),
       "",
       `👨‍💻 Payout wallet: ${maskPayoutWallet(player.payoutWallet)}`,
       "⚠️ Promo Lock: wagering must be completed before withdrawal.",
@@ -3100,7 +3672,7 @@ async function sendWallet(
       "Minimum withdrawal: ₹100 or $1.00",
     ].join("\n"),
     currencyKeyboard(
-      parseDisplayCurrency(player.preferredCurrency, "USD"),
+      preferredCurrency,
       player.telegramUserId,
     ),
   );
@@ -3200,6 +3772,22 @@ function svgLabel(value: string, maxLength = 24): string {
   return value.length > maxLength
     ? `${value.slice(0, Math.max(1, maxLength - 1))}…`
     : value;
+}
+
+function svgAvatar(
+  dataUri: string | null | undefined,
+  cx: number,
+  cy: number,
+  radius: number,
+  fallback: string,
+  stroke: string,
+): string {
+  const safeFallback = escapeXml(svgLabel(fallback.trim().slice(0, 2).toUpperCase() || "?", 2));
+  const fallbackMarkup = `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="#c3e9ee"/><text x="${cx}" y="${cy + 16}" text-anchor="middle" fill="#07505b" font-size="${Math.round(radius * 0.72)}" font-family="DejaVu Sans" font-weight="bold">${safeFallback}</text>`;
+  const imageMarkup = dataUri
+    ? `<clipPath id="avatar-clip-${cx}-${cy}"><circle cx="${cx}" cy="${cy}" r="${radius - 3}"/></clipPath><image href="${escapeXml(dataUri)}" x="${cx - radius + 3}" y="${cy - radius + 3}" width="${(radius - 3) * 2}" height="${(radius - 3) * 2}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatar-clip-${cx}-${cy})"/>`
+    : fallbackMarkup;
+  return `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="#c3e9ee" stroke="${stroke}" stroke-width="5"/>${imageMarkup}`;
 }
 
 function statsCardSvg(data: StatsCardData): string {
@@ -4276,6 +4864,8 @@ type EscrowCardData = {
   code: string;
   buyer: string;
   seller: string;
+  buyerAvatarDataUri: string | null;
+  sellerAvatarDataUri: string | null;
   amount: string;
   fee: string;
   status: string;
@@ -4288,23 +4878,40 @@ function escrowCardSvg(data: EscrowCardData): string {
     : data.status === "CANCELLED"
       ? "#ff8a9a"
       : "#f5d477";
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
-  <defs><linearGradient id="felt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#061d25"/><stop offset="1" stop-color="#123d3b"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#bb8a2d"/><stop offset=".5" stop-color="#ffe9a2"/><stop offset="1" stop-color="#c99b3b"/></linearGradient></defs>
-  <rect width="1200" height="720" rx="42" fill="url(#felt)"/><circle cx="1060" cy="80" r="230" fill="#d0a848" opacity=".08"/><circle cx="120" cy="680" r="250" fill="#4fd1c5" opacity=".07"/><rect x="38" y="38" width="1124" height="644" rx="30" fill="none" stroke="#d9b55c" stroke-opacity=".42" stroke-width="2"/>
-  <text x="78" y="104" fill="#f5d477" font-size="28" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text>
-  <text x="78" y="166" fill="#fff" font-size="48" font-family="DejaVu Sans" font-weight="bold">SECURE ESCROW</text>
-  <rect x="78" y="202" width="380" height="76" rx="38" fill="#d9b55c" fill-opacity=".13" stroke="#d9b55c" stroke-opacity=".75" stroke-width="2"/><text x="268" y="252" text-anchor="middle" fill="#ffe9a2" font-size="33" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.code)}</text>
-  <rect x="900" y="82" width="220" height="58" rx="29" fill="${statusColor}" fill-opacity=".16" stroke="${statusColor}" stroke-opacity=".72" stroke-width="2"/><text x="1010" y="120" text-anchor="middle" fill="${statusColor}" font-size="20" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
-  <rect x="62" y="305" width="510" height="105" rx="22" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
-  <rect x="628" y="305" width="510" height="105" rx="22" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
-  <text x="94" y="342" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">BUYER</text><text x="94" y="383" fill="#fff" font-size="35" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.buyer)}</text>
-  <text x="660" y="342" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">SELLER</text><text x="660" y="383" fill="#fff" font-size="35" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.seller)}</text>
-  <line x1="78" y1="424" x2="1122" y2="424" stroke="#d9b55c" stroke-opacity=".24"/>
-  <text x="78" y="474" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">AMOUNT HELD</text><text x="78" y="532" fill="url(#gold)" font-size="50" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
-  <text x="650" y="474" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">SERVICE FEE</text><text x="650" y="526" fill="#fff" font-size="38" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.fee)}</text><text x="650" y="558" fill="#9cc4bd" font-size="18" font-family="DejaVu Sans">0.2% · charged at creation</text>
-  <text x="78" y="620" fill="${statusColor}" font-size="27" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.cancelStatus)}</text>
-  <text x="78" y="656" fill="#80aaa4" font-size="18" font-family="DejaVu Sans">Buyer accepts · seller releases · both can request cancellation</text>
- </svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="860" viewBox="0 0 1200 860">
+  <defs>
+    <linearGradient id="escrow-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#052b35"/><stop offset=".55" stop-color="#0b5360"/><stop offset="1" stop-color="#07303c"/></linearGradient>
+    <linearGradient id="escrow-gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f4b72b"/><stop offset=".5" stop-color="#ffe38a"/><stop offset="1" stop-color="#f6a91a"/></linearGradient>
+    <linearGradient id="escrow-card" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#eefcff"/><stop offset="1" stop-color="#c6edf2"/></linearGradient>
+  </defs>
+  <rect width="1200" height="860" rx="40" fill="url(#escrow-bg)"/>
+  <circle cx="1040" cy="55" r="270" fill="#55d3d5" opacity=".12"/><circle cx="120" cy="820" r="260" fill="#f4b72b" opacity=".08"/>
+  <rect x="28" y="28" width="1144" height="804" rx="32" fill="none" stroke="#9be7ea" stroke-opacity=".7" stroke-width="3"/>
+  <text x="72" y="90" fill="#72e4e5" font-size="24" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="72" y="142" fill="#ffffff" font-size="43" font-family="DejaVu Sans" font-weight="bold">PROTECTED ESCROW</text>
+  <rect x="910" y="62" width="220" height="52" rx="26" fill="${statusColor}" fill-opacity=".18" stroke="${statusColor}" stroke-width="2"/>
+  <text x="1020" y="96" text-anchor="middle" fill="${statusColor}" font-size="18" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
+  <text x="72" y="184" fill="#a9d9df" font-size="19" font-family="DejaVu Sans">ESCROW ID</text><text x="210" y="184" fill="#ffffff" font-size="24" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.code)}</text>
+  <rect x="48" y="220" width="1104" height="190" rx="26" fill="#e3f8fa" stroke="#5ccbd1" stroke-width="2"/>
+  <rect x="70" y="242" width="300" height="44" rx="22" fill="#f4b72b"/><text x="220" y="271" text-anchor="middle" fill="#143641" font-size="16" font-family="DejaVu Sans" font-weight="bold">SELLER / FUNDS</text>
+  <rect x="830" y="242" width="300" height="44" rx="22" fill="#1ab0bd"/><text x="980" y="271" text-anchor="middle" fill="#ffffff" font-size="16" font-family="DejaVu Sans" font-weight="bold">BUYER / RECEIVES</text>
+  ${svgAvatar(data.sellerAvatarDataUri, 220, 340, 42, data.seller, "#f4b72b")}
+  ${svgAvatar(data.buyerAvatarDataUri, 980, 340, 42, data.buyer, "#1ab0bd")}
+  <text x="220" y="398" text-anchor="middle" fill="#07505b" font-size="23" font-family="DejaVu Sans" font-weight="bold">${escapeXml(svgLabel(data.seller, 18))}</text>
+  <text x="980" y="398" text-anchor="middle" fill="#07505b" font-size="23" font-family="DejaVu Sans" font-weight="bold">${escapeXml(svgLabel(data.buyer, 18))}</text>
+  <rect x="420" y="248" width="360" height="142" rx="22" fill="#07505b"/>
+  <text x="600" y="284" text-anchor="middle" fill="#8be9eb" font-size="16" font-family="DejaVu Sans" font-weight="bold">PROTECTED VALUE</text>
+  <text x="600" y="348" text-anchor="middle" fill="#ffffff" font-size="49" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
+  <rect x="48" y="446" width="1104" height="118" rx="24" fill="url(#escrow-card)"/>
+  <text x="82" y="482" fill="#47717a" font-size="16" font-family="DejaVu Sans" font-weight="bold">TOTAL</text><text x="82" y="530" fill="#073b45" font-size="31" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
+  <text x="430" y="482" fill="#47717a" font-size="16" font-family="DejaVu Sans" font-weight="bold">SERVICE FEE</text><text x="430" y="530" fill="#073b45" font-size="31" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.fee)}</text>
+  <text x="790" y="482" fill="#47717a" font-size="16" font-family="DejaVu Sans" font-weight="bold">SETTLEMENT</text><text x="790" y="530" fill="${statusColor}" font-size="25" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.cancelStatus)}</text>
+  <text x="72" y="620" fill="#8be9eb" font-size="18" font-family="DejaVu Sans" font-weight="bold">ESCROW FLOW</text>
+  <rect x="48" y="648" width="330" height="72" rx="18" fill="#d5f4da" stroke="#70e59a" stroke-width="2"/><text x="76" y="676" fill="#3d7761" font-size="14" font-family="DejaVu Sans">01</text><text x="76" y="700" fill="#17553e" font-size="19" font-family="DejaVu Sans" font-weight="bold">CREATED</text><text x="332" y="696" text-anchor="end" fill="#45bd73" font-size="28">✓</text>
+  <rect x="435" y="648" width="330" height="72" rx="18" fill="#d5f4da" stroke="#70e59a" stroke-width="2"/><text x="463" y="676" fill="#3d7761" font-size="14" font-family="DejaVu Sans">02</text><text x="463" y="700" fill="#17553e" font-size="19" font-family="DejaVu Sans" font-weight="bold">ACCEPTED</text><text x="719" y="696" text-anchor="end" fill="#45bd73" font-size="28">✓</text>
+  <rect x="822" y="648" width="330" height="72" rx="18" fill="${statusColor}" fill-opacity=".25" stroke="${statusColor}" stroke-width="2"/><text x="850" y="676" fill="#d9fff0" font-size="14" font-family="DejaVu Sans">03</text><text x="850" y="700" fill="#ffffff" font-size="19" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status === "COMPLETED" ? "RELEASED" : "PENDING")}</text>
+  <text x="72" y="780" fill="#9bcfd5" font-size="17" font-family="DejaVu Sans">Buyer accepts · seller releases · both parties can request mutual cancellation</text>
+</svg>`;
 }
 
 async function escrowCardPng(data: EscrowCardData): Promise<Buffer> {
@@ -4331,6 +4938,10 @@ async function sendEscrowCard(
   pin = true,
 ): Promise<void> {
   const currency = parseCurrency(escrow.currency, "USD");
+  const [sellerAvatarDataUri, buyerAvatarDataUri] = await Promise.all([
+    bot.getUserProfilePhoto(seller.telegramUserId),
+    bot.getUserProfilePhoto(buyer.telegramUserId),
+  ]);
   const cancelStatus =
     escrow.senderCancelRequestedAt && escrow.recipientCancelRequestedAt
       ? "MUTUAL CANCEL CONFIRMED"
@@ -4343,30 +4954,33 @@ async function sendEscrowCard(
     code: escrow.code,
     buyer: buyer.username ? `@${buyer.username}` : buyer.displayName,
     seller: seller.username ? `@${seller.username}` : seller.displayName,
+    buyerAvatarDataUri,
+    sellerAvatarDataUri,
     amount: formatMoney(escrow.amountMinor, currency),
     fee: formatMoney(escrow.feeMinor, currency),
     status: escrow.status.toUpperCase(),
     cancelStatus,
   });
   const caption = [
-    `<b>🔐 ESCROW ${escrow.code}</b>`,
+    `<b>🔐 PROTECTED ESCROW · ${escrow.code}</b>`,
     `<b>Buyer:</b> ${escapeTelegramText(buyer.username ? `@${buyer.username}` : buyer.displayName)}`,
     `<b>Seller:</b> ${escapeTelegramText(seller.username ? `@${seller.username}` : seller.displayName)}`,
-    `<b>Amount:</b> ${formatMoney(escrow.amountMinor, currency)}`,
-    `<b>Fee:</b> ${formatMoney(escrow.feeMinor, currency)} (0.2%)`,
+    `<b>💰 Protected value:</b> ${formatMoney(escrow.amountMinor, currency)}`,
+    `<b>Service fee:</b> ${formatMoney(escrow.feeMinor, currency)} (0.2%)`,
     `<b>Fair ID:</b> <code>${escrow.fairId ?? "legacy"}</code>`,
+    `<b>Status:</b> ${escapeTelegramText(cancelStatus)}`,
     "All actions and status updates stay in this single card.",
   ].join("\n");
   const inlineKeyboard: InlineKeyboardButton[][] =
     escrow.status === "pending"
       ? [[
-          { text: "Accept deal", callback_data: `escrow:accept:${escrow.code}` },
-          { text: "Reject deal", callback_data: `escrow:reject:${escrow.code}` },
+          { text: "✅ Accept deal", callback_data: `escrow:accept:${escrow.code}` },
+          { text: "❌ Reject deal", callback_data: `escrow:reject:${escrow.code}` },
         ]]
       : escrow.status === "accepted"
         ? [[
-            { text: "Seller: release payment", callback_data: `escrow:release:${escrow.code}` },
-            { text: "Mutual cancel", callback_data: `escrow:cancel:${escrow.code}` },
+            { text: "💰 Seller: release payment", callback_data: `escrow:release:${escrow.code}` },
+            { text: "❌ Mutual cancel", callback_data: `escrow:cancel:${escrow.code}` },
           ]]
         : [];
   if (escrow.messageId) {
@@ -4767,11 +5381,197 @@ function parseBattleArguments(args: string[], fallbackCurrency: Currency): {
 }
 
 const battleTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
+const battleTimeoutWarnings = new Set<number>();
+const battleTimeoutWarningInFlight = new Set<number>();
+const automaticPvpRollsInFlight = new Set<number>();
 
 function clearBattleTimeout(battleId: number): void {
   const timeout = battleTimeouts.get(battleId);
   if (timeout) clearTimeout(timeout);
   battleTimeouts.delete(battleId);
+}
+
+const BATTLE_WARNING_GRACE_MS = 30_000;
+
+async function sendBattleTimeoutWarning(
+  resultBot: TelegramBot,
+  battle: typeof casinoChallengesTable.$inferSelect,
+  expectedLabel: string,
+): Promise<boolean> {
+  if (
+    battleTimeoutWarnings.has(battle.id) ||
+    battleTimeoutWarningInFlight.has(battle.id)
+  ) {
+    return false;
+  }
+  battleTimeoutWarningInFlight.add(battle.id);
+  battleTimeoutWarnings.add(battle.id);
+  try {
+    const deadline = new Date(Date.now() + BATTLE_WARNING_GRACE_MS);
+    await db
+      .update(casinoChallengesTable)
+      .set({ turnDeadlineAt: deadline })
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          eq(casinoChallengesTable.status, battle.status),
+        ),
+      );
+    await resultBot.sendMessage(
+      battle.chatId,
+      [
+        "⏰ <b>120 seconds are over.</b>",
+        `<b>You have only 30 seconds</b> to send ${battle.emoji} ${expectedLabel}.`,
+        "Otherwise the bot will roll it for you and calculate the result automatically.",
+      ].join("\n"),
+      undefined,
+      premiumEmojiOptionsForGame(battle.gameType),
+    );
+    scheduleBattleTimeout(resultBot, battle.id, BATTLE_WARNING_GRACE_MS);
+    return true;
+  } catch (error) {
+    battleTimeoutWarnings.delete(battle.id);
+    throw error;
+  } finally {
+    battleTimeoutWarningInFlight.delete(battle.id);
+  }
+}
+
+async function autoRollPvbTurn(
+  resultBot: TelegramBot,
+  battle: typeof casinoChallengesTable.$inferSelect,
+): Promise<void> {
+  const [claimed] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "rolling", turnDeadlineAt: null })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "running"),
+      ),
+    )
+    .returning();
+  if (!claimed) return;
+  const playerRows = await db
+    .select()
+    .from(casinoChallengeRollsTable)
+    .where(
+      and(
+        eq(casinoChallengeRollsTable.challengeId, battle.id),
+        eq(casinoChallengeRollsTable.actorType, "player"),
+      ),
+    );
+  let round = 1;
+  let rollCount = 0;
+  if (battle.targetWins) {
+    const latestRound = playerRows.reduce(
+      (latest, row) => Math.max(latest, row.round),
+      0,
+    );
+    const latestCount = playerRows.filter((row) => row.round === latestRound).length;
+    round = latestRound === 0 || latestCount >= battle.rollsPerRound
+      ? latestRound + 1
+      : latestRound;
+    rollCount = latestRound === 0 || latestCount >= battle.rollsPerRound
+      ? 0
+      : latestCount;
+  } else {
+    for (let candidate = 1; candidate <= battle.rounds; candidate += 1) {
+      const count = playerRows.filter((row) => row.round === candidate).length;
+      if (count < battle.rollsPerRound) {
+        round = candidate;
+        rollCount = count;
+        break;
+      }
+    }
+  }
+  try {
+    for (let rollIndex = rollCount + 1; rollIndex <= battle.rollsPerRound; rollIndex += 1) {
+      const verified = await sendVerifiedBotDice(
+        resultBot,
+        resultBot,
+        battle.chatId,
+        battle.emoji,
+        battle.id,
+      );
+      await db
+        .insert(casinoChallengeRollsTable)
+        .values({
+          challengeId: battle.id,
+          actorType: "player",
+          actorKey: `timeout-player:${battle.id}`,
+          playerId: battle.creatorPlayerId,
+          round,
+          rollIndex,
+          emoji: verified.roll.dice?.emoji ?? battle.emoji,
+          value: verified.roll.dice?.value ?? 1,
+          messageId: verified.roll.message_id,
+        })
+        .onConflictDoNothing();
+    }
+    await runPvbRound(resultBot, new Map(), claimed, round);
+  } catch (error) {
+    logger.error({ err: error, battleId: battle.id }, "Automatic PVB roll failed");
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: "cancelled", turnDeadlineAt: null, completedAt: new Date() })
+      .where(eq(casinoChallengesTable.id, battle.id));
+    await resultBot.sendMessage(
+      battle.chatId,
+      "❌ The automatic roll could not be verified. This PVB room was cancelled without settling a second time.",
+    );
+  }
+}
+
+async function autoRollPvpTurn(
+  resultBot: TelegramBot,
+  battle: typeof casinoChallengesTable.$inferSelect,
+): Promise<void> {
+  if (battle.status !== "awaiting_player_one" && battle.status !== "awaiting_player_two") return;
+  if (automaticPvpRollsInFlight.has(battle.id)) return;
+  automaticPvpRollsInFlight.add(battle.id);
+  const expectedPlayerId =
+    battle.status === "awaiting_player_two"
+      ? battle.playerTwoId
+      : battle.creatorPlayerId;
+  try {
+    if (!expectedPlayerId) return;
+    const [expectedPlayer] = await db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.id, expectedPlayerId))
+      .limit(1);
+    if (!expectedPlayer) return;
+    const verified = await sendVerifiedBotDice(
+      resultBot,
+      resultBot,
+      battle.chatId,
+      battle.emoji,
+      battle.id,
+    );
+    battleTimeoutWarnings.delete(battle.id);
+    await handlePlayerPvpRoll(resultBot, verified.roll, expectedPlayer);
+  } catch (error) {
+    logger.error({ err: error, battleId: battle.id }, "Automatic PVP roll failed");
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: "cancelled", turnDeadlineAt: null, completedAt: new Date() })
+      .where(
+        and(
+          eq(casinoChallengesTable.id, battle.id),
+          inArray(casinoChallengesTable.status, [
+            "awaiting_player_one",
+            "awaiting_player_two",
+          ]),
+        ),
+      );
+    await resultBot.sendMessage(
+      battle.chatId,
+      "❌ The automatic roll could not be verified. This PVP room was cancelled without settling a second time.",
+    );
+  } finally {
+    automaticPvpRollsInFlight.delete(battle.id);
+  }
 }
 
 async function expirePvbBattle(
@@ -4789,10 +5589,19 @@ async function expirePvbBattle(
       !["pending_confirmation", "running", "rolling", "roulette_choice"].includes(battle.status)
   ) {
     clearBattleTimeout(battleId);
+    battleTimeoutWarnings.delete(battleId);
     return;
   }
   if (battle.turnDeadlineAt && !isBattleTurnExpired(battle.turnDeadlineAt)) {
     scheduleBattleTimeout(resultBot, battle.id, battle.turnDeadlineAt.getTime() - Date.now());
+    return;
+  }
+
+  if (battle.status === "running") {
+    if (battleTimeoutWarningInFlight.has(battle.id)) return;
+    if (await sendBattleTimeoutWarning(resultBot, battle, "for your PVB turn")) return;
+    battleTimeoutWarnings.delete(battle.id);
+    await autoRollPvbTurn(resultBot, battle);
     return;
   }
 
@@ -4816,6 +5625,7 @@ async function expirePvbBattle(
     )
     .returning();
   clearBattleTimeout(battleId);
+  battleTimeoutWarnings.delete(battleId);
   if (!cancelledBattle) return;
 
   const timeoutOutcome = battleTimeoutOutcome(battle.stakeMinor);
@@ -4836,6 +5646,43 @@ async function expirePvpBattle(
   resultBot: TelegramBot,
   battleId: number,
 ): Promise<void> {
+  const [battle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(eq(casinoChallengesTable.id, battleId))
+    .limit(1);
+  if (!battle) {
+    clearBattleTimeout(battleId);
+    battleTimeoutWarnings.delete(battleId);
+    return;
+  }
+  if (
+    battle.status === "awaiting_player_one" ||
+    battle.status === "awaiting_player_two"
+  ) {
+    if (battleTimeoutWarningInFlight.has(battle.id)) return;
+    const [expectedPlayer] = await db
+      .select()
+      .from(casinoPlayersTable)
+      .where(
+        eq(
+          casinoPlayersTable.id,
+          battle.status === "awaiting_player_two"
+            ? battle.playerTwoId as number
+            : battle.creatorPlayerId,
+        ),
+      )
+      .limit(1);
+    const warned = await sendBattleTimeoutWarning(
+      resultBot,
+      battle,
+      `for ${casinoPlayerLabel(expectedPlayer, "the expected player")}'s PVP turn`,
+    );
+    if (warned) return;
+    battleTimeoutWarnings.delete(battle.id);
+    await autoRollPvpTurn(resultBot, battle);
+    return;
+  }
   const [cancelledBattle] = await db
     .update(casinoChallengesTable)
     .set({
@@ -4858,6 +5705,7 @@ async function expirePvpBattle(
     )
     .returning();
   clearBattleTimeout(battleId);
+  battleTimeoutWarnings.delete(battleId);
   if (!cancelledBattle) return;
   await resultBot.sendMessage(
     cancelledBattle.chatId,
@@ -5022,13 +5870,18 @@ async function settleBattle(input: {
       playerTwoBalance = playerTwo.balanceMinor;
     }
 
-    const { tie } = calculateBattlePayouts({
+    const tie = input.playerOneScore === input.playerTwoScore;
+    const playerOneWon = tie ? false : input.playerOneWon;
+    const { tie: payoutTie } = calculateBattlePayouts({
       stakeMinor: input.stakeMinor,
       playerOneScore: input.playerOneScore,
       playerTwoScore: input.playerTwoScore,
-      playerOneWon: input.playerOneWon,
+      playerOneWon,
       hasPlayerTwo: Boolean(input.playerTwoId),
     });
+    if (payoutTie !== tie) {
+      throw new Error("BATTLE_TIE_STATE_MISMATCH");
+    }
     const customMultiplier =
       input.payoutMultiplier !== undefined && Number.isFinite(input.payoutMultiplier)
         ? Math.max(0, input.payoutMultiplier)
@@ -5038,12 +5891,12 @@ async function settleBattle(input: {
           stakeMinor: input.stakeMinor,
           playerOneScore: input.playerOneScore,
           playerTwoScore: input.playerTwoScore,
-          playerOneWon: input.playerOneWon,
+          playerOneWon,
           hasPlayerTwo: Boolean(input.playerTwoId),
         }).playerOnePayout
       : tie
         ? input.stakeMinor
-        : input.playerOneWon
+        : playerOneWon
           ? Math.round(input.stakeMinor * customMultiplier)
           : 0;
     const playerTwoPayout = customMultiplier === null
@@ -5051,12 +5904,12 @@ async function settleBattle(input: {
           stakeMinor: input.stakeMinor,
           playerOneScore: input.playerOneScore,
           playerTwoScore: input.playerTwoScore,
-          playerOneWon: input.playerOneWon,
+          playerOneWon,
           hasPlayerTwo: Boolean(input.playerTwoId),
         }).playerTwoPayout
       : tie && input.playerTwoId
         ? input.stakeMinor
-        : input.playerTwoId && !input.playerOneWon
+        : input.playerTwoId && !playerOneWon
           ? Math.round(input.stakeMinor * customMultiplier)
           : 0;
 
@@ -5108,7 +5961,7 @@ async function settleBattle(input: {
       }
     }
     if (houseWallet && !tie) {
-      const houseAmount = input.playerOneWon
+      const houseAmount = playerOneWon
         ? Math.floor(input.stakeMinor * 0.8)
         : input.stakeMinor;
       await tx
@@ -5173,12 +6026,27 @@ async function settleBattle(input: {
       }
     }
 
+    await recordDailyLoss(
+      tx,
+      input.playerOneId,
+      input.currency,
+      Math.max(0, playerOneDebit - playerOnePayout),
+    );
+    if (input.playerTwoId) {
+      await recordDailyLoss(
+        tx,
+        input.playerTwoId,
+        input.currency,
+        Math.max(0, playerTwoDebit - playerTwoPayout),
+      );
+    }
+
     await tx
       .update(casinoChallengesTable)
       .set({
         playerOneScore: input.playerOneScore,
         playerTwoScore: input.playerTwoScore,
-        winnerPlayerId: tie ? null : input.playerOneWon ? input.playerOneId : input.playerTwoId,
+        winnerPlayerId: tie ? null : playerOneWon ? input.playerOneId : input.playerTwoId,
         status: "completed",
         completedAt: new Date(),
       })
@@ -5630,15 +6498,15 @@ function rouletteKeyboard(
 async function sendRouletteSticker(
   bot: TelegramBot,
   chatId: number,
+  result: number,
 ): Promise<boolean> {
   if (rouletteStickerIds.length === 0) await loadRouletteStickerPack(bot);
-  if (rouletteStickerIds.length === 0) return false;
-  let index = randomInt(rouletteStickerIds.length);
-  if (rouletteStickerIds.length > 1 && index === lastRouletteStickerIndex) {
-    index = (index + 1 + randomInt(rouletteStickerIds.length - 1)) % rouletteStickerIds.length;
-  }
-  lastRouletteStickerIndex = index;
-  await bot.sendSticker(chatId, rouletteStickerIds[index]);
+  // Sticker-set order is not a roulette result mapping. Only use a sticker
+  // whose own emoji metadata identifies this exact number; otherwise omit the
+  // animation instead of showing a visually contradictory result.
+  const stickerId = rouletteStickerIdsByNumber.get(result);
+  if (!stickerId) return false;
+  await bot.sendSticker(chatId, stickerId);
   return true;
 }
 
@@ -5689,7 +6557,7 @@ async function startRoulette(
       rounds: 1,
       rollsPerRound: 1,
       targetWins: null,
-      resultRule: "roulette_pending",
+      resultRule: "high",
       fairId: createFairId(),
       status: "roulette_choice",
       turnDeadlineAt: new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS),
@@ -5709,6 +6577,7 @@ async function startRoulette(
       "Choose a side below:",
     ].join("\n"),
     rouletteKeyboard(player.telegramUserId, battle.id),
+    ROULETTE_PREMIUM_EMOJI_OPTIONS,
   );
   await db
     .update(casinoChallengesTable)
@@ -5730,7 +6599,12 @@ async function handleRouletteChoice(
     .where(eq(casinoChallengesTable.id, battleId))
     .limit(1);
   if (!battle || battle.mode !== "pvb" || battle.gameType !== "roulette" || battle.status !== "roulette_choice") {
-    await bot.sendMessage(chatId, "That roulette room is no longer waiting for a choice.");
+    await bot.sendMessage(
+      chatId,
+      "That roulette room is no longer waiting for a choice.",
+      undefined,
+      ROULETTE_PREMIUM_EMOJI_OPTIONS,
+    );
     return;
   }
   const [player] = await db
@@ -5758,13 +6632,16 @@ async function handleRouletteChoice(
         battle.messageId,
         `<b>🎰 ROULETTE–VS BOT #${battle.id}</b>\n\nSelection: <b>${rouletteChoiceLabel(choice)}</b>\n\n<b>Wheel spinning…</b>`,
         { inline_keyboard: [] },
+        ROULETTE_PREMIUM_EMOJI_OPTIONS,
       );
     }
   } catch (error) {
     logger.warn({ err: error, battleId: battle.id }, "Roulette room update failed");
   }
   const result = randomInt(1, 37);
-  const stickerSent = await sendRouletteSticker(bot, chatId);
+  await wait(PVP_RESULT_DELAY_MS);
+  const stickerSent = await sendRouletteSticker(bot, chatId, result);
+  await wait(PVP_RESULT_DELAY_MS);
   const won = rouletteChoiceMatches(choice, result);
   const numericChoice = choice.startsWith("number:");
   const payoutMultiplier = numericChoice ? 36 : 1.92;
@@ -5791,7 +6668,12 @@ async function handleRouletteChoice(
       .update(casinoChallengesTable)
       .set({ status: "cancelled", completedAt: new Date() })
       .where(eq(casinoChallengesTable.id, battle.id));
-    await bot.sendMessage(chatId, "Roulette could not settle this room. Please contact support before playing again.");
+    await bot.sendMessage(
+      chatId,
+      "Roulette could not settle this room. Please contact support before playing again.",
+      undefined,
+      ROULETTE_PREMIUM_EMOJI_OPTIONS,
+    );
     return;
   }
   if (won) {
@@ -5810,13 +6692,15 @@ async function handleRouletteChoice(
       "",
       `<b>Room:</b> #${battle.id}`,
       `<b>Your selection:</b> ${rouletteChoiceLabel(choice)}`,
-      `<b>Verified sticker result:</b> ${stickerSent ? "sent" : "unavailable"} · <b>Number ${result}</b>`,
+      `<b>Verified roulette result:</b> <b>Number ${result}</b> · ${result % 2 === 0 ? "Even" : "Odd"}${stickerSent ? "" : " · animation unavailable"}`,
       won
         ? `<b>✅ WIN — ${formatMoney(Math.round(battle.stakeMinor * payoutMultiplier), parseCurrency(battle.currency, "USD"))} credited (${payoutMultiplier}×).</b>`
         : `<b>❌ LOSS — ${formatMoney(battle.stakeMinor, parseCurrency(battle.currency, "USD"))} went to the house.</b>`,
       `<b>Balance:</b> ${formatMoney(settled.playerOneBalance, parseCurrency(battle.currency, "USD"))}`,
       `<b>Fair ID:</b> <code>${settled.fairId}</code>`,
     ].join("\n"),
+    undefined,
+    ROULETTE_PREMIUM_EMOJI_OPTIONS,
   );
 }
 
@@ -6321,6 +7205,8 @@ async function confirmPvbBattle(
           "",
           "<b>This room is already active or completed.</b>",
         ].join("\n"),
+        undefined,
+        premiumEmojiOptionsForGame(battle.gameType),
       );
     } else {
       await resultBot.sendMessage(chatId, "<b>❌ This PVB room was not found.</b>");
@@ -6439,6 +7325,8 @@ async function confirmPvbBattle(
       "",
       "<i>Good luck — play fair, play smart.</i>",
     ].join("\n"),
+    undefined,
+    premiumEmojiOptionsForGame(battle.gameType),
   );
   await promptPvbRound(resultBot, startedBattle, battle.messageId);
 }
@@ -6780,6 +7668,7 @@ async function handlePlayerPvpRoll(
     );
     return true;
   }
+  battleTimeoutWarnings.delete(battle.id);
   const latestRound = existingRows.reduce(
     (latest, row) => Math.max(latest, row.round),
     0,
@@ -7091,13 +7980,19 @@ async function promptPvbRound(
         existingMessageId,
         text,
         { inline_keyboard: [] },
+        premiumEmojiOptionsForGame(battle.gameType),
       );
       return;
     } catch (error) {
       logger.warn({ err: error, battleId: battle.id }, "PVB prompt message update failed");
     }
   }
-  await resultBot.sendMessage(battle.chatId, text);
+  await resultBot.sendMessage(
+    battle.chatId,
+    text,
+    undefined,
+    premiumEmojiOptionsForGame(battle.gameType),
+  );
 }
 
 function buildPvbRoundScores(
@@ -7265,6 +8160,8 @@ async function runPvbRound(
       } (${playerRound} - ${houseRound})`,
       `<b>${creatorLabel}:</b> ${playerRound} · <b>${botLabel}:</b> ${houseRound}`,
     ].join("\n"),
+    undefined,
+    premiumEmojiOptionsForGame(battle.gameType),
   );
 
   if (battle.targetWins) {
@@ -7320,6 +8217,7 @@ async function runPvbRound(
           fairId: battle.fairId ?? "legacy",
         }),
         creator ? pvbRematchKeyboard(battle, creator) : undefined,
+        premiumEmojiOptionsForGame(battle.gameType),
       );
       return;
     }
@@ -7413,6 +8311,7 @@ async function runPvbRound(
         fairId: battle.fairId ?? "legacy",
       }),
       creator ? pvbRematchKeyboard(battle, creator) : undefined,
+      premiumEmojiOptionsForGame(battle.gameType),
     );
     return;
   }
@@ -7522,6 +8421,7 @@ async function handlePlayerPvbRoll(
     await resultBot.sendMessage(message.chat.id, "That roll is already being processed. Please wait for the round result.");
     return true;
   }
+  battleTimeoutWarnings.delete(battle.id);
   clearBattleTimeout(battle.id);
   const [storedRoll] = await db
     .insert(casinoChallengeRollsTable)
@@ -7720,6 +8620,8 @@ async function playSimpleMainGame(
         balanceMinor: settled.balanceMinor,
         fairId: settled.fairId,
       }),
+      undefined,
+      premiumEmojiOptionsForGame(gameType),
     );
     await auditTransaction(
       bot,
@@ -8119,6 +9021,12 @@ async function completeMinesGame(
           updatedAt: new Date(),
         },
       });
+    await recordDailyLoss(
+      tx,
+      game.playerId,
+      game.currency,
+      Math.max(0, game.amountMinor + game.jackpotMinor - payoutMinor),
+    );
     return updated.balanceMinor;
   });
   return { balanceMinor: balance, payoutMinor };
@@ -8232,6 +9140,7 @@ async function handleMinesChoice(
   if (game.bombs.has(cell)) {
     settlingMinesGames.add(fairId);
     game.status = "lost";
+    await wait(PVP_RESULT_DELAY_MS);
     const settled = await completeMinesGame(game, "LOSS");
     activeMinesGames.delete(fairId);
     settlingMinesGames.delete(fairId);
@@ -8253,6 +9162,7 @@ async function handleMinesChoice(
   if (game.revealed.size >= 16 - game.mines) {
     settlingMinesGames.add(fairId);
     game.status = "cashed_out";
+    await wait(PVP_RESULT_DELAY_MS);
     const settled = await completeMinesGame(game, "CASHOUT");
     activeMinesGames.delete(fairId);
     settlingMinesGames.delete(fairId);
@@ -8334,6 +9244,24 @@ async function cashOutMines(
   game.status = "cashed_out";
   game.autoRunning = false;
   activeMinesGames.delete(fairId);
+  if (game.messageId) {
+    try {
+      await bot.editMessageText(
+        chatId,
+        game.messageId,
+        minesBoardText(
+          game,
+          "<b>⚡ CASH-OUT PROCESSING</b>\nYour payout is being settled now.",
+        ),
+        { inline_keyboard: [] },
+      );
+    } catch (error) {
+      logger.debug(
+        { err: error, fairId },
+        "Mines cash-out processing message update failed",
+      );
+    }
+  }
   let settled: { balanceMinor: number; payoutMinor: number };
   try {
     settled = await completeMinesGame(game, "CASHOUT");
@@ -8843,10 +9771,11 @@ async function sendWagerLeaderboard(
       };
     });
   const image = await wagerLeaderboardPng(mode, items);
+  const periodTitle = leaderboardPeriod(mode);
   await bot.sendPhoto(
     chatId,
     image,
-    `<b>🏆 ${period.title}</b>\n${escapeTelegramText(period.subtitle)}`,
+    `<b>🏆 ${periodTitle.title}</b>\n${periodTitle.subtitle}\n\nOnly verified human player accounts are shown.`,
   );
 }
 
@@ -8908,6 +9837,7 @@ async function sendGames(
         { text: "📜 Terms", callback_data: ownedCallback("main:terms", ownerTelegramUserId) },
       ]],
     },
+    SLOT_PREMIUM_EMOJI_OPTIONS,
   );
 }
 
@@ -9134,19 +10064,165 @@ async function sendDailyBonusSettings(
     .from(casinoDailyBonusSettingsTable)
     .limit(1);
   if (!settings || settings.amountMinor <= 0 || settings.eligibleUsers <= 0) {
-    await bot.sendMessage(chatId, "Daily bonus is not configured yet. Use /setdaily AMOUNT USERS INR|USD.");
+    await sendBonusCard(bot, chatId, {
+      title: "DAILY BONUS",
+      subtitle: "BOT-SELECTED REWARD",
+      status: "NOT CONFIGURED",
+      amount: "—",
+      currency: "INR",
+      winners: "—",
+      next: "Ask an administrator to configure the draw",
+    });
     return;
   }
-  await bot.sendMessage(
-    chatId,
-    [
-      "<b>🎁 Daily bonus configured</b>",
-      "",
-      `Amount: <b>${formatMoney(settings.amountMinor, parseCurrency(settings.currency, "INR"))}</b>`,
-      `Eligible users: <b>${settings.eligibleUsers}</b>`,
-      `Next distribution: <b>${settings.nextDistributionAt ? settings.nextDistributionAt.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "scheduled in 24 hours"}</b>`,
-    ].join("\n"),
-  );
+  await sendBonusCard(bot, chatId, {
+    title: "DAILY BONUS",
+    subtitle: "BOT-SELECTED REWARD",
+    status: "CONFIGURED",
+    amount: formatMoney(settings.amountMinor, parseCurrency(settings.currency, "INR")),
+    currency: parseCurrency(settings.currency, "INR"),
+    winners: String(settings.eligibleUsers),
+    next: settings.nextDistributionAt
+      ? settings.nextDistributionAt.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" })
+      : "Scheduled in 24 hours",
+  });
+}
+
+type BonusCardData = {
+  title: string;
+  subtitle: string;
+  status: string;
+  amount: string;
+  currency: Currency;
+  winners: string;
+  next: string;
+};
+
+function bonusCardSvg(data: BonusCardData): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <defs>
+    <linearGradient id="bonus-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10182e"/><stop offset="1" stop-color="#203d54"/></linearGradient>
+    <linearGradient id="bonus-gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#e5ad43"/><stop offset="1" stop-color="#ffe6a1"/></linearGradient>
+  </defs>
+  <rect width="1200" height="760" rx="42" fill="url(#bonus-bg)"/>
+  <circle cx="1080" cy="90" r="220" fill="#f6c453" opacity=".12"/><circle cx="100" cy="720" r="230" fill="#3b82f6" opacity=".10"/>
+  <rect x="42" y="42" width="1116" height="676" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".15"/>
+  <text x="86" y="112" fill="#f6c453" font-size="28" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="186" fill="#ffffff" font-size="54" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.title)}</text>
+  <text x="86" y="228" fill="#9db0cb" font-size="24" font-family="DejaVu Sans" letter-spacing="2">${escapeXml(data.subtitle)}</text>
+  <rect x="900" y="88" width="205" height="70" rx="35" fill="#f6c453" fill-opacity=".18" stroke="#f6c453" stroke-opacity=".8" stroke-width="2"/>
+  <text x="1002" y="133" text-anchor="middle" fill="#f6c453" font-size="25" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
+  <line x1="86" y1="276" x2="1114" y2="276" stroke="#ffffff" stroke-opacity=".14"/>
+  <text x="86" y="332" fill="#8da2bd" font-size="22" font-family="DejaVu Sans" font-weight="bold">REWARD PER WINNER</text>
+  <text x="86" y="400" fill="url(#bonus-gold)" font-size="54" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
+  <text x="650" y="332" fill="#8da2bd" font-size="22" font-family="DejaVu Sans" font-weight="bold">MAXIMUM WINNERS</text>
+  <text x="650" y="400" fill="#ffffff" font-size="54" font-family="Deja Vu Sans" font-weight="bold">${escapeXml(data.winners)}</text>
+  <rect x="70" y="456" width="1060" height="150" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="104" y="506" fill="#8da2bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">NEXT BOT SELECTION</text>
+  <text x="104" y="556" fill="#ffffff" font-size="27" font-family="DejaVu Sans">${escapeXml(svgLabel(data.next, 60))}</text>
+  <text x="104" y="646" fill="#b6c7df" font-size="21" font-family="DejaVu Sans">Selection is automatic and rewards are credited to the ${data.currency} wallet.</text>
+  <text x="86" y="692" fill="#7185a3" font-size="18" font-family="DejaVu Sans">Complete the displayed wagering rule before requesting a withdrawal.</text>
+</svg>`;
+}
+
+async function bonusCardPng(data: BonusCardData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render bonus image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(bonusCardSvg(data));
+  });
+}
+
+async function sendBonusCard(
+  bot: TelegramBot,
+  chatId: number,
+  data: BonusCardData,
+): Promise<void> {
+  await bot.sendPhoto(chatId, await bonusCardPng(data));
+}
+
+async function sendMonthlyBonusStatus(
+  bot: TelegramBot,
+  chatId: number,
+  player: typeof casinoPlayersTable.$inferSelect,
+): Promise<void> {
+  const [settings] = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(eq(casinoGiveawaySettingsTable.kind, "monthly"))
+    .limit(1);
+  if (!settings || !settings.enabled || settings.amountMinor <= 0) {
+    await sendBonusCard(bot, chatId, {
+      title: "MONTHLY BONUS",
+      subtitle: "BOT-SELECTED REWARD",
+      status: "NOT CONFIGURED",
+      amount: "—",
+      currency: "INR",
+      winners: "—",
+      next: "Ask an administrator to configure the draw",
+    });
+    return;
+  }
+  const currency = parseCurrency(settings.currency, "INR");
+  const periodKey = settings.nextDrawAt
+    ? new Date(settings.nextDrawAt.getTime() - giveawayPeriodMs(settings)).toISOString()
+    : null;
+  const claim = periodKey
+    ? (await db
+        .select()
+        .from(casinoGiveawayClaimsTable)
+        .where(
+          and(
+            eq(casinoGiveawayClaimsTable.kind, "monthly"),
+            eq(casinoGiveawayClaimsTable.periodKey, periodKey),
+            eq(casinoGiveawayClaimsTable.playerId, player.id),
+          ),
+        )
+        .limit(1))[0]
+    : undefined;
+  const wallet = claim?.selected
+    ? await ensureWallet(player.id, currency)
+    : undefined;
+  await sendBonusCard(bot, chatId, {
+    title: "MONTHLY BONUS",
+    subtitle: claim?.selected ? "CONGRATULATIONS" : "BOT-SELECTED REWARD",
+    status: claim?.selected ? "WINNER" : "ACTIVE",
+    amount: claim?.selected
+      ? formatMoney(claim.amountMinor, currency)
+      : formatMoney(settings.amountMinor, currency),
+    currency,
+    winners: String(settings.maxWinners || "ALL"),
+    next: claim?.selected
+      ? `Balance ${formatMoney(wallet?.balanceMinor ?? 0, currency)}`
+      : settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "Scheduled soon",
+  });
+}
+
+async function sendBonusWinnerCard(
+  bot: TelegramBot,
+  chatId: number,
+  kind: string,
+  amountMinor: number,
+  currency: Currency,
+  balanceMinor: number,
+): Promise<void> {
+  await sendBonusCard(bot, chatId, {
+    title: `${kind.toUpperCase()} BONUS`,
+    subtitle: "BOT-SELECTED WINNER",
+    status: "WINNER",
+    amount: formatMoney(amountMinor, currency),
+    currency,
+    winners: "CREDITED",
+    next: `Updated balance ${formatMoney(balanceMinor, currency)}`,
+  });
 }
 
 type BonusKind = "daily" | "weekly";
@@ -9238,17 +10314,13 @@ async function distributeScheduledReward(
         description: `${kind} bot-selected bonus`,
       });
       try {
-        await bot.sendMessage(
+        await sendBonusWinnerCard(
+          bot,
           recipient.telegramUserId,
-          [
-            `<b>🏆 YOU ARE A ${kind.toUpperCase()} BONUS WINNER</b>`,
-            "",
-            `Bonus credited: <b>${formatMoney(settings.amountMinor, currency)}</b>`,
-            `Updated balance: <b>${formatMoney(reward.balanceMinor, currency)}</b>`,
-            "The winner was selected randomly by the bot.",
-            `Withdrawal wagering rule: <b>1× ${formatMoney(settings.amountMinor, currency)}</b> must be completed.`,
-            "Track progress with /wagerstatus.",
-          ].join("\n"),
+          kind,
+          settings.amountMinor,
+          currency,
+          reward.balanceMinor,
         );
       } catch (error) {
         logger.warn(
@@ -9275,15 +10347,15 @@ async function sendBonusClaimStatus(
   const [settings] = await db.select().from(table).limit(1);
   const label = kind === "daily" ? "daily" : "weekly";
   if (!settings || settings.amountMinor <= 0 || settings.eligibleUsers <= 0) {
-    await bot.sendMessage(
-      chatId,
-      [
-        `<b>🎁 ${label.toUpperCase()} BONUS</b>`,
-        "",
-        `${label[0].toUpperCase()}${label.slice(1)} bonus is not configured yet.`,
-        `Only admins can set it with /set${label} AMOUNT MAX_WINNERS INR|USD.`,
-      ].join("\n"),
-    );
+    await sendBonusCard(bot, chatId, {
+      title: `${label.toUpperCase()} BONUS`,
+      subtitle: "BOT-SELECTED REWARD",
+      status: "NOT CONFIGURED",
+      amount: "—",
+      currency: "INR",
+      winners: "—",
+      next: "Ask an administrator to configure the draw",
+    });
     return;
   }
   const currency = parseCurrency(settings.currency, "INR");
@@ -9306,58 +10378,46 @@ async function sendBonusClaimStatus(
         .limit(1))[0]
     : undefined;
   if (claim?.selected) {
-    const [wallet] = await db
-      .select()
-      .from(casinoWalletsTable)
-      .where(
-        and(
-          eq(casinoWalletsTable.playerId, player.id),
-          eq(casinoWalletsTable.currency, currency),
-        ),
-      )
-      .limit(1);
-    await bot.sendMessage(
+    const wallet = await ensureWallet(player.id, currency);
+    await sendBonusWinnerCard(
+      bot,
       chatId,
-      [
-        `<b>🏆 YOU ARE A ${label.toUpperCase()} BONUS WINNER</b>`,
-        "",
-        `Bonus: <b>${formatMoney(claim.amountMinor, currency)}</b>`,
-        `Updated balance: <b>${formatMoney(wallet?.balanceMinor ?? 0, currency)}</b>`,
-        "The winner was selected randomly by the bot.",
-        `Withdrawal rule: complete 1× wagering — <b>${formatMoney(claim.amountMinor, currency)}</b>.`,
-        "Use /wagerstatus to check your remaining requirement.",
-      ].join("\n"),
+      label,
+      claim.amountMinor,
+      currency,
+      wallet.balanceMinor,
     );
     return;
   }
   if (claim && !claim.selected) {
-    await bot.sendMessage(
-      chatId,
-      [
-        `<b>ℹ️ ${label.toUpperCase()} BONUS DRAW COMPLETE</b>`,
-        "",
-        "You were not selected in this draw.",
-        "The winner was selected randomly by the bot. Users and admins cannot choose the winner.",
-        `Next ${label} selection: <b>${next?.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "scheduled soon"}</b>`,
-      ].join("\n"),
-    );
+    await sendBonusCard(bot, chatId, {
+      title: `${label.toUpperCase()} BONUS`,
+      subtitle: "BOT-SELECTED REWARD",
+      status: "NOT SELECTED",
+      amount: formatMoney(settings.amountMinor, currency),
+      currency,
+      winners: String(settings.eligibleUsers),
+      next: next?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "Scheduled soon",
+    });
     return;
   }
-  await bot.sendMessage(
-    chatId,
-    [
-      `<b>🎁 ${label.toUpperCase()} BONUS</b>`,
-      "",
-      `Configured reward: <b>${formatMoney(settings.amountMinor, currency)}</b>`,
-      `Maximum winners: <b>${settings.eligibleUsers}</b>`,
-      `Next bot selection: <b>${next?.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "scheduled soon"}</b>`,
-      "",
-      "Only active users can enter the random selection. The user cannot choose the winner.",
-    ].join("\n"),
-  );
+  await sendBonusCard(bot, chatId, {
+    title: `${label.toUpperCase()} BONUS`,
+    subtitle: "BOT-SELECTED REWARD",
+    status: "ACTIVE",
+    amount: formatMoney(settings.amountMinor, currency),
+    currency,
+    winners: String(settings.eligibleUsers),
+    next: next?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "Scheduled soon",
+  });
 }
 
 async function distributeDueRewards(bot: TelegramBot): Promise<void> {
+  try {
+    await distributeDueDailyLossRewards();
+  } catch (error) {
+    logger.error({ err: error }, "Daily loss rebate distribution failed");
+  }
   for (const kind of ["daily", "weekly"] as const) {
     try {
       await distributeScheduledReward(bot, kind);
@@ -9375,6 +10435,32 @@ async function distributeDueRewards(bot: TelegramBot): Promise<void> {
 type GiveawayKind = "monthly" | "multi_day" | "referral" | "giveaway" | "rakeback";
 
 type GiveawaySetting = typeof casinoGiveawaySettingsTable.$inferSelect;
+type HouseRoyale = typeof casinoHouseRoyalesTable.$inferSelect;
+type HouseRoyalePlayer = typeof casinoHouseRoyalePlayersTable.$inferSelect;
+
+function officialGroupChatId(): number | null {
+  const value = Number(process.env.CASINO_MAIN_GROUP_CHAT_ID ?? "");
+  return Number.isSafeInteger(value) && value < 0 ? value : null;
+}
+
+type GiveawayDraftStep =
+  | "amount"
+  | "winners"
+  | "referrals"
+  | "wager"
+  | "duration";
+
+type GiveawayDraft = {
+  step: GiveawayDraftStep;
+  amountMinor?: number;
+  currency?: Currency;
+  maxWinners?: number;
+  minReferralCount?: number;
+  minWagerMinor?: number;
+  periodDays?: number;
+};
+
+const giveawayDrafts = new Map<number, GiveawayDraft>();
 
 function isUserGiveawaySetting(settings: GiveawaySetting): boolean {
   return settings.kind === "giveaway" || /^giveaway_\d+$/.test(settings.kind);
@@ -9396,7 +10482,7 @@ function giveawayLabel(settings: GiveawaySetting, index: number): string {
 
 async function giveawayPlayerMetrics(
   playerId: number,
-  settings: GiveawaySetting,
+  settings: Pick<GiveawaySetting, "nextDrawAt" | "periodDays" | "currency">,
 ): Promise<{ wagerMinor: number; referrals: number; bets: number }> {
   const since = settings.nextDrawAt
     ? new Date(settings.nextDrawAt.getTime() - giveawayPeriodMs(settings))
@@ -9440,6 +10526,1134 @@ async function giveawayPlayerMetrics(
   };
 }
 
+async function houseRoyaleWagerMinor(
+  playerId: number,
+  currency: Currency,
+  periodDays: number,
+): Promise<number> {
+  const since = new Date(Date.now() - Math.max(1, periodDays) * 24 * 60 * 60 * 1_000);
+  const [rounds, battles] = await Promise.all([
+    db
+      .select()
+      .from(casinoGameRoundsTable)
+      .where(
+        and(
+          eq(casinoGameRoundsTable.playerId, playerId),
+          eq(casinoGameRoundsTable.currency, currency),
+          gte(casinoGameRoundsTable.createdAt, since),
+        ),
+      ),
+    db
+      .select()
+      .from(casinoChallengesTable)
+      .where(
+        and(
+          eq(casinoChallengesTable.status, "completed"),
+          eq(casinoChallengesTable.currency, currency),
+          gte(casinoChallengesTable.createdAt, since),
+          or(
+            eq(casinoChallengesTable.creatorPlayerId, playerId),
+            eq(casinoChallengesTable.playerTwoId, playerId),
+          ),
+        ),
+      ),
+  ]);
+  return (
+    rounds.reduce((total, round) => total + round.stakeMinor, 0) +
+    battles.reduce((total, battle) => total + battle.stakeMinor, 0)
+  );
+}
+
+function houseRoyalePayouts(prizePoolMinor: number): {
+  winnerOneMinor: number;
+  winnerTwoMinor: number;
+} {
+  return {
+    winnerOneMinor: Math.floor(prizePoolMinor * 60 / 100),
+    winnerTwoMinor: prizePoolMinor - Math.floor(prizePoolMinor * 60 / 100),
+  };
+}
+
+type HouseRoyaleBracket = {
+  rounds: Array<{
+    label: string;
+    matches: Array<{
+      playerOneId: number;
+      playerTwoId: number;
+      playerOneRoll: number;
+      playerTwoRoll: number;
+      winnerId: number;
+      loserId: number;
+    }>;
+  }>;
+  firstPlaceId: number;
+  secondPlaceId: number;
+};
+
+async function hasValidHouseRoyaleReferral(playerId: number): Promise<boolean> {
+  const [referral] = await db
+    .select({ id: casinoPlayersTable.id })
+    .from(casinoPlayersTable)
+    .where(
+      and(
+        eq(casinoPlayersTable.referredByPlayerId, playerId),
+        eq(casinoPlayersTable.isBot, false),
+      ),
+    )
+    .limit(1);
+  return Boolean(referral);
+}
+
+function houseRoyaleDeadlineText(royale: HouseRoyale): string {
+  return royale.joinDeadlineAt
+    ? royale.joinDeadlineAt.toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        dateStyle: "medium",
+        timeStyle: "short",
+      })
+    : "when 8 players join";
+}
+
+async function activeHouseRoyale(): Promise<HouseRoyale | null> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.status, "open"))
+    .orderBy(desc(casinoHouseRoyalesTable.id))
+    .limit(1);
+  return royale ?? null;
+}
+
+async function houseRoyalePlayers(royaleId: number): Promise<HouseRoyalePlayer[]> {
+  return db
+    .select()
+    .from(casinoHouseRoyalePlayersTable)
+    .where(eq(casinoHouseRoyalePlayersTable.royaleId, royaleId))
+    .orderBy(desc(casinoHouseRoyalePlayersTable.joinedAt));
+}
+
+function houseRoyaleAnnouncementSvg(data: {
+  id: number;
+  prizePool: string;
+  winnerPrize: string;
+  runnerPrize: string;
+  registered: number;
+  eligible: number;
+  minWager: string;
+  deadline: string;
+}): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820">
+  <defs>
+    <linearGradient id="hr-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10162d"/><stop offset=".55" stop-color="#202b57"/><stop offset="1" stop-color="#3b2457"/></linearGradient>
+    <linearGradient id="hr-gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f1b83d"/><stop offset="1" stop-color="#ffe9a6"/></linearGradient>
+  </defs>
+  <rect width="1200" height="820" rx="42" fill="url(#hr-bg)"/>
+  <circle cx="1060" cy="90" r="230" fill="#8ea6ff" opacity=".14"/><circle cx="90" cy="780" r="250" fill="#f1b83d" opacity=".08"/>
+  <rect x="34" y="34" width="1132" height="752" rx="32" fill="none" stroke="#879cff" stroke-opacity=".55" stroke-width="2"/>
+  <text x="82" y="96" fill="#8ea6ff" font-size="26" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="82" y="158" fill="#ffffff" font-size="48" font-family="DejaVu Sans" font-weight="bold">👑 HOUSE ROYALE #${data.id}</text>
+  <text x="82" y="195" fill="#bfc9ec" font-size="21" font-family="DejaVu Sans">FREE 8-PLAYER DICE TOURNAMENT · HOUSE-FUNDED PRIZE POOL</text>
+  <rect x="82" y="232" width="1036" height="126" rx="25" fill="#ffffff" fill-opacity=".07" stroke="#f1b83d" stroke-opacity=".55"/>
+  <text x="120" y="274" fill="#aab8e5" font-size="17" font-family="DejaVu Sans" font-weight="bold">PRIZE POOL</text>
+  <text x="120" y="325" fill="url(#hr-gold)" font-size="43" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.prizePool)}</text>
+  <text x="540" y="274" fill="#aab8e5" font-size="17" font-family="DejaVu Sans" font-weight="bold">1ST PLACE · 60%</text>
+  <text x="540" y="325" fill="#ffffff" font-size="34" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.winnerPrize)}</text>
+  <text x="860" y="274" fill="#aab8e5" font-size="17" font-family="DejaVu Sans" font-weight="bold">2ND PLACE · 40%</text>
+  <text x="860" y="325" fill="#ffffff" font-size="34" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.runnerPrize)}</text>
+  <rect x="82" y="390" width="500" height="150" rx="24" fill="#ffffff" fill-opacity=".06" stroke="#879cff" stroke-opacity=".55"/>
+  <text x="116" y="430" fill="#9eafe3" font-size="17" font-family="DejaVu Sans" font-weight="bold">REGISTRATION</text>
+  <text x="116" y="480" fill="#ffffff" font-size="31" font-family="DejaVu Sans" font-weight="bold">${data.registered}/8 REQUESTS · ${data.eligible}/8 ELIGIBLE</text>
+  <text x="116" y="515" fill="#f1b83d" font-size="18" font-family="DejaVu Sans">Registration closes ${escapeXml(data.deadline)}</text>
+  <rect x="618" y="390" width="500" height="150" rx="24" fill="#ffffff" fill-opacity=".06" stroke="#879cff" stroke-opacity=".55"/>
+  <text x="652" y="430" fill="#9eafe3" font-size="17" font-family="DejaVu Sans" font-weight="bold">JOIN REQUIREMENTS</text>
+  <text x="652" y="478" fill="#ffffff" font-size="22" font-family="DejaVu Sans">1 valid human referral</text>
+  <text x="652" y="512" fill="#ffffff" font-size="22" font-family="DejaVu Sans">30-day INR wager ≥ ${escapeXml(data.minWager)}</text>
+  <text x="82" y="590" fill="#8ea6ff" font-size="19" font-family="DejaVu Sans" font-weight="bold">TOURNAMENT FORMAT</text>
+  <text x="82" y="625" fill="#dce3ff" font-size="22" font-family="DejaVu Sans">4 quarterfinals → 2 semifinals → 1 final · dice results are sent live in the group</text>
+  <rect x="82" y="675" width="1036" height="68" rx="20" fill="#70e59a" fill-opacity=".18" stroke="#70e59a" stroke-opacity=".7"/>
+  <text x="600" y="718" text-anchor="middle" fill="#9affba" font-size="25" font-family="DejaVu Sans" font-weight="bold">PRESS JOIN HOUSE ROYALE · CHECK YOUR DM FOR LIVE ELIGIBILITY</text>
+</svg>`;
+}
+
+async function houseRoyaleAnnouncementPng(data: {
+  id: number;
+  prizePool: string;
+  winnerPrize: string;
+  runnerPrize: string;
+  registered: number;
+  eligible: number;
+  minWager: string;
+  deadline: string;
+}): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render House Royale image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(houseRoyaleAnnouncementSvg(data));
+  });
+}
+
+async function sendHouseRoyale(
+  bot: TelegramBot,
+  chatId: number,
+  royale: HouseRoyale | null,
+  viewerTelegramUserId?: number,
+): Promise<void> {
+  if (!royale) {
+    await bot.sendMessage(
+      chatId,
+      "<b>👑 HOUSE ROYALE</b>\n\nNo House Royale is open right now.",
+    );
+    return;
+  }
+  const players = await houseRoyalePlayers(royale.id);
+  const eligiblePlayers = players.filter((player) => Boolean(player.eligibilityConfirmedAt));
+  const currency = parseCurrency(royale.currency, "INR");
+  const payouts = houseRoyalePayouts(royale.prizePoolMinor);
+  const admin = viewerTelegramUserId !== undefined && isAdmin(viewerTelegramUserId);
+  const keyboard: InlineKeyboardButton[][] = players.length < royale.maxPlayers
+    ? [[{
+        text: "👑 Join House Royale",
+        callback_data: `house:join:${royale.id}`,
+      }]]
+    : [[{
+        text: eligiblePlayers.length >= royale.maxPlayers
+          ? "✅ 8/8 Players Eligible"
+          : `⏳ ${eligiblePlayers.length}/${royale.maxPlayers} Eligible`,
+        callback_data: `house:draw:${royale.id}`,
+      }]];
+  if (admin && isPrivateChat({ id: chatId, type: "private" })) {
+    keyboard.push([
+      { text: "🎲 Start 3-game bracket", callback_data: `house:draw:${royale.id}` },
+      { text: "❌ Cancel", callback_data: `house:cancel:${royale.id}` },
+    ]);
+  }
+  const image = await houseRoyaleAnnouncementPng({
+    id: royale.id,
+    prizePool: formatMoney(royale.prizePoolMinor, currency),
+    winnerPrize: formatMoney(payouts.winnerOneMinor, currency),
+    runnerPrize: formatMoney(payouts.winnerTwoMinor, currency),
+    registered: players.length,
+    eligible: eligiblePlayers.length,
+    minWager: formatMoney(royale.minWagerMinor, "INR"),
+    deadline: houseRoyaleDeadlineText(royale),
+  });
+  const caption = [
+    `<b>👑 HOUSE ROYALE #${royale.id}</b>`,
+    `<b>Players:</b> ${players.length}/${royale.maxPlayers} registered · ${eligiblePlayers.length}/${royale.maxPlayers} eligible`,
+    `<b>Prize pool:</b> ${formatMoney(royale.prizePoolMinor, currency)} (house funded)`,
+    "",
+    "<b>Join requirements:</b>",
+    "• At least 1 valid human referral",
+    `• Minimum ${formatMoney(royale.minWagerMinor, "INR")} INR wager in the last 30 days`,
+    `• Registration closes ${houseRoyaleDeadlineText(royale)}`,
+    "",
+    "Tap Join House Royale. The bot will message you privately and update your eligibility live.",
+  ].join("\n");
+  const groupId = officialGroupChatId();
+  const isAnnouncement = groupId !== null && chatId === groupId;
+  let sent: TelegramMessage;
+  if (isAnnouncement && royale.announcementMessageId) {
+    sent = await bot.editPhoto(chatId, royale.announcementMessageId, image, caption, {
+      inline_keyboard: keyboard,
+    });
+  } else {
+    sent = await bot.sendPhoto(chatId, image, caption, { inline_keyboard: keyboard });
+  }
+  if (isAnnouncement) {
+    await db
+      .update(casinoHouseRoyalesTable)
+      .set({ announcementMessageId: sent.message_id })
+      .where(eq(casinoHouseRoyalesTable.id, royale.id));
+    try {
+      await bot.pinChatMessage(chatId, sent.message_id);
+    } catch (error) {
+      logger.warn({ err: error, royaleId: royale.id }, "House Royale announcement pin failed");
+    }
+  }
+}
+
+async function joinHouseRoyaleLegacy(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  royaleId: number,
+): Promise<void> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.id, royaleId))
+    .limit(1);
+  if (!royale || royale.status !== "open") {
+    await bot.sendMessage(chatId, "That House Royale is no longer open.");
+    return;
+  }
+  const player = await ensurePlayer(user);
+  if (player.isBot) {
+    await bot.sendMessage(chatId, "Only human players can join House Royale.");
+    return;
+  }
+  if (royale.joinDeadlineAt && royale.joinDeadlineAt.getTime() < Date.now()) {
+    await bot.sendMessage(chatId, "<b>❌ House Royale registration is closed.</b>");
+    return;
+  }
+  const validReferral = await hasValidHouseRoyaleReferral(player.id);
+  const currency = parseCurrency(royale.currency, "INR");
+  const wagerMinor = await houseRoyaleWagerMinor(
+    player.id,
+    "INR",
+    30,
+  );
+  if (!validReferral || wagerMinor < royale.minWagerMinor) {
+    await bot.sendMessage(
+      chatId,
+      [
+        "<b>❌ You are not eligible for this House Royale.</b>",
+        "",
+        `Valid referral: <b>${validReferral ? "✅" : "❌"}</b> (1 required)`,
+        `Your 30-day INR wager: <b>${formatMoney(wagerMinor, "INR")}</b>`,
+        `Required wager: <b>${formatMoney(royale.minWagerMinor, "INR")}</b>`,
+      ].join("\n"),
+    );
+    return;
+  }
+  let result: "joined" | "already" | "full";
+  try {
+    result = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM casino_house_royales WHERE id = ${royale.id} FOR UPDATE`);
+      const [lockedRoyale] = await tx
+        .select()
+        .from(casinoHouseRoyalesTable)
+        .where(eq(casinoHouseRoyalesTable.id, royale.id))
+        .limit(1);
+      if (!lockedRoyale || lockedRoyale.status !== "open") return "full";
+      const [existing] = await tx
+        .select({ id: casinoHouseRoyalePlayersTable.id })
+        .from(casinoHouseRoyalePlayersTable)
+        .where(
+          and(
+            eq(casinoHouseRoyalePlayersTable.royaleId, royale.id),
+            eq(casinoHouseRoyalePlayersTable.playerId, player.id),
+          ),
+        )
+        .limit(1);
+      if (existing) return "already";
+      const currentPlayers = await tx
+        .select({ id: casinoHouseRoyalePlayersTable.id })
+        .from(casinoHouseRoyalePlayersTable)
+        .where(eq(casinoHouseRoyalePlayersTable.royaleId, royale.id));
+      if (currentPlayers.length >= lockedRoyale.maxPlayers) return "full";
+      const [entry] = await tx
+        .insert(casinoHouseRoyalePlayersTable)
+        .values({
+          royaleId: lockedRoyale.id,
+          playerId: player.id,
+          entryAmountMinor: lockedRoyale.entryAmountMinor,
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (!entry) throw new Error("HOUSE_ROYALE_ALREADY_JOINED");
+      return "joined";
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "HOUSE_ROYALE_ALREADY_JOINED") {
+      result = "already";
+    } else {
+      logger.error({ err: error, royaleId, playerId: player.id }, "House Royale join failed");
+      await bot.sendMessage(chatId, "House Royale could not process your entry. Please try again.");
+      return;
+    }
+  }
+  if (result === "already") {
+    await bot.sendMessage(chatId, "ℹ️ You are already registered for this House Royale.");
+    return;
+  }
+  if (result === "full") {
+    await bot.sendMessage(chatId, "This House Royale is already full.");
+    return;
+  }
+  const players = await houseRoyalePlayers(royale.id);
+  await bot.sendMessage(
+    chatId,
+    `<b>✅ House Royale registration confirmed</b>\nPlayers: <b>${players.length}/8</b>\nNo entry fee — prize pool is funded by the house.`,
+  );
+  if (players.length >= royale.maxPlayers) {
+    await drawHouseRoyale(bot, royale.id);
+  }
+}
+
+async function houseRoyaleEligibility(
+  playerId: number,
+  royale: HouseRoyale,
+): Promise<{ validReferral: boolean; wagerMinor: number; eligible: boolean }> {
+  const [validReferral, wagerMinor] = await Promise.all([
+    hasValidHouseRoyaleReferral(playerId),
+    houseRoyaleWagerMinor(playerId, "INR", royale.wagerPeriodDays || 30),
+  ]);
+  return {
+    validReferral,
+    wagerMinor,
+    eligible: validReferral && wagerMinor >= royale.minWagerMinor,
+  };
+}
+
+function houseRoyaleRequirementText(
+  royale: HouseRoyale,
+  playerName: string,
+  eligibility: { validReferral: boolean; wagerMinor: number; eligible: boolean },
+  confirmed: boolean,
+): string {
+  return [
+    `<b>👑 HOUSE ROYALE #${royale.id} PARTICIPATION</b>`,
+    "",
+    `Player: <b>${escapeTelegramText(playerName)}</b>`,
+    `Prize pool: <b>${formatMoney(royale.prizePoolMinor, parseCurrency(royale.currency, "INR"))}</b>`,
+    "",
+    "<b>Your live requirements:</b>",
+    `Referral: <b>${eligibility.validReferral ? "✅ 1 valid human referral" : "❌ Need 1 valid human referral"}</b>`,
+    `30-day INR wager: <b>${formatMoney(eligibility.wagerMinor, "INR")}</b> / ${formatMoney(royale.minWagerMinor, "INR")}`,
+    "",
+    confirmed
+      ? "<b>✅ You have successfully participated!</b>\nCheck /giveawayrank for your rank."
+      : "Keep playing and referring. This message updates automatically when your requirements change.",
+  ].join("\n");
+}
+
+async function updateHouseRoyalePlayerStatus(
+  bot: TelegramBot,
+  royale: HouseRoyale,
+  row: HouseRoyalePlayer,
+  player: typeof casinoPlayersTable.$inferSelect,
+): Promise<{ row: HouseRoyalePlayer; eligible: boolean }> {
+  const eligibility = await houseRoyaleEligibility(player.id, royale);
+  let currentRow = row;
+  const newlyConfirmed = eligibility.eligible && !row.eligibilityConfirmedAt;
+  if (newlyConfirmed) {
+    const [updated] = await db
+      .update(casinoHouseRoyalePlayersTable)
+      .set({ eligibilityConfirmedAt: new Date() })
+      .where(eq(casinoHouseRoyalePlayersTable.id, row.id))
+      .returning();
+    if (updated) currentRow = updated;
+  }
+  if (!currentRow.dmChatId) return { row: currentRow, eligible: eligibility.eligible };
+  const text = houseRoyaleRequirementText(
+    royale,
+    player.username ? `@${player.username}` : player.displayName,
+    eligibility,
+    Boolean(currentRow.eligibilityConfirmedAt),
+  );
+  if (currentRow.dmMessageId) {
+    try {
+      await bot.editMessageText(currentRow.dmChatId, currentRow.dmMessageId, text);
+    } catch (error) {
+      logger.debug({ err: error, royaleId: royale.id, playerId: player.id }, "House Royale DM update failed");
+    }
+  } else {
+    const sent = await bot.sendMessage(currentRow.dmChatId, text);
+    const [updated] = await db
+      .update(casinoHouseRoyalePlayersTable)
+      .set({ dmMessageId: sent.message_id })
+      .where(eq(casinoHouseRoyalePlayersTable.id, currentRow.id))
+      .returning();
+    if (updated) currentRow = updated;
+  }
+  if (newlyConfirmed) {
+    await bot.sendMessage(
+      player.telegramUserId,
+      "<b>✅ You have successfully participated in House Royale!</b>\nCheck /giveawayrank for your rank.",
+    );
+  }
+  return { row: currentRow, eligible: eligibility.eligible };
+}
+
+async function joinHouseRoyale(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  royaleId: number,
+): Promise<void> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.id, royaleId))
+    .limit(1);
+  if (!royale || royale.status !== "open") {
+    await bot.sendMessage(chatId, "That House Royale is no longer open.");
+    return;
+  }
+  const player = await ensurePlayer(user);
+  if (player.isBot) {
+    await bot.sendMessage(chatId, "Only human players can join House Royale.");
+    return;
+  }
+  if (royale.joinDeadlineAt && royale.joinDeadlineAt.getTime() < Date.now()) {
+    await bot.sendMessage(chatId, "<b>❌ House Royale registration is closed.</b>");
+    return;
+  }
+  let result: "joined" | "already" | "full";
+  try {
+    result = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM casino_house_royales WHERE id = ${royale.id} FOR UPDATE`);
+      const [lockedRoyale] = await tx
+        .select()
+        .from(casinoHouseRoyalesTable)
+        .where(eq(casinoHouseRoyalesTable.id, royale.id))
+        .limit(1);
+      if (!lockedRoyale || lockedRoyale.status !== "open") return "full";
+      const [existing] = await tx
+        .select()
+        .from(casinoHouseRoyalePlayersTable)
+        .where(
+          and(
+            eq(casinoHouseRoyalePlayersTable.royaleId, royale.id),
+            eq(casinoHouseRoyalePlayersTable.playerId, player.id),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        await tx
+          .update(casinoHouseRoyalePlayersTable)
+          .set({ dmChatId: user.id })
+          .where(eq(casinoHouseRoyalePlayersTable.id, existing.id));
+        return "already";
+      }
+      const currentPlayers = await tx
+        .select({ id: casinoHouseRoyalePlayersTable.id })
+        .from(casinoHouseRoyalePlayersTable)
+        .where(eq(casinoHouseRoyalePlayersTable.royaleId, royale.id));
+      if (currentPlayers.length >= lockedRoyale.maxPlayers) return "full";
+      await tx.insert(casinoHouseRoyalePlayersTable).values({
+        royaleId: lockedRoyale.id,
+        playerId: player.id,
+        entryAmountMinor: lockedRoyale.entryAmountMinor,
+        dmChatId: user.id,
+      });
+      return "joined";
+    });
+  } catch (error) {
+    logger.error({ err: error, royaleId, playerId: player.id }, "House Royale join failed");
+    await bot.sendMessage(chatId, "House Royale could not process your participation request. Please try again.");
+    return;
+  }
+  if (result === "full") {
+    await bot.sendMessage(chatId, "This House Royale is already full.");
+    return;
+  }
+  const [row] = await db
+    .select()
+    .from(casinoHouseRoyalePlayersTable)
+    .where(
+      and(
+        eq(casinoHouseRoyalePlayersTable.royaleId, royale.id),
+        eq(casinoHouseRoyalePlayersTable.playerId, player.id),
+      ),
+    )
+    .limit(1);
+  if (!row) return;
+  await updateHouseRoyalePlayerStatus(bot, royale, row, player);
+  if (isGroupChat({ id: chatId, type: "supergroup" })) {
+    const notice = await bot.sendMessage(
+      chatId,
+      "<b>✅ Participation request received.</b>\nCheck your DM for House Royale requirements and live eligibility updates.",
+    );
+    setTimeout(() => {
+      void bot.deleteMessage(chatId, notice.message_id).catch(() => undefined);
+    }, 30 * 60 * 1_000);
+  }
+  const currentPlayers = await houseRoyalePlayers(royale.id);
+  const groupId = officialGroupChatId();
+  if (groupId !== null) {
+    const [freshRoyale] = await db
+      .select()
+      .from(casinoHouseRoyalesTable)
+      .where(eq(casinoHouseRoyalesTable.id, royale.id))
+      .limit(1);
+    if (freshRoyale) await sendHouseRoyale(bot, groupId, freshRoyale);
+  }
+  if (currentPlayers.filter((candidate) => candidate.eligibilityConfirmedAt).length >= royale.maxPlayers) {
+    await drawHouseRoyale(bot, royale.id);
+  }
+}
+
+async function syncOpenHouseRoyales(bot: TelegramBot): Promise<void> {
+  const royales = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.status, "open"));
+  for (const royale of royales) {
+    if (royale.joinDeadlineAt && royale.joinDeadlineAt.getTime() <= Date.now()) {
+      const [expired] = await db
+        .update(casinoHouseRoyalesTable)
+        .set({ status: "expired", drawnAt: new Date() })
+        .where(
+          and(
+            eq(casinoHouseRoyalesTable.id, royale.id),
+            eq(casinoHouseRoyalesTable.status, "open"),
+          ),
+        )
+        .returning();
+      if (expired && officialGroupChatId() !== null) {
+        await bot.sendMessage(
+          officialGroupChatId() as number,
+          `<b>⏱ HOUSE ROYALE #${royale.id} REGISTRATION CLOSED</b>\nThe registration window ended before 8 eligible players joined.`,
+        );
+        if (royale.announcementMessageId) {
+          try {
+            await bot.unpinChatMessage(officialGroupChatId() as number, royale.announcementMessageId);
+          } catch {
+            // The message may no longer be pinned.
+          }
+        }
+      }
+      continue;
+    }
+    const rows = await houseRoyalePlayers(royale.id);
+    let changed = false;
+    for (const row of rows) {
+      const [player] = await db
+        .select()
+        .from(casinoPlayersTable)
+        .where(eq(casinoPlayersTable.id, row.playerId))
+        .limit(1);
+      if (!player) continue;
+      const before = row.eligibilityConfirmedAt;
+      const result = await updateHouseRoyalePlayerStatus(bot, royale, row, player);
+      changed ||= Boolean(!before && result.row.eligibilityConfirmedAt);
+    }
+    const refreshedRows = await houseRoyalePlayers(royale.id);
+    const eligibleCount = refreshedRows.filter((row) => row.eligibilityConfirmedAt).length;
+    if (changed && officialGroupChatId() !== null) {
+      const [freshRoyale] = await db
+        .select()
+        .from(casinoHouseRoyalesTable)
+        .where(eq(casinoHouseRoyalesTable.id, royale.id))
+        .limit(1);
+      if (freshRoyale) await sendHouseRoyale(bot, officialGroupChatId() as number, freshRoyale);
+    }
+    if (eligibleCount >= royale.maxPlayers) await drawHouseRoyale(bot, royale.id);
+  }
+}
+
+async function playHouseRoyaleMatch(
+  bot: TelegramBot,
+  chatId: number,
+  roundLabel: string,
+  playerOneId: number,
+  playerTwoId: number,
+): Promise<{
+  playerOneId: number;
+  playerTwoId: number;
+  playerOneRoll: number;
+  playerTwoRoll: number;
+  winnerId: number;
+  loserId: number;
+}> {
+  await bot.sendMessage(
+    chatId,
+    `<b>${roundLabel}</b>\n🎲 Player <code>${playerOneId}</code> vs Player <code>${playerTwoId}</code>`,
+  );
+  let playerOneRoll = 0;
+  let playerTwoRoll = 0;
+  for (let attempt = 0; attempt < 6 && playerOneRoll === playerTwoRoll; attempt += 1) {
+    const first = await bot.sendDice(chatId, "🎲");
+    const second = await bot.sendDice(chatId, "🎲");
+    playerOneRoll = first.dice?.value ?? 0;
+    playerTwoRoll = second.dice?.value ?? 0;
+  }
+  if (playerOneRoll === playerTwoRoll) {
+    playerOneRoll = randomInt(1, 7);
+    playerTwoRoll = playerOneRoll === 6 ? 5 : playerOneRoll + 1;
+  }
+  const winnerId = playerOneRoll > playerTwoRoll ? playerOneId : playerTwoId;
+  const loserId = winnerId === playerOneId ? playerTwoId : playerOneId;
+  await bot.sendMessage(
+    chatId,
+    `<b>${roundLabel} RESULT</b>\nPlayer <code>${playerOneId}</code>: <b>${playerOneRoll}</b>\nPlayer <code>${playerTwoId}</code>: <b>${playerTwoRoll}</b>\nWinner: <b>${winnerId}</b>`,
+  );
+  return {
+    playerOneId,
+    playerTwoId,
+    playerOneRoll,
+    playerTwoRoll,
+    winnerId,
+    loserId,
+  };
+}
+
+async function drawHouseRoyale(
+  bot: TelegramBot,
+  royaleId: number,
+): Promise<void> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.id, royaleId))
+    .limit(1);
+  if (!royale || royale.status !== "open") return;
+  const allPlayers = await houseRoyalePlayers(royale.id);
+  const players = allPlayers.filter((player) => Boolean(player.eligibilityConfirmedAt));
+  if (players.length !== royale.maxPlayers) {
+    await bot.sendMessage(
+      royale.chatId ?? royale.createdByTelegramUserId,
+      `<b>❌ House Royale requires exactly ${royale.maxPlayers} eligible players before the dice bracket can start.</b>\nCurrent eligible players: ${players.length}/${royale.maxPlayers}`,
+    );
+    return;
+  }
+  const [claimed] = await db
+    .update(casinoHouseRoyalesTable)
+    .set({ status: "drawing" })
+    .where(
+      and(
+        eq(casinoHouseRoyalesTable.id, royale.id),
+        eq(casinoHouseRoyalesTable.status, "open"),
+      ),
+    )
+    .returning();
+  if (!claimed) return;
+
+  const chatId = officialGroupChatId() ?? royale.chatId ?? royale.createdByTelegramUserId;
+  const rounds: HouseRoyaleBracket["rounds"] = [];
+  try {
+    const firstRound: HouseRoyaleBracket["rounds"][number] = {
+      label: "ROUND 1/3 · QUARTERFINALS",
+      matches: [],
+    };
+    const firstRoundWinners: number[] = [];
+    for (let index = 0; index < 8; index += 2) {
+      const match = await playHouseRoyaleMatch(
+        bot,
+        chatId,
+        `${firstRound.label} · MATCH ${index / 2 + 1}`,
+        players[index].playerId,
+        players[index + 1].playerId,
+      );
+      firstRound.matches.push(match);
+      firstRoundWinners.push(match.winnerId);
+    }
+    rounds.push(firstRound);
+
+    const secondRound: HouseRoyaleBracket["rounds"][number] = {
+      label: "ROUND 2/3 · SEMIFINALS",
+      matches: [],
+    };
+    const finalists: number[] = [];
+    for (let index = 0; index < 4; index += 2) {
+      const match = await playHouseRoyaleMatch(
+        bot,
+        chatId,
+        `${secondRound.label} · MATCH ${index / 2 + 1}`,
+        firstRoundWinners[index],
+        firstRoundWinners[index + 1],
+      );
+      secondRound.matches.push(match);
+      finalists.push(match.winnerId);
+    }
+    rounds.push(secondRound);
+
+    const finalRound: HouseRoyaleBracket["rounds"][number] = {
+      label: "ROUND 3/3 · FINAL",
+      matches: [],
+    };
+    const finalMatch = await playHouseRoyaleMatch(
+      bot,
+      chatId,
+      finalRound.label,
+      finalists[0],
+      finalists[1],
+    );
+    finalRound.matches.push(finalMatch);
+    rounds.push(finalRound);
+
+    const payouts = houseRoyalePayouts(royale.prizePoolMinor);
+    const currency = parseCurrency(royale.currency, "INR");
+    const winnerOneWallet = await ensureWallet(finalMatch.winnerId, currency);
+    const winnerTwoWallet = await ensureWallet(finalMatch.loserId, currency);
+    const houseWallet = await ensureHouseWallet(currency);
+    await db.transaction(async (tx) => {
+      const [updatedHouse] = await tx
+        .update(casinoHouseWalletsTable)
+        .set({
+          balanceMinor: sql`${casinoHouseWalletsTable.balanceMinor} - ${royale.prizePoolMinor}`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(casinoHouseWalletsTable.id, houseWallet.id),
+            gte(casinoHouseWalletsTable.balanceMinor, royale.prizePoolMinor),
+          ),
+        )
+        .returning();
+      if (!updatedHouse) throw new Error("HOUSE_ROYALE_INSUFFICIENT_HOUSE_BALANCE");
+      for (const [wallet, payoutMinor, placement] of [
+        [winnerOneWallet, payouts.winnerOneMinor, 1],
+        [winnerTwoWallet, payouts.winnerTwoMinor, 2],
+      ] as const) {
+        await tx
+          .update(casinoWalletsTable)
+          .set({
+            balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${payoutMinor}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(casinoWalletsTable.id, wallet.id));
+        await tx.insert(casinoLedgerEntriesTable).values({
+          walletId: wallet.id,
+          transactionId: `house-royale-${royale.id}-winner-${placement}`,
+          entryType: "house_royale_prize",
+          amountMinor: payoutMinor,
+          description: `House Royale #${royale.id} ${placement === 1 ? "1st" : "2nd"} place prize`,
+        });
+        await tx
+          .update(casinoHouseRoyalePlayersTable)
+          .set({
+            selected: true,
+            placement,
+            payoutMinor,
+          })
+          .where(
+            and(
+              eq(casinoHouseRoyalePlayersTable.royaleId, royale.id),
+              eq(casinoHouseRoyalePlayersTable.playerId, placement === 1 ? finalMatch.winnerId : finalMatch.loserId),
+            ),
+          );
+      }
+      await tx
+        .update(casinoHouseRoyalesTable)
+        .set({
+          status: "completed",
+          winnerOneMinor: payouts.winnerOneMinor,
+          winnerTwoMinor: payouts.winnerTwoMinor,
+          bracketState: JSON.stringify({
+            rounds,
+            firstPlaceId: finalMatch.winnerId,
+            secondPlaceId: finalMatch.loserId,
+          } satisfies HouseRoyaleBracket),
+          drawnAt: new Date(),
+        })
+        .where(eq(casinoHouseRoyalesTable.id, royale.id));
+    });
+    for (const [playerId, placement, payoutMinor] of [
+      [finalMatch.winnerId, "1ST", payouts.winnerOneMinor],
+      [finalMatch.loserId, "2ND", payouts.winnerTwoMinor],
+    ] as const) {
+      await bot.sendMessage(
+        chatId,
+        `<b>🏆 HOUSE ROYALE #${royale.id} · ${placement} PLACE</b>\nPlayer: <code>${playerId}</code>\nPrize credited: <b>${formatMoney(payoutMinor, currency)}</b>\nSplit: <b>60% / 40%</b>\nFair ID: <code>${royale.fairId}</code>`,
+      );
+    }
+    await bot.sendMessage(
+      chatId,
+      `<b>✅ HOUSE ROYALE #${royale.id} COMPLETED</b>\nThree dice rounds finished. Prize pool split automatically 60% / 40%.`,
+    );
+  } catch (error) {
+    await db
+      .update(casinoHouseRoyalesTable)
+      .set({ status: "open" })
+      .where(eq(casinoHouseRoyalesTable.id, royale.id));
+    logger.error({ err: error, royaleId }, "House Royale tournament failed");
+    await bot.sendMessage(
+      chatId,
+      "<b>❌ House Royale could not complete safely.</b>\nNo prize was paid; an admin can start the full 8-player bracket again.",
+    );
+  }
+}
+
+async function drawHouseRoyaleLegacy(
+  bot: TelegramBot,
+  royaleId: number,
+): Promise<void> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.id, royaleId))
+    .limit(1);
+  if (!royale || royale.status !== "open") {
+    if (royale?.createdByTelegramUserId) {
+      await bot.sendMessage(royale.createdByTelegramUserId, "That House Royale is no longer open.");
+    }
+    return;
+  }
+  const players = await houseRoyalePlayers(royale.id);
+  if (players.length < 2) {
+    await bot.sendMessage(
+      royale.createdByTelegramUserId,
+      "House Royale needs at least 2 joined players before winners can be drawn.",
+    );
+    return;
+  }
+  const [claimed] = await db
+    .update(casinoHouseRoyalesTable)
+    .set({ status: "drawing" })
+    .where(
+      and(
+        eq(casinoHouseRoyalesTable.id, royale.id),
+        eq(casinoHouseRoyalesTable.status, "open"),
+      ),
+    )
+    .returning();
+  if (!claimed) return;
+  const selected = shufflePlayers(players).slice(0, 2);
+  const payouts = houseRoyalePayouts(royale.prizePoolMinor);
+  const currency = parseCurrency(royale.currency, "USD");
+  const winnerPayouts = [payouts.winnerOneMinor, payouts.winnerTwoMinor];
+  try {
+    const winnerWallets = await Promise.all(
+      selected.map((player) => ensureWallet(player.playerId, currency)),
+    );
+    const houseWallet = await ensureHouseWallet(currency);
+    await db.transaction(async (tx) => {
+      const [updatedHouse] = await tx
+        .update(casinoHouseWalletsTable)
+        .set({
+          balanceMinor: sql`${casinoHouseWalletsTable.balanceMinor} - ${royale.prizePoolMinor}`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(casinoHouseWalletsTable.id, houseWallet.id),
+            gte(casinoHouseWalletsTable.balanceMinor, royale.prizePoolMinor),
+          ),
+        )
+        .returning();
+      if (!updatedHouse) throw new Error("HOUSE_ROYALE_INSUFFICIENT_HOUSE_BALANCE");
+      for (let index = 0; index < selected.length; index += 1) {
+        const participant = selected[index];
+        const payoutMinor = winnerPayouts[index];
+        await tx
+          .update(casinoWalletsTable)
+          .set({
+            balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${payoutMinor}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(casinoWalletsTable.id, winnerWallets[index].id));
+        await tx.insert(casinoLedgerEntriesTable).values({
+          walletId: winnerWallets[index].id,
+          transactionId: `house-royale-${royale.id}-winner-${index + 1}`,
+          entryType: "house_royale_prize",
+          amountMinor: payoutMinor,
+          description: `House Royale #${royale.id} ${index === 0 ? "1st" : "2nd"} place prize`,
+        });
+        await tx
+          .update(casinoHouseRoyalePlayersTable)
+          .set({
+            selected: true,
+            placement: index + 1,
+            payoutMinor,
+          })
+          .where(eq(casinoHouseRoyalePlayersTable.id, participant.id));
+      }
+      await tx
+        .update(casinoHouseRoyalesTable)
+        .set({
+          status: "completed",
+          winnerOneMinor: payouts.winnerOneMinor,
+          winnerTwoMinor: payouts.winnerTwoMinor,
+          drawnAt: new Date(),
+        })
+        .where(eq(casinoHouseRoyalesTable.id, royale.id));
+    });
+  } catch (error) {
+    await db
+      .update(casinoHouseRoyalesTable)
+      .set({ status: "open" })
+      .where(eq(casinoHouseRoyalesTable.id, royale.id));
+    if (error instanceof Error && error.message === "HOUSE_ROYALE_INSUFFICIENT_HOUSE_BALANCE") {
+      await bot.sendMessage(
+        royale.createdByTelegramUserId,
+        `<b>❌ House Royale #${royale.id} could not draw.</b>\nHouse balance is below the ${formatMoney(royale.prizePoolMinor, currency)} prize pool.`,
+      );
+      return;
+    }
+    logger.error({ err: error, royaleId }, "House Royale draw failed");
+    await bot.sendMessage(royale.createdByTelegramUserId, "House Royale draw failed and was left open.");
+    return;
+  }
+  for (let index = 0; index < selected.length; index += 1) {
+    const winner = await db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.id, selected[index].playerId))
+      .limit(1);
+    if (!winner[0]) continue;
+    await bot.sendMessage(
+      winner[0].telegramUserId,
+      [
+        `<b>🏆 HOUSE ROYALE #${royale.id} — ${index === 0 ? "1ST" : "2ND"} PLACE</b>`,
+        "",
+        `Prize credited: <b>${formatMoney(winnerPayouts[index], currency)}</b>`,
+        `Prize pool: <b>${formatMoney(royale.prizePoolMinor, currency)}</b>`,
+        `<b>Fair ID:</b> <code>${royale.fairId}</code>`,
+      ].join("\n"),
+    );
+  }
+  await bot.sendMessage(
+    royale.createdByTelegramUserId,
+    `<b>✅ House Royale #${royale.id} completed.</b>\n1st: <b>${formatMoney(payouts.winnerOneMinor, currency)}</b>\n2nd: <b>${formatMoney(payouts.winnerTwoMinor, currency)}</b>`,
+  );
+}
+
+async function cancelHouseRoyale(
+  bot: TelegramBot,
+  chatId: number,
+  royaleId: number,
+): Promise<void> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .where(eq(casinoHouseRoyalesTable.id, royaleId))
+    .limit(1);
+  if (!royale || royale.status !== "open") {
+    await bot.sendMessage(chatId, "That House Royale is no longer open.");
+    return;
+  }
+  const [cancelled] = await db
+    .update(casinoHouseRoyalesTable)
+    .set({ status: "canceled", drawnAt: new Date() })
+    .where(
+      and(
+        eq(casinoHouseRoyalesTable.id, royale.id),
+        eq(casinoHouseRoyalesTable.status, "open"),
+      ),
+    )
+    .returning();
+  if (!cancelled) return;
+  const players = await houseRoyalePlayers(royale.id);
+  const currency = parseCurrency(royale.currency, "USD");
+  const houseWallet = await ensureHouseWallet(currency);
+  const wallets = await Promise.all(players.map((player) => ensureWallet(player.playerId, currency)));
+  const totalRefund = players.reduce((total, player) => total + player.entryAmountMinor, 0);
+  try {
+    await db.transaction(async (tx) => {
+      if (totalRefund > 0) {
+        const [updatedHouse] = await tx
+          .update(casinoHouseWalletsTable)
+          .set({
+            balanceMinor: sql`${casinoHouseWalletsTable.balanceMinor} - ${totalRefund}`,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(casinoHouseWalletsTable.id, houseWallet.id),
+              gte(casinoHouseWalletsTable.balanceMinor, totalRefund),
+            ),
+          )
+          .returning();
+        if (!updatedHouse) throw new Error("HOUSE_ROYALE_REFUND_BALANCE");
+      }
+      for (let index = 0; index < players.length; index += 1) {
+        const player = players[index];
+        await tx
+          .update(casinoWalletsTable)
+          .set({
+            balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${player.entryAmountMinor}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(casinoWalletsTable.id, wallets[index].id));
+        await tx.insert(casinoLedgerEntriesTable).values({
+          walletId: wallets[index].id,
+          transactionId: `house-royale-${royale.id}-refund-${player.id}`,
+          entryType: "house_royale_refund",
+          amountMinor: player.entryAmountMinor,
+          description: `House Royale #${royale.id} cancelled entry refund`,
+        });
+      }
+    });
+  } catch (error) {
+    await db
+      .update(casinoHouseRoyalesTable)
+      .set({ status: "open", drawnAt: null })
+      .where(eq(casinoHouseRoyalesTable.id, royale.id));
+    logger.error({ err: error, royaleId }, "House Royale refund failed");
+    await bot.sendMessage(chatId, "House Royale could not be cancelled safely; it remains open.");
+    return;
+  }
+  await bot.sendMessage(
+    chatId,
+    `<b>✅ House Royale #${royale.id} cancelled.</b>\n${players.length} entry/refund(s) processed.`,
+  );
+}
+
+async function createHouseRoyale(
+  bot: TelegramBot,
+  chatId: number,
+  adminId: number,
+  args: string[],
+): Promise<void> {
+  const prizePoolMinor = parseMoney(args[0]);
+  const durationMinutes = Number(args[1]);
+  const minWagerMinor = parseMoney(args[2]);
+  const existing = await activeHouseRoyale();
+  if (existing) {
+    await bot.sendMessage(
+      chatId,
+      `<b>❌ House Royale #${existing.id} is already open.</b>\nClose or draw it before hosting another one.`,
+    );
+    return;
+  }
+  if (
+    !prizePoolMinor ||
+    !Number.isInteger(durationMinutes) ||
+    durationMinutes < 1 ||
+    durationMinutes > 1_440 ||
+    !minWagerMinor ||
+    minWagerMinor < 0
+  ) {
+    await bot.sendMessage(
+      chatId,
+      [
+        "<b>Usage:</b> <code>/organize PRIZEPOOL TIME MINWAGER</code>",
+        "",
+        "TIME is the registration window in minutes. House Royale always requires exactly 8 players.",
+        "Every player needs at least 1 valid human referral and the configured INR wager in the last 30 days.",
+        "Example: <code>/organize 5000 30 5000</code> → ₹5,000 prize pool, 30-minute registration, ₹5,000 minimum wager.",
+      ].join("\n"),
+    );
+    return;
+  }
+  const joinDeadlineAt = new Date(Date.now() + durationMinutes * 60_000);
+  const groupId = officialGroupChatId();
+  const [royale] = await db
+    .insert(casinoHouseRoyalesTable)
+    .values({
+      chatId: groupId ?? chatId,
+      currency: "INR",
+      entryAmountMinor: 0,
+      maxPlayers: 8,
+      prizePoolMinor,
+      minWagerMinor,
+      wagerPeriodDays: 30,
+      createdByTelegramUserId: adminId,
+      fairId: createFairId(),
+      status: "open",
+      joinDeadlineAt,
+    })
+    .returning();
+  if (!royale) {
+    await bot.sendMessage(chatId, "House Royale could not be created.");
+    return;
+  }
+  await bot.sendMessage(
+    chatId,
+    `<b>✅ HOUSE ROYALE #${royale.id} ORGANIZED</b>\nPrize pool and registration time were set by admin only.\nThe bracket starts automatically at exactly 8 eligible players.`,
+  );
+  if (groupId !== null) {
+    await sendHouseRoyale(bot, groupId, royale);
+    await bot.sendMessage(
+      chatId,
+      `<b>📣 House Royale #${royale.id} posted in the official group and pinned.</b>\nPlayers can join from the group button and will receive live requirements in DM.`,
+    );
+  } else {
+    await sendHouseRoyale(bot, chatId, royale, adminId);
+  }
+}
+
 function giveawayOverviewSvg(
   settings: GiveawaySetting[],
   title: string,
@@ -9452,7 +11666,7 @@ function giveawayOverviewSvg(
       `<text x="86" y="${y}" fill="#f6c453" font-size="25" font-family="DejaVu Sans" font-weight="bold">${escapeXml(giveawayLabel(settingsRow, index))}</text>`,
       `<text x="420" y="${y}" fill="#ffffff" font-size="25" font-family="Deja Vu Sans" font-weight="bold">${escapeXml(formatMoney(settingsRow.amountMinor, currency))}</text>`,
       `<text x="680" y="${y}" fill="#b6c7df" font-size="20" font-family="Deja Sans">Wager ${escapeXml(formatMoney(settingsRow.minWagerMinor, currency))} · Referrals ${settingsRow.minReferralCount}</text>`,
-      `<text x="420" y="${y + 30}" fill="#8da2bd" font-size="18" font-family="Deja Sans">Winners ${settingsRow.maxWinners} · Draw ${escapeXml(settingsRow.nextDrawAt?.toLocaleDateString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "pending")}</text>`,
+      `<text x="420" y="${y + 30}" fill="#8da2bd" font-size="18" font-family="Deja Sans">Winners ${settingsRow.maxWinners || "all"} · Draw ${escapeXml(settingsRow.nextDrawAt?.toLocaleDateString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "pending")}</text>`,
     ].join("");
   }).join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820">
@@ -9486,13 +11700,198 @@ async function giveawayOverviewPng(
   });
 }
 
+function giveawayUserLabel(user: TelegramUser): string {
+  return user.username
+    ? `@${user.username}`
+    : [user.first_name, user.last_name].filter(Boolean).join(" ") || `user ${user.id}`;
+}
+
+type GiveawayRequirementStatus = "review" | "not_eligible" | "joined";
+
+function giveawayRequirementSvg(
+  settings: GiveawaySetting,
+  index: number,
+  user: TelegramUser,
+  metrics: { wagerMinor: number; referrals: number; bets: number },
+  status: GiveawayRequirementStatus,
+): string {
+  const currency = parseCurrency(settings.currency, "INR");
+  const statusText =
+    status === "joined"
+      ? "SUCCESSFULLY JOINED"
+      : status === "not_eligible"
+        ? "NOT ELIGIBLE YET"
+        : metrics.wagerMinor >= settings.minWagerMinor &&
+            metrics.referrals >= settings.minReferralCount
+          ? "READY TO JOIN"
+          : "CHECK REQUIREMENTS";
+  const statusColor =
+    status === "joined"
+      ? "#76e3a3"
+      : status === "not_eligible"
+        ? "#f6c453"
+        : "#9dd7ff";
+  const userLabel = escapeXml(giveawayUserLabel(user));
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820">
+  <defs><linearGradient id="giveaway-requirement-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#101a31"/><stop offset="1" stop-color="#183b45"/></linearGradient></defs>
+  <rect width="1400" height="820" rx="42" fill="url(#giveaway-requirement-bg)"/>
+  <circle cx="1260" cy="110" r="230" fill="#eab308" opacity=".12"/>
+  <circle cx="110" cy="760" r="210" fill="#2563eb" opacity=".11"/>
+  <rect x="42" y="42" width="1316" height="736" rx="32" fill="none" stroke="#f6c453" stroke-opacity=".38" stroke-width="2"/>
+  <text x="86" y="108" fill="#f6c453" font-size="30" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="166" fill="#ffffff" font-size="48" font-family="DejaVu Sans" font-weight="bold">${escapeXml(giveawayLabel(settings, index))}</text>
+  <text x="1310" y="112" text-anchor="end" fill="${statusColor}" font-size="24" font-family="DejaVu Sans" font-weight="bold">${statusText}</text>
+  <text x="86" y="218" fill="#9db0cb" font-size="22" font-family="DejaVu Sans">PLAYER</text>
+  <text x="86" y="258" fill="#ffffff" font-size="34" font-family="DejaVu Sans" font-weight="bold">${userLabel}</text>
+  <rect x="86" y="302" width="590" height="170" rx="24" fill="#ffffff" fill-opacity=".07" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="122" y="346" fill="#8da2bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">PRIZE</text>
+  <text x="122" y="392" fill="#f6c453" font-size="34" font-family="DejaVu Sans" font-weight="bold">${escapeXml(formatMoney(settings.amountMinor, currency))}</text>
+  <text x="122" y="434" fill="#b6c7df" font-size="20" font-family="DejaVu Sans">Winners: ${settings.maxWinners || "all eligible"} · Draw: ${escapeXml(settings.nextDrawAt?.toLocaleDateString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "pending")}</text>
+  <rect x="716" y="302" width="598" height="170" rx="24" fill="#ffffff" fill-opacity=".07" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="752" y="346" fill="#8da2bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">JOIN CONDITIONS</text>
+  <text x="752" y="392" fill="#ffffff" font-size="23" font-family="DejaVu Sans">Wager: ${escapeXml(formatMoney(metrics.wagerMinor, currency))} / ${escapeXml(formatMoney(settings.minWagerMinor, currency))}</text>
+  <text x="752" y="432" fill="#ffffff" font-size="23" font-family="DejaVu Sans">Referrals: ${metrics.referrals} / ${settings.minReferralCount}</text>
+  <text x="86" y="554" fill="#8da2bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">ACTIVITY</text>
+  <text x="86" y="600" fill="#dbe7f5" font-size="27" font-family="DejaVu Sans">Messages / plays: ${metrics.bets}</text>
+  <text x="86" y="662" fill="#b6c7df" font-size="21" font-family="DejaVu Sans">Minimum wager to join: ${escapeXml(formatMoney(settings.minWagerMinor, currency))}</text>
+  <text x="86" y="700" fill="#b6c7df" font-size="21" font-family="DejaVu Sans">Minimum referrals to join: ${settings.minReferralCount}</text>
+  <text x="1314" y="700" text-anchor="end" fill="${statusColor}" font-size="24" font-family="DejaVu Sans" font-weight="bold">${statusText}</text>
+  <text x="86" y="760" fill="#7185a3" font-size="18" font-family="DejaVu Sans">Requirements are checked again when joining and before the draw.</text>
+</svg>`;
+}
+
+async function giveawayRequirementPng(
+  settings: GiveawaySetting,
+  index: number,
+  user: TelegramUser,
+  metrics: { wagerMinor: number; referrals: number; bets: number },
+  status: GiveawayRequirementStatus,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render giveaway requirements image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(giveawayRequirementSvg(settings, index, user, metrics, status));
+  });
+}
+
+type GiveawayRankingItem = {
+  rank: number;
+  name: string;
+  wagerMinor: number;
+  referrals: number;
+  bets: number;
+  messages: number;
+  points: number;
+  wagerEligible: boolean;
+  referralEligible: boolean;
+};
+
+function giveawayRankingsSvg(
+  setting: GiveawaySetting | null,
+  items: GiveawayRankingItem[],
+): string {
+  const currency = parseCurrency(setting?.currency, "INR");
+  const rankTitle = setting
+    ? `${giveawayLabel(setting, 0)} RESULT · TOP 10 PLAYERS`
+    : "GIVEAWAY RESULT · TOP 10 PLAYERS";
+  const conditionHeader = setting
+    ? `WAGER ${formatMoney(setting.minWagerMinor, currency)} MIN · ${setting.minReferralCount} REFERRALS MIN`
+    : "NO ACTIVE GIVEAWAY · INFORMATIONAL SNAPSHOT";
+  const rows = items.length > 0
+    ? items.map((item, index) => {
+        const y = 290 + index * 50;
+        const eligible = Boolean(
+          setting && item.wagerEligible && item.referralEligible,
+        );
+        const status = !setting ? "NO ACTIVE" : eligible ? "ELIGIBLE" : "NOT YET";
+        const statusColor = eligible ? "#76e3a3" : "#f6c453";
+        return [
+          `<rect x="58" y="${y - 31}" width="1284" height="42" rx="13" fill="#ffffff" fill-opacity="${index < 3 ? ".09" : ".045"}" stroke="#ffffff" stroke-opacity=".08"/>`,
+          `<text x="84" y="${y}" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.rank}</text>`,
+          `<text x="148" y="${y}" fill="#ffffff" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(item.name, 22))}</text>`,
+          `<text x="470" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="20" font-family="DejaVu Sans, sans-serif">${escapeXml(formatMoney(item.wagerMinor, currency))}</text>`,
+          `<text x="650" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="20" font-family="DejaVu Sans, sans-serif">${item.messages}</text>`,
+          `<text x="780" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="20" font-family="DejaVu Sans, sans-serif">${item.referrals}</text>`,
+          `<text x="930" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="20" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.points.toFixed(1)}</text>`,
+          `<text x="1150" y="${y}" text-anchor="end" fill="${!setting ? "#8da2bd" : item.wagerEligible && item.referralEligible ? "#76e3a3" : "#f6c453"}" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">${!setting ? "—" : `W${item.wagerEligible ? "✓" : "✗"} R${item.referralEligible ? "✓" : "✗"}`}</text>`,
+          `<text x="1298" y="${y}" text-anchor="end" fill="${statusColor}" font-size="19" font-family="Deja Vu Sans, sans-serif" font-weight="bold">${status}</text>`,
+        ].join("");
+      }).join("")
+    : `<text x="700" y="430" text-anchor="middle" fill="#b6c7df" font-size="28" font-family="Deja Sans">No wager or referral activity yet</text>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900">
+  <defs><linearGradient id="giveaway-rank-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#101a31"/><stop offset="1" stop-color="#183b45"/></linearGradient></defs>
+  <rect width="1400" height="900" rx="42" fill="url(#giveaway-rank-bg)"/>
+  <circle cx="1280" cy="90" r="220" fill="#eab308" opacity=".12"/>
+  <circle cx="90" cy="840" r="220" fill="#2563eb" opacity=".11"/>
+  <rect x="42" y="42" width="1316" height="816" rx="32" fill="none" stroke="#f6c453" stroke-opacity=".38" stroke-width="2"/>
+  <text x="86" y="108" fill="#f6c453" font-size="29" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="164" fill="#ffffff" font-size="42" font-family="DejaVu Sans" font-weight="bold">${escapeXml(rankTitle)}</text>
+  <text x="86" y="199" fill="#9db0cb" font-size="20" font-family="Deja Sans">${escapeXml(conditionHeader)}</text>
+  <text x="148" y="246" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">PLAYER</text>
+  <text x="470" y="246" text-anchor="end" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">TOTAL WAGER</text>
+  <text x="650" y="246" text-anchor="end" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">MESSAGES</text>
+  <text x="780" y="246" text-anchor="end" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">REFERRALS</text>
+  <text x="930" y="246" text-anchor="end" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">POINTS</text>
+  <text x="1150" y="246" text-anchor="end" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">CONDITIONS</text>
+  <text x="1298" y="246" text-anchor="end" fill="#8da2bd" font-size="17" font-family="Deja Sans" font-weight="bold">STATUS</text>
+  ${rows}
+  <text x="86" y="810" fill="#9db0cb" font-size="17" font-family="Deja Sans">Messages = completed game and battle entries recorded by RolexCasino. W✓/R✓ show each active condition.</text>
+</svg>`;
+}
+
+async function giveawayRankingsPng(
+  setting: GiveawaySetting | null,
+  items: GiveawayRankingItem[],
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render giveaway rank image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(giveawayRankingsSvg(setting, items));
+  });
+}
+
 function giveawayOverviewKeyboard(
   settings: GiveawaySetting[],
 ): { inline_keyboard: InlineKeyboardButton[][] } {
   return {
+    inline_keyboard: settings.flatMap((settingsRow, index) => [
+      [
+        {
+          text: `Join ${index + 1}`,
+          callback_data: `giveaway:select:${settingsRow.kind}`,
+        },
+        {
+          text: `Rank ${index + 1}`,
+          callback_data: `giveaway:rank:${settingsRow.kind}`,
+        },
+      ],
+    ]),
+  };
+}
+
+function giveawayRankSelectionKeyboard(
+  settings: GiveawaySetting[],
+): { inline_keyboard: InlineKeyboardButton[][] } {
+  return {
     inline_keyboard: settings.map((settingsRow, index) => [{
-      text: `Join ${index + 1}`,
-      callback_data: `giveaway:select:${settingsRow.kind}`,
+      text: `🏆 ${giveawayLabel(settingsRow, index)} · ${formatMoney(settingsRow.amountMinor, parseCurrency(settingsRow.currency, "INR"))}`,
+      callback_data: `giveaway:rank:${settingsRow.kind}`,
     }]),
   };
 }
@@ -9531,6 +11930,58 @@ async function sendGiveawaySettings(
       `Next draw: <b>${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "not scheduled"}</b>`,
     ].join("\n"),
   );
+}
+
+async function publishGiveawayAnnouncement(
+  bot: TelegramBot,
+  settings: GiveawaySetting,
+): Promise<void> {
+  const announcementBot = activeGiveawayBot ?? bot;
+  const groupId = officialGroupChatId();
+  if (groupId === null) return;
+  const image = await giveawayOverviewPng(
+    [settings],
+    giveawayLabel(settings, 0),
+    "House-funded prize pool · requirements checked at join and again before the draw.",
+  );
+  const keyboard = {
+    inline_keyboard: [
+      [{
+        text: "Join giveaway",
+        callback_data: `giveaway:select:${settings.kind}`,
+      }, {
+        text: "🏆 View leaderboard",
+        callback_data: `giveaway:rank:${settings.kind}`,
+      }],
+    ],
+  };
+  const caption = [
+    `<b>🎁 ${giveawayLabel(settings, 0)}</b>`,
+    `<b>Prize pool:</b> ${formatMoney(settings.amountMinor, parseCurrency(settings.currency, "INR"))}`,
+    `<b>Minimum wager:</b> ${formatMoney(settings.minWagerMinor, parseCurrency(settings.currency, "INR"))}`,
+    `<b>Minimum referrals:</b> ${settings.minReferralCount}`,
+    `<b>Draw:</b> ${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "scheduled soon"}`,
+    "",
+    "Tap Join giveaway. The bot will send your requirements in DM.",
+  ].join("\n");
+  let sent: TelegramMessage;
+  if (settings.announcementMessageId && settings.announcementChatId === groupId) {
+    sent = await announcementBot.editPhoto(groupId, settings.announcementMessageId, image, caption, keyboard);
+  } else {
+    sent = await announcementBot.sendPhoto(groupId, image, caption, keyboard);
+  }
+  await db
+    .update(casinoGiveawaySettingsTable)
+    .set({
+      announcementChatId: groupId,
+      announcementMessageId: sent.message_id,
+    })
+    .where(eq(casinoGiveawaySettingsTable.id, settings.id));
+  try {
+    await announcementBot.pinChatMessage(groupId, sent.message_id);
+  } catch (error) {
+    logger.warn({ err: error, kind: settings.kind }, "Giveaway announcement pin failed");
+  }
 }
 
 async function configureGiveaway(
@@ -9586,6 +12037,12 @@ async function configureGiveaway(
       nextDrawAt,
     });
   }
+  const [saved] = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(eq(casinoGiveawaySettingsTable.kind, kind))
+    .limit(1);
+  if (saved) await publishGiveawayAnnouncement(bot, saved);
   await bot.sendMessage(
     chatId,
     `<b>✅ ${kind.toUpperCase()} SAVED</b>\n\nNext draw: <b>${nextDrawAt.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" })}</b>`,
@@ -9670,17 +12127,28 @@ async function distributeConfiguredGiveaways(bot: TelegramBot): Promise<void> {
           entryType: "admin_credit",
           description: `${kind} giveaway reward`,
         });
-        await bot.sendMessage(
-          recipient.telegramUserId,
-          [
-            `<b>🏆🎉 ${kind.toUpperCase()} WINNER</b>`,
-            "",
-            `Reward credited: <b>${formatMoney(rewardMinor, parseCurrency(settings.currency, "INR"))}</b>`,
-            `Balance: <b>${formatMoney(reward.balanceMinor, parseCurrency(settings.currency, "INR"))}</b>`,
-            "Withdrawal wagering rule: <b>1× the credited reward</b>.",
-            "Use /wagerstatus to check progress.",
-          ].join("\n"),
-        );
+        if (kind === "monthly") {
+          await sendBonusWinnerCard(
+            bot,
+            recipient.telegramUserId,
+            "monthly",
+            rewardMinor,
+            parseCurrency(settings.currency, "INR"),
+            reward.balanceMinor,
+          );
+        } else {
+          await bot.sendMessage(
+            recipient.telegramUserId,
+            [
+              `<b>🏆🎉 ${kind.toUpperCase()} WINNER</b>`,
+              "",
+              `Reward credited: <b>${formatMoney(rewardMinor, parseCurrency(settings.currency, "INR"))}</b>`,
+              `Balance: <b>${formatMoney(reward.balanceMinor, parseCurrency(settings.currency, "INR"))}</b>`,
+              "Withdrawal wagering rule: <b>1× the credited reward</b>.",
+              "Use /wagerstatus to check progress.",
+            ].join("\n"),
+          );
+        }
       } catch (error) {
         logger.warn({ err: error, playerId: recipient.id, kind }, "Giveaway reward notification failed");
       }
@@ -9692,6 +12160,12 @@ async function distributeConfiguredGiveaways(bot: TelegramBot): Promise<void> {
         updatedAt: now,
       })
       .where(eq(casinoGiveawaySettingsTable.id, settings.id));
+    const [rolledOver] = await db
+      .select()
+      .from(casinoGiveawaySettingsTable)
+      .where(eq(casinoGiveawaySettingsTable.id, settings.id))
+      .limit(1);
+    if (rolledOver) await publishGiveawayAnnouncement(bot, rolledOver);
   }
 }
 
@@ -9753,10 +12227,15 @@ async function handleAdminCommand(
           updatedAt: new Date(),
         },
       });
-    await bot.sendMessage(
-      chatId,
-      `<b>✅ DAILY BONUS SET</b>\n\nBonus per winner: <b>${formatMoney(amountMinor, currency)}</b>\nMaximum winners: <b>${eligibleUsers}</b>\nCurrency: <b>${currency}</b>\nSelection: <b>randomly chosen by the bot</b>\nNext draw: <b>in 24 hours</b>\nWager rule: <b>1× before withdrawal</b>`,
-    );
+    await sendBonusCard(bot, chatId, {
+      title: "DAILY BONUS",
+      subtitle: "BOT-SELECTED REWARD",
+      status: "CONFIGURED",
+      amount: formatMoney(amountMinor, currency),
+      currency,
+      winners: String(eligibleUsers),
+      next: "Scheduled in 24 hours",
+    });
     return true;
   }
 
@@ -9800,10 +12279,15 @@ async function handleAdminCommand(
           updatedAt: new Date(),
         },
       });
-    await bot.sendMessage(
-      chatId,
-      `<b>✅ WEEKLY BONUS SET</b>\n\nBonus per winner: <b>${formatMoney(amountMinor, currency)}</b>\nMaximum winners: <b>${eligibleUsers}</b>\nCurrency: <b>${currency}</b>\nSelection: <b>randomly chosen by the bot</b>\nNext draw: <b>in 1 week</b>\nWager rule: <b>1× before withdrawal</b>`,
-    );
+    await sendBonusCard(bot, chatId, {
+      title: "WEEKLY BONUS",
+      subtitle: "BOT-SELECTED REWARD",
+      status: "CONFIGURED",
+      amount: formatMoney(amountMinor, currency),
+      currency,
+      winners: String(eligibleUsers),
+      next: "Scheduled in 1 week",
+    });
     return true;
   }
 
@@ -10188,6 +12672,8 @@ async function showDepositNetworks(
     chatId,
     [
       `<b>Deposit ${formatMoney(amountMinor, currency)}</b>`,
+      `Fee: <b>${formatMoney(request.feeMinor, currency)}</b> (${currency === "USD" ? "3%" : "1%"})`,
+      `Net credit after approval: <b>${formatMoney(amountMinor - request.feeMinor, currency)}</b>`,
       "",
       "Choose your payment network:",
       currency === "INR"
@@ -10277,6 +12763,8 @@ async function selectDepositNetwork(
       "",
       `Currency: <b>${currency}</b>`,
       `Exact amount: <b>${formatMoney(pending.amountMinor, currency)}</b>`,
+      `Deposit fee: <b>${formatMoney(depositFeeMinor(pending.amountMinor, currency), currency)}</b> (${currency === "USD" ? "3%" : "1%"})`,
+      `Net credit after approval: <b>${formatMoney(pending.amountMinor - depositFeeMinor(pending.amountMinor, currency), currency)}</b>`,
       `Network: <b>${networkLabel(network)}</b>`,
       `Payment address: <code>${address}</code>`,
       "",
@@ -11120,6 +13608,8 @@ async function handleMainUpdate(
       await sendGameTerms(bot, chatId);
     } else if (action.startsWith("currency:set:")) {
       const currency = parseDisplayCurrency(action.split(":")[2], "USD");
+      const currentCurrency = parseDisplayCurrency(player.preferredCurrency, "USD");
+      if (currentCurrency === currency) return;
       await changePlayerCurrency(player.id, currency);
       const text = [
         `<b>✅ Currency updated — ${currency}</b>`,
@@ -11129,27 +13619,29 @@ async function handleMainUpdate(
         await balanceText(player.id, currency),
       ].join("\n");
       const keyboard = currencyKeyboard(currency, player.telegramUserId);
-      if (isPrivateChat(callback.message?.chat ?? { id: chatId, type: "group" })) {
-        const messageId = callback.message?.message_id;
-        if (messageId) {
-          await bot.editMessageText(chatId, messageId, text, keyboard);
-          currencyMenuMessages.set(player.telegramUserId, { chatId, messageId });
-        } else {
-          await openCurrencyMenu(bot, chatId, player, currency);
-        }
-      } else {
-        const existing = currencyMenuMessages.get(player.telegramUserId);
-        if (existing) {
-          try {
-            await bot.editMessageText(existing.chatId, existing.messageId, text, keyboard);
-          } catch {
-            currencyMenuMessages.delete(player.telegramUserId);
-            await openCurrencyMenu(bot, chatId, player, currency);
-          }
-        } else {
-          await openCurrencyMenu(bot, chatId, player, currency);
+      const directMessage = callback.message &&
+        isPrivateChat(callback.message.chat)
+        ? { chatId: callback.message.chat.id, messageId: callback.message.message_id }
+        : currencyMenuMessages.get(player.telegramUserId);
+      if (directMessage) {
+        try {
+          await bot.editMessageText(
+            directMessage.chatId,
+            directMessage.messageId,
+            text,
+            keyboard,
+          );
+          currencyMenuMessages.set(player.telegramUserId, directMessage);
+          return;
+        } catch (error) {
+          logger.debug(
+            { err: error, userId: player.telegramUserId },
+            "Currency menu message could not be edited; replacing it once",
+          );
+          currencyMenuMessages.delete(player.telegramUserId);
         }
       }
+      await openCurrencyMenu(bot, chatId, player, currency);
     } else if (action.startsWith("language:set:")) {
       const language = action.split(":")[2] ?? "en";
       if (!BOT_LANGUAGES.some((item) => item.code === language)) return;
@@ -11251,7 +13743,14 @@ async function handleMainUpdate(
         await startMinesGame(bot, chatId, callback.from, amountMinor, currency, mines);
       }
     } else if (action.startsWith("mines:auto:start:")) {
-      await runMinesAuto(bot, chatId, callback.from, action.split(":")[3] ?? "");
+      void runMinesAuto(
+        bot,
+        chatId,
+        callback.from,
+        action.split(":")[3] ?? "",
+      ).catch((error) => {
+        logger.error({ err: error }, "Mines auto loop failed");
+      });
     } else if (action.startsWith("mines:auto:stop:")) {
       await stopMinesAuto(bot, chatId, callback.from, action.split(":")[3] ?? "");
     } else if (action.startsWith("mines:open:")) {
@@ -11285,6 +13784,7 @@ async function handleMainUpdate(
             battle.messageId,
             `<b>🎰 ROULETTE–VS BOT ROOM #${battle.id}</b>\n\nChoose a side below:`,
             rouletteKeyboard(player.telegramUserId, battle.id),
+            ROULETTE_PREMIUM_EMOJI_OPTIONS,
           );
         }
       }
@@ -11309,6 +13809,7 @@ async function handleMainUpdate(
             battle.messageId,
             `<b>🎰 ROULETTE–VS BOT ROOM #${battle.id}</b>\n\nChoose a number from 1 to 36:`,
             rouletteKeyboard(player.telegramUserId, battle.id, true),
+            ROULETTE_PREMIUM_EMOJI_OPTIONS,
           );
         }
       }
@@ -11574,8 +14075,16 @@ async function handleMainUpdate(
     await sendWagerLeaderboard(bot, chatId, "weekly");
   } else if (command === "monthly") {
     await sendWagerLeaderboard(bot, chatId, "monthly");
+  } else if (command === "monthlybonus") {
+    await sendMonthlyBonusStatus(bot, chatId, player);
   } else if (command === "weeklybonus") {
     await sendBonusClaimStatus(bot, chatId, player, "weekly");
+  } else if (command === "rackback") {
+    if (!isPrivateChat(message.chat)) {
+      await bot.sendMessage(chatId, "Daily loss rebate details are available only in your private chat with RolexCasino.");
+      return;
+    }
+    await sendRackbackStatus(bot, chatId, player);
   } else if (command === "reflead" || command === "referralleaderboard") {
     await sendReferralLeaderboard(bot, chatId);
   } else if (command === "wagerstatus") {
@@ -11592,8 +14101,8 @@ async function handleMainUpdate(
       chatId,
       `<b>✅ YOUR NEW CLIENT SEED</b>\n\n<b>Your client seed:</b> <code>${seed}</code>\n\n<b>${escapeTelegramText("Keep this seed private. It is used as your new fairness/cache seed.")}</b> ❌`,
     );
-  } else if (command === "daily") {
-    await sendBonusClaimStatus(bot, chatId, player, command);
+  } else if (command === "daily" || command === "dailybonus") {
+    await sendBonusClaimStatus(bot, chatId, player, "daily");
   } else if (command === "tip") {
     await handleTip(bot, chatId, message, player, args);
   } else if (command === "claim") {
@@ -11832,13 +14341,13 @@ async function playHelperGame(
       resultBot,
       chatId,
       [
-        `<b>🎲 ${rollBot.gameType.toUpperCase()} RESULT</b>`,
+        `<b>${rollBot.gameType === "slots" ? "🎰" : "🎲"} ${rollBot.gameType.toUpperCase()} RESULT</b>`,
         "",
         "<blockquote>",
         `<b>Roll:</b> ${rollValue}`,
         `<b>Multiplier:</b> <b>${result.multiplier.toFixed(2)}×</b>`,
         `<b>Bet:</b> <b>${formatMoney(stakeMinor, currency)} → ${formatMoney(payoutMinor, currency)}</b>`,
-        `🎲 <b>Result:</b> ${result.outcome}`,
+        `${rollBot.gameType === "slots" ? "🎰" : "🎲"} <b>Result:</b> ${result.outcome}`,
         "</blockquote>",
         result.multiplier > 0
           ? `<b>✅ WIN — YOU WON ${formatMoney(payoutMinor, currency)}</b>`
@@ -11854,6 +14363,7 @@ async function playHelperGame(
           }],
         ],
       },
+      premiumEmojiOptionsForGame(rollBot.gameType),
     );
     await auditTransaction(
       resultBot,
@@ -12051,6 +14561,7 @@ async function finishBlackjackRoom(bot: TelegramBot, room: BlackjackRoom): Promi
   blackjackActionsInFlight.add(room.roomId);
   const payoutMultiplier = blackjackMultiplier(room.game.status);
   try {
+    await wait(PVP_RESULT_DELAY_MS);
     const settled = await settleGame({
       playerId: room.playerId,
       helperBot: "blackjack-main",
@@ -12270,24 +14781,23 @@ async function sendLatestGiveaway(
   chatId: number,
 ): Promise<void> {
   const settings = await activeGiveawaySettings();
+  const royale = await activeHouseRoyale();
+  if (royale) await sendHouseRoyale(bot, chatId, royale);
   if (!settings.length) {
-    await bot.sendMessage(chatId, "<b>🎁 No active giveaway right now.</b>\nPlease check again soon.");
+    if (!royale) {
+      await bot.sendMessage(chatId, "<b>🎁 No active giveaway right now.</b>\nPlease check again soon.");
+    }
     return;
   }
   const image = await giveawayOverviewPng(
     settings,
     "ACTIVE GIVEAWAYS",
-    "Choose one giveaway to review its requirements and join.",
-  );
-  await bot.sendMessage(
-    chatId,
-    "<b>🎁 Choose a giveaway below.</b>\nThe bot checks your wager and referral requirements before joining.",
-    giveawayOverviewKeyboard(settings),
+    "Choose a giveaway to see your username, minimum wager, minimum referrals, and join status.",
   );
   await bot.sendPhoto(
     chatId,
     image,
-    "<b>🎁 ACTIVE ROLEXCASINO GIVEAWAYS</b>\nSelect a giveaway to see its requirements.",
+    "<b>🎁 ACTIVE ROLEXCASINO GIVEAWAYS</b>\nTap a giveaway to view your requirements and join.",
     giveawayOverviewKeyboard(settings),
   );
 }
@@ -12297,28 +14807,85 @@ async function sendGiveawayRequirements(
   chatId: number,
   settings: GiveawaySetting,
   index: number,
+  user?: TelegramUser,
+  sourceMessage?: TelegramMessage,
 ): Promise<void> {
   const currency = parseCurrency(settings.currency, "INR");
-  await bot.sendMessage(
-    chatId,
-    [
-      `<b>🎁 ${giveawayLabel(settings, index)}</b>`,
-      "",
-      `Prize: <b>${formatMoney(settings.amountMinor, currency)}</b>`,
-      `Winners: <b>${settings.maxWinners}</b>`,
-      `Minimum wager: <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
-      `Minimum referrals: <b>${settings.minReferralCount}</b>`,
-      `Draw: <b>${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "scheduled soon"}</b>`,
-      "",
-      "Eligibility is checked again before the draw.",
-    ].join("\n"),
-    {
-      inline_keyboard: [[{
+  const player = user ? await ensurePlayer(user) : null;
+  const metrics = player ? await giveawayPlayerMetrics(player.id, settings) : null;
+  const username = user
+    ? user.username
+      ? `@${user.username}`
+      : [user.first_name, user.last_name].filter(Boolean).join(" ") || `user ${user.id}`
+    : "your account";
+  const text = [
+    `<b>🎁 ${giveawayLabel(settings, index)}</b>`,
+    "",
+    `Player: <b>${escapeTelegramText(username)}</b>`,
+    `Prize: <b>${formatMoney(settings.amountMinor, currency)}</b>`,
+    `Winners: <b>${settings.maxWinners || "all eligible"}</b>`,
+    `Minimum wager to join: <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
+    `Your wager: <b>${formatMoney(metrics?.wagerMinor ?? 0, currency)}</b>`,
+    `Minimum referrals to join: <b>${settings.minReferralCount}</b>`,
+    `Your referrals: <b>${metrics?.referrals ?? 0}</b>`,
+    `Your messages/plays: <b>${metrics?.bets ?? 0}</b>`,
+    `Draw: <b>${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "scheduled soon"}</b>`,
+    "",
+    "Press Join giveaway. Your wager and referral conditions are checked again before entry.",
+  ].join("\n");
+  const keyboard = {
+    inline_keyboard: [
+      [{
         text: "Join giveaway",
         callback_data: `giveaway:join:${settings.kind}`,
-      }]],
-    },
-  );
+      }],
+      [{
+        text: `🏆 ${giveawayLabel(settings, index)} result · Top 10`,
+        callback_data: `giveaway:rank:${settings.kind}`,
+      }],
+    ],
+  };
+  if (sourceMessage) {
+    try {
+      if (sourceMessage.photo?.length) {
+        if (!user || !metrics) throw new Error("Giveaway requirements image needs a user");
+        const image = await giveawayRequirementPng(
+          settings,
+          index,
+          user,
+          metrics,
+          "review",
+        );
+        await bot.editPhoto(
+          chatId,
+          sourceMessage.message_id,
+          image,
+          text,
+          keyboard,
+        );
+      } else {
+        await bot.editMessageText(chatId, sourceMessage.message_id, text, keyboard);
+      }
+      return;
+    } catch (error) {
+      logger.debug(
+        { err: error, chatId, messageId: sourceMessage.message_id },
+        "Giveaway requirements message could not be edited; sending a replacement",
+      );
+      if (sourceMessage.photo?.length) {
+        try {
+          await bot.editMessageCaption(chatId, sourceMessage.message_id, text, keyboard);
+          return;
+        } catch (captionError) {
+          logger.debug(
+            { err: captionError, chatId, messageId: sourceMessage.message_id },
+            "Giveaway photo caption fallback also failed",
+          );
+        }
+      }
+    }
+  }
+  await bot.sendMessage(chatId, text, keyboard);
 }
 
 async function joinGiveaway(
@@ -12326,25 +14893,87 @@ async function joinGiveaway(
   chatId: number,
   user: TelegramUser,
   settings: GiveawaySetting,
+  index = 0,
+  sourceMessage?: TelegramMessage,
 ): Promise<void> {
   const player = await ensurePlayer(user);
   const metrics = await giveawayPlayerMetrics(player.id, settings);
   const currency = parseCurrency(settings.currency, "INR");
+  const username = user.username
+    ? `@${user.username}`
+    : [user.first_name, user.last_name].filter(Boolean).join(" ") || `user ${user.id}`;
+  const editStatusMessage = async (
+    text: string,
+    replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+    status: GiveawayRequirementStatus = "joined",
+  ): Promise<boolean> => {
+    if (!sourceMessage) return false;
+    try {
+      if (sourceMessage.photo?.length) {
+        const image = await giveawayRequirementPng(
+          settings,
+          index,
+          user,
+          metrics,
+          status,
+        );
+        await bot.editPhoto(
+          chatId,
+          sourceMessage.message_id,
+          image,
+          text,
+          replyMarkup,
+        );
+      } else {
+        await bot.editMessageText(chatId, sourceMessage.message_id, text, replyMarkup);
+      }
+      return true;
+    } catch (error) {
+      logger.debug(
+        { err: error, chatId, messageId: sourceMessage.message_id },
+        "Giveaway join message could not be edited; sending a replacement",
+      );
+      if (sourceMessage.photo?.length) {
+        try {
+          await bot.editMessageCaption(chatId, sourceMessage.message_id, text, replyMarkup);
+          return true;
+        } catch (captionError) {
+          logger.debug(
+            { err: captionError, chatId, messageId: sourceMessage.message_id },
+            "Giveaway join photo caption fallback also failed",
+          );
+        }
+      }
+      return false;
+    }
+  };
   if (
     metrics.wagerMinor < settings.minWagerMinor ||
     metrics.referrals < settings.minReferralCount
   ) {
-    await bot.sendMessage(
-      chatId,
-      [
-        "<b>❌ You are not eligible yet.</b>",
-        "",
-        `Wager: <b>${formatMoney(metrics.wagerMinor, currency)}</b> / <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
-        `Referrals: <b>${metrics.referrals}</b> / <b>${settings.minReferralCount}</b>`,
-        "",
-        "Keep playing and referring players, then press Join again.",
-      ].join("\n"),
-    );
+    const text = [
+      "<b>❌ You are not eligible yet.</b>",
+      "",
+      `Player: <b>${escapeTelegramText(username)}</b>`,
+      `Wager: <b>${formatMoney(metrics.wagerMinor, currency)}</b> / <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
+      `Referrals: <b>${metrics.referrals}</b> / <b>${settings.minReferralCount}</b>`,
+      `Messages/plays: <b>${metrics.bets}</b>`,
+      "",
+      "Keep playing and referring players, then press Join giveaway again.",
+    ].join("\n");
+    const edited = await editStatusMessage(text, {
+      inline_keyboard: [
+        [{
+          text: "Join giveaway",
+          callback_data: `giveaway:join:${settings.kind}`,
+        }],
+        [{
+          text: `🏆 ${giveawayLabel(settings, index)} result · Top 10`,
+          callback_data: `giveaway:rank:${settings.kind}`,
+        }],
+      ],
+    }, "not_eligible");
+    if (!edited) await bot.sendMessage(chatId, text);
     return;
   }
   const periodKey = settings.nextDrawAt?.toISOString() ?? `${settings.updatedAt.toISOString()}:${settings.id}`;
@@ -12360,12 +14989,194 @@ async function joinGiveaway(
     })
     .onConflictDoNothing()
     .returning();
+  const text = [
+    entry ? "<b>✅ You have successfully joined the giveaway!</b>" : "<b>ℹ️ You are already registered for this giveaway.</b>",
+    "",
+    `Player: <b>${escapeTelegramText(username)}</b>`,
+    `Minimum wager: <b>${formatMoney(settings.minWagerMinor, currency)}</b> · Your wager: <b>${formatMoney(metrics.wagerMinor, currency)}</b>`,
+    `Minimum referrals: <b>${settings.minReferralCount}</b> · Your referrals: <b>${metrics.referrals}</b>`,
+    `Messages/plays: <b>${metrics.bets}</b>`,
+    "",
+    "Use /giveawayrank to see your points and rank.",
+  ].join("\n");
+  const edited = await editStatusMessage(text, { inline_keyboard: [] });
+  if (!edited) await bot.sendMessage(chatId, text);
+}
+
+function giveawayDraftLabel(draft: GiveawayDraft): string {
+  const currency = draft.currency ?? "INR";
+  return [
+    `Amount: ${draft.amountMinor ? formatMoney(draft.amountMinor, currency) : "not selected"}`,
+    `Currency: ${currency}`,
+    `Winners: ${draft.maxWinners === 0 ? "all eligible users" : draft.maxWinners ?? "not selected"}`,
+    `Minimum referrals: ${draft.minReferralCount ?? "not selected"}`,
+    `Minimum wager: ${draft.minWagerMinor !== undefined ? formatMoney(draft.minWagerMinor, currency) : "not selected"}`,
+    `Duration: ${draft.periodDays ? `${draft.periodDays} day(s)` : "not selected"}`,
+  ].join("\n");
+}
+
+async function sendGiveawayAdminStep(
+  bot: TelegramBot,
+  chatId: number,
+  adminId: number,
+): Promise<void> {
+  const draft = giveawayDrafts.get(adminId);
+  if (!draft) return;
+  const button = (text: string, data: string): InlineKeyboardButton => ({
+    text,
+    callback_data: `giveaway:admin:${data}`,
+  });
+  const currencySymbol = draft.currency === "USD" ? "$" : "₹";
+  if (draft.step === "amount") {
+    await bot.sendMessage(
+      chatId,
+      `<b>New giveaway</b>\n\n${escapeTelegramText(giveawayDraftLabel(draft))}\n\nChoose a currency and prize amount.`,
+      {
+        inline_keyboard: [
+          [button(`${draft.currency === "INR" ? "✓ " : ""}INR`, "currency:INR"), button(`${draft.currency === "USD" ? "✓ " : ""}USD`, "currency:USD")],
+          [button(`${currencySymbol}50`, "amount:50"), button(`${currencySymbol}100`, "amount:100"), button(`${currencySymbol}250`, "amount:250")],
+          [button(`${currencySymbol}500`, "amount:500"), button(`${currencySymbol}1,000`, "amount:1000"), button("Enter amount", "amount:custom")],
+          [button("Cancel", "cancel")],
+        ],
+      },
+    );
+    return;
+  }
+  if (draft.step === "winners") {
+    await bot.sendMessage(
+      chatId,
+      `<b>Choose winner count</b>\n\n${escapeTelegramText(giveawayDraftLabel(draft))}`,
+      {
+        inline_keyboard: [
+          [button("All eligible users", "winners:0"), button("Top 3", "winners:3")],
+          [button("Top 10", "winners:10"), button("Enter manually", "winners:custom")],
+          [button("Back to amount", "back:amount"), button("Cancel", "cancel")],
+        ],
+      },
+    );
+    return;
+  }
+  if (draft.step === "referrals") {
+    await bot.sendMessage(
+      chatId,
+      `<b>Minimum referrals</b>\n\n${escapeTelegramText(giveawayDraftLabel(draft))}`,
+      {
+        inline_keyboard: [
+          [button("No minimum", "referrals:0"), button("1 referral", "referrals:1"), button("3 referrals", "referrals:3")],
+          [button("Enter manually", "referrals:custom")],
+          [button("Back to winners", "back:winners"), button("Cancel", "cancel")],
+        ],
+      },
+    );
+    return;
+  }
+  if (draft.step === "wager") {
+    await bot.sendMessage(
+      chatId,
+      `<b>Minimum wager</b>\n\n${escapeTelegramText(giveawayDraftLabel(draft))}`,
+      {
+        inline_keyboard: [
+          [button("No minimum", "wager:0"), button(`${currencySymbol}100`, "wager:10000"), button(`${currencySymbol}500`, "wager:50000")],
+          [button("Enter manually", "wager:custom")],
+          [button("Back to referrals", "back:referrals"), button("Cancel", "cancel")],
+        ],
+      },
+    );
+    return;
+  }
   await bot.sendMessage(
     chatId,
-    entry
-      ? `<b>✅ You joined ${settings.kind === "giveaway" ? "the giveaway" : settings.kind.replace("giveaway_", "Giveaway ")}.</b>\nUse /giveawayrank to see your points and rank.`
-      : "<b>ℹ️ You are already registered for this giveaway.</b>",
+    `<b>Giveaway duration</b>\n\n${escapeTelegramText(giveawayDraftLabel(draft))}`,
+    {
+      inline_keyboard: [
+        [button("1 day", "duration:1"), button("7 days", "duration:7"), button("30 days", "duration:30")],
+        [button("Enter manually", "duration:custom")],
+        [button("Back to wager", "back:wager"), button("Cancel", "cancel")],
+      ],
+    },
   );
+}
+
+async function sendGiveawayAdminReview(
+  bot: TelegramBot,
+  chatId: number,
+  adminId: number,
+): Promise<void> {
+  const draft = giveawayDrafts.get(adminId);
+  if (!draft) return;
+  await bot.sendMessage(
+    chatId,
+    `<b>Review giveaway</b>\n\n${escapeTelegramText(giveawayDraftLabel(draft))}\n\nPress Create when everything is correct.`,
+    {
+      inline_keyboard: [
+        [{ text: "Create giveaway", callback_data: "giveaway:admin:save" }],
+        [{ text: "Edit amount", callback_data: "giveaway:admin:back:amount" }, { text: "Edit winners", callback_data: "giveaway:admin:back:winners" }],
+        [{ text: "Edit referrals", callback_data: "giveaway:admin:back:referrals" }, { text: "Edit wager", callback_data: "giveaway:admin:back:wager" }],
+        [{ text: "Edit duration", callback_data: "giveaway:admin:back:duration" }, { text: "Cancel", callback_data: "giveaway:admin:cancel" }],
+      ],
+    },
+  );
+}
+
+async function handleGiveawayAdminText(
+  bot: TelegramBot,
+  message: TelegramMessage,
+  text: string,
+): Promise<boolean> {
+  if (!message.from) return false;
+  const telegramUserId = message.from.id;
+  const draft = giveawayDrafts.get(telegramUserId);
+  if (!draft) return false;
+  if (text.trim().toLowerCase() === "/cancel") {
+    giveawayDrafts.delete(telegramUserId);
+    await bot.sendMessage(message.chat.id, "Giveaway setup cancelled.");
+    return true;
+  }
+  if (text.trim().startsWith("/")) return false;
+  const value = text.trim();
+  if (draft.step === "amount") {
+    const amountMinor = parseMoney(value);
+    if (!amountMinor) {
+      await bot.sendMessage(message.chat.id, "Enter a valid positive amount, for example 100.");
+      return true;
+    }
+    draft.amountMinor = amountMinor;
+    draft.step = "winners";
+  } else if (draft.step === "winners") {
+    const winners = value.toLowerCase() === "all" ? 0 : Number(value);
+    if (!Number.isInteger(winners) || winners < 0) {
+      await bot.sendMessage(message.chat.id, "Enter a whole number of winners, or type all.");
+      return true;
+    }
+    draft.maxWinners = winners;
+    draft.step = "referrals";
+  } else if (draft.step === "referrals") {
+    const referrals = Number(value);
+    if (!Number.isInteger(referrals) || referrals < 0) {
+      await bot.sendMessage(message.chat.id, "Enter a whole number of minimum referrals.");
+      return true;
+    }
+    draft.minReferralCount = referrals;
+    draft.step = "wager";
+  } else if (draft.step === "wager") {
+    const wager = parseMoney(value);
+    if (value !== "0" && !wager) {
+      await bot.sendMessage(message.chat.id, "Enter a wager amount, or type 0 for no minimum.");
+      return true;
+    }
+    draft.minWagerMinor = wager ?? 0;
+    draft.step = "duration";
+  } else {
+    const days = Number(value);
+    if (!Number.isInteger(days) || days < 1) {
+      await bot.sendMessage(message.chat.id, "Enter a whole number of days.");
+      return true;
+    }
+    draft.periodDays = days;
+  }
+  if (draft.periodDays) await sendGiveawayAdminReview(bot, message.chat.id, telegramUserId);
+  else await sendGiveawayAdminStep(bot, message.chat.id, telegramUserId);
+  return true;
 }
 
 async function sendGiveawayAdminPanel(
@@ -12393,86 +15204,362 @@ async function sendGiveawayAdminPanel(
     `Winners: ${winnerNames}`,
   ].join(" · ");
   const image = await giveawayOverviewPng(settings, "ADMIN GIVEAWAY PANEL", subtitle);
+  const keyboard: InlineKeyboardButton[][] = [
+    [{ text: "＋ Create giveaway", callback_data: "giveaway:admin:new" }],
+    ...settings.map((settingsRow, index) => [
+      { text: `Manage ${index + 1}`, callback_data: `giveaway:select:${settingsRow.kind}` },
+      { text: `Disable ${index + 1}`, callback_data: `giveaway:admin:disable:${settingsRow.kind}` },
+    ]),
+    [{ text: "↻ Refresh panel", callback_data: "giveaway:admin:refresh" }],
+  ];
+  await bot.sendPhoto(chatId, image, undefined, { inline_keyboard: keyboard });
+}
+
+async function sendGiveawayCancelPanel(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<void> {
+  const settings = await activeGiveawaySettings();
+  if (!settings.length) {
+    await bot.sendMessage(chatId, "<b>🎁 No active giveaways are available to cancel.</b>");
+    return;
+  }
+  const image = await giveawayOverviewPng(
+    settings,
+    "CANCEL GIVEAWAY",
+    "Choose a giveaway to disable and remove from the official group.",
+  );
+  const keyboard = {
+    inline_keyboard: settings.map((settingsRow, index) => [{
+      text: `❌ Cancel ${index + 1} · ${formatMoney(settingsRow.amountMinor, parseCurrency(settingsRow.currency, "INR"))}`,
+      callback_data: `giveaway:admin:cancel:${settingsRow.kind}`,
+    }]),
+  };
   await bot.sendPhoto(
     chatId,
     image,
-    [
-      "<b>🛡️ GIVEAWAY ADMIN PANEL</b>",
-      "",
-      `Admin: <b>${escapeTelegramText(`${admin.first_name ?? ""} ${admin.last_name ?? ""}`.trim() || "Admin")}</b>`,
-      `Total started: <b>${settings.length}</b>`,
-      `Completed: <b>${completed}</b>`,
-      `Active: <b>${active}</b>`,
-      `Recent winners: <b>${escapeTelegramText(winnerNames)}</b>`,
-      "",
-      "<b>Admin commands</b>",
-      "<code>/giveawayadd AMOUNT MAX_WINNERS DAYS MIN_WAGER MIN_REFERRALS INR|USD</code>",
-      "<code>/giveawayoff NUMBER</code>",
-      "<code>/latest</code> · <code>/giveawayrank</code>",
-    ].join("\n"),
-    {
-      inline_keyboard: settings.map((settingsRow, index) => [{
-        text: `Manage ${index + 1}`,
-        callback_data: `giveaway:select:${settingsRow.kind}`,
-      }]),
-    },
+    "<b>⚠️ CANCEL GIVEAWAY</b>\nSelect one prize pool. The group announcement will be deleted and a pinned cancellation notice will be posted.",
+    keyboard,
   );
 }
 
-async function giveawayRankings(bot: TelegramBot, chatId: number): Promise<void> {
-  const [players, rounds, battles] = await Promise.all([
-    db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.isBot, false)),
-    db.select().from(casinoGameRoundsTable),
-    db.select().from(casinoChallengesTable).where(eq(casinoChallengesTable.status, "completed")),
-  ]);
-  const wagerByPlayer = new Map<number, number>();
-  const betsByPlayer = new Map<number, number>();
-  for (const round of rounds) {
-    wagerByPlayer.set(round.playerId, (wagerByPlayer.get(round.playerId) ?? 0) + round.stakeMinor);
-    betsByPlayer.set(round.playerId, (betsByPlayer.get(round.playerId) ?? 0) + 1);
-  }
-  for (const battle of battles) {
-    wagerByPlayer.set(
-      battle.creatorPlayerId,
-      (wagerByPlayer.get(battle.creatorPlayerId) ?? 0) + battle.stakeMinor,
-    );
-    betsByPlayer.set(battle.creatorPlayerId, (betsByPlayer.get(battle.creatorPlayerId) ?? 0) + 1);
-    if (battle.playerTwoId) {
-      wagerByPlayer.set(
-        battle.playerTwoId,
-        (wagerByPlayer.get(battle.playerTwoId) ?? 0) + battle.stakeMinor,
-      );
-      betsByPlayer.set(battle.playerTwoId, (betsByPlayer.get(battle.playerTwoId) ?? 0) + 1);
-    }
-  }
-  const rows = players
-    .map((player) => {
-      const referrals = players.filter((candidate) => candidate.referredByPlayerId === player.id).length;
-      const bets = betsByPlayer.get(player.id) ?? 0;
-      return {
-        player,
-        referrals,
-        bets,
-        points: referrals + bets * 0.5,
-        wagerMinor: wagerByPlayer.get(player.id) ?? 0,
-      };
-    })
-    .filter((row) => row.points > 0)
-    .sort((left, right) => right.points - left.points || right.referrals - left.referrals);
-  if (!rows.length) {
-    await bot.sendMessage(chatId, "<b>🏆 Giveaway rank</b>\nNo eligible points have been earned yet.");
+async function cancelConfiguredGiveaway(
+  bot: TelegramBot,
+  adminChatId: number,
+  kind: string,
+): Promise<void> {
+  const [settings] = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(and(eq(casinoGiveawaySettingsTable.kind, kind), eq(casinoGiveawaySettingsTable.enabled, true)))
+    .limit(1);
+  if (!settings) {
+    await bot.sendMessage(adminChatId, "That giveaway is no longer active.");
     return;
   }
-  const lines = rows.map((row, index) => {
-    const name = row.player.username ? `@${row.player.username}` : row.player.displayName;
-    return `<b>${index + 1}.</b> ${escapeTelegramText(name)} — <b>${row.points.toFixed(1)} pts</b> · ${row.referrals} referrals · ${row.bets} bets`;
-  });
-  for (let index = 0; index < lines.length; index += 30) {
-    await bot.sendMessage(
-      chatId,
-      `<b>🏆 GIVEAWAY RANK ${index + 1}-${Math.min(index + 30, lines.length)}</b>\n\n${lines.slice(index, index + 30).join("\n")}`,
-    );
+  await db
+    .update(casinoGiveawaySettingsTable)
+    .set({ enabled: false, announcementMessageId: null, updatedAt: new Date() })
+    .where(eq(casinoGiveawaySettingsTable.id, settings.id));
+  const groupId = settings.announcementChatId ?? officialGroupChatId();
+  if (groupId !== null && settings.announcementMessageId) {
+    try {
+      await bot.unpinChatMessage(groupId, settings.announcementMessageId);
+    } catch {
+      // The old announcement may already be unpinned.
+    }
+    try {
+      await bot.deleteMessage(groupId, settings.announcementMessageId);
+    } catch (error) {
+      logger.debug({ err: error, kind }, "Giveaway announcement deletion failed");
+    }
   }
+  if (groupId !== null) {
+    const notice = await bot.sendMessage(
+      groupId,
+      `<b>🛑 ${giveawayLabel(settings, 0)} HAS BEEN CANCELED</b>\nThis giveaway has been canceled by an administrator. Its group announcement and join flow are no longer active.`,
+    );
+    try {
+      await bot.pinChatMessage(groupId, notice.message_id);
+    } catch (error) {
+      logger.warn({ err: error, kind }, "Giveaway cancellation pin failed");
+    }
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await bot.unpinChatMessage(groupId, notice.message_id);
+        } catch {
+          // The cancellation notice may already be unpinned.
+        }
+        try {
+          await bot.deleteMessage(groupId, notice.message_id);
+        } catch {
+          // Telegram may reject deletion after an admin changed permissions.
+        }
+      })();
+    }, 30 * 60 * 1_000);
+  }
+  await bot.sendMessage(
+    adminChatId,
+    `<b>✅ ${giveawayLabel(settings, 0)} canceled.</b>\nThe group announcement was removed and the cancellation notice was pinned for 30 minutes.`,
+  );
+}
+
+async function giveawayRankings(
+  bot: TelegramBot,
+  chatId: number,
+  requestedSetting?: GiveawaySetting,
+): Promise<void> {
+  const activeSettings = await activeGiveawaySettings();
+  if (!requestedSetting) {
+    if (!activeSettings.length) {
+      await bot.sendMessage(chatId, "<b>🎁 No ongoing giveaways.</b>\nThere is no active giveaway ranking to show.");
+      return;
+    }
+    const image = await giveawayOverviewPng(
+      activeSettings,
+      "ONGOING GIVEAWAYS",
+      "Select a prize pool below to view its live Top 10 leaderboard.",
+    );
+    await bot.sendPhoto(
+      chatId,
+      image,
+      "<b>🏆 ONGOING GIVEAWAYS</b>\nChoose Giveaway 1, Giveaway 2, or another active prize pool to see its leaderboard.",
+      giveawayRankSelectionKeyboard(activeSettings),
+    );
+    return;
+  }
+  const [setting] = activeSettings;
+  const selectedSetting = requestedSetting &&
+    activeSettings.some((candidate) => candidate.id === requestedSetting.id)
+    ? requestedSetting
+    : setting;
+  const metricSettings = selectedSetting ?? {
+    currency: "INR" as Currency,
+    nextDrawAt: null,
+    periodDays: 30,
+  };
+  const players = (await db.select().from(casinoPlayersTable)).filter(
+    (player) => !isLeaderboardBot(player),
+  );
+  const rows = (
+    await Promise.all(
+      players.map(async (player) => {
+        const metrics = await giveawayPlayerMetrics(player.id, metricSettings);
+        return {
+          player,
+          ...metrics,
+          wagerEligible: Boolean(
+            selectedSetting && metrics.wagerMinor >= selectedSetting.minWagerMinor,
+          ),
+          referralEligible: Boolean(
+            selectedSetting && metrics.referrals >= selectedSetting.minReferralCount,
+          ),
+        };
+      }),
+    )
+  )
+    .sort(
+      (left, right) =>
+        right.wagerMinor - left.wagerMinor ||
+        right.referrals - left.referrals ||
+        right.bets - left.bets,
+    )
+    .slice(0, 10)
+    .map((row, index) => ({ ...row, rank: index + 1 }));
+  const image = await giveawayRankingsPng(
+    selectedSetting,
+    rows.map((row) => ({
+      rank: row.rank,
+      name: row.player.username ? `@${row.player.username}` : row.player.displayName,
+      wagerMinor: row.wagerMinor,
+      referrals: row.referrals,
+      bets: row.bets,
+      messages: row.bets,
+      points: row.referrals + row.bets * 0.5,
+      wagerEligible: row.wagerEligible,
+      referralEligible: row.referralEligible,
+    })),
+  );
+  await bot.sendPhoto(
+    chatId,
+    image,
+    selectedSetting
+      ? `<b>🏆 ${escapeTelegramText(giveawayLabel(selectedSetting, 0))} RESULT · TOP 10 PLAYERS</b>\nTotal wager, messages, referrals, points, and condition status.`
+      : "<b>🏆 GIVEAWAY RESULT · TOP 10 PLAYERS</b>\nNo active giveaway is configured; showing the top 10 player activity records.",
+  );
+}
+
+async function handleGiveawayAdminAction(
+  bot: TelegramBot,
+  callback: TelegramCallbackQuery,
+): Promise<boolean> {
+  const message = callback.message;
+  if (!message || !isAdmin(callback.from.id)) {
+    await bot.sendMessage(message?.chat.id ?? callback.from.id, ADMIN_RESTRICTED_MESSAGE);
+    return true;
+  }
+  const parts = (callback.data ?? "").split(":");
+  const action = parts[2];
+  const value = parts.slice(3).join(":");
+  const chatId = message.chat.id;
+  if (action === "cancelpanel") {
+    await sendGiveawayCancelPanel(bot, chatId);
+    return true;
+  }
+  if (action === "cancel") {
+    await cancelConfiguredGiveaway(bot, chatId, value);
+    await sendGiveawayCancelPanel(bot, chatId);
+    return true;
+  }
+  if (action === "new") {
+    giveawayDrafts.set(callback.from.id, { step: "amount", currency: "INR" });
+    await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    return true;
+  }
+  if (action === "cancel") {
+    giveawayDrafts.delete(callback.from.id);
+    await bot.sendMessage(chatId, "Giveaway setup cancelled.");
+    return true;
+  }
+  if (action === "refresh") {
+    await sendGiveawayAdminPanel(bot, chatId, callback.from);
+    return true;
+  }
+  if (action === "disable") {
+    const [selected] = await db
+      .select()
+      .from(casinoGiveawaySettingsTable)
+      .where(eq(casinoGiveawaySettingsTable.kind, value))
+      .limit(1);
+    if (!selected) {
+      await bot.sendMessage(chatId, "That giveaway no longer exists.");
+      return true;
+    }
+    await db
+      .update(casinoGiveawaySettingsTable)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(casinoGiveawaySettingsTable.id, selected.id));
+    await bot.sendMessage(chatId, "Giveaway disabled.");
+    await sendGiveawayAdminPanel(bot, chatId, callback.from);
+    return true;
+  }
+  const draft = giveawayDrafts.get(callback.from.id);
+  if (!draft) {
+    await bot.sendMessage(chatId, "Press Create giveaway to start a new setup.");
+    return true;
+  }
+  if (action === "currency" && isSupportedCurrency(value)) {
+    draft.currency = value;
+    await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    return true;
+  }
+  if (action === "amount") {
+    if (value === "custom") {
+      draft.step = "amount";
+      await bot.sendMessage(chatId, `Send the prize amount in ${draft.currency ?? "INR"} (for example 100).`);
+      return true;
+    }
+    const amount = Number(value);
+    if (Number.isFinite(amount) && amount > 0) {
+      draft.amountMinor = Math.round(amount * 100);
+      draft.step = "winners";
+      await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    }
+    return true;
+  }
+  if (action === "winners") {
+    if (value === "custom") {
+      draft.step = "winners";
+      await bot.sendMessage(chatId, "Send the winner count, or type all for every eligible user.");
+      return true;
+    }
+    const winners = Number(value);
+    if (Number.isInteger(winners) && winners >= 0) {
+      draft.maxWinners = winners;
+      draft.step = "referrals";
+      await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    }
+    return true;
+  }
+  if (action === "referrals") {
+    if (value === "custom") {
+      draft.step = "referrals";
+      await bot.sendMessage(chatId, "Send the minimum referral count.");
+      return true;
+    }
+    const referrals = Number(value);
+    if (Number.isInteger(referrals) && referrals >= 0) {
+      draft.minReferralCount = referrals;
+      draft.step = "wager";
+      await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    }
+    return true;
+  }
+  if (action === "wager") {
+    if (value === "custom") {
+      draft.step = "wager";
+      await bot.sendMessage(chatId, `Send the minimum wager in ${draft.currency ?? "INR"}, or 0 for no minimum.`);
+      return true;
+    }
+    const wager = Number(value);
+    if (Number.isFinite(wager) && wager >= 0) {
+      draft.minWagerMinor = Math.round(wager);
+      draft.step = "duration";
+      await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    }
+    return true;
+  }
+  if (action === "duration") {
+    if (value === "custom") {
+      draft.step = "duration";
+      await bot.sendMessage(chatId, "Send the giveaway duration in whole days.");
+      return true;
+    }
+    const days = Number(value);
+    if (Number.isInteger(days) && days > 0) {
+      draft.periodDays = days;
+      await sendGiveawayAdminReview(bot, chatId, callback.from.id);
+    }
+    return true;
+  }
+  if (action === "back") {
+    if (["amount", "winners", "referrals", "wager", "duration"].includes(value)) {
+      draft.step = value as GiveawayDraftStep;
+      await sendGiveawayAdminStep(bot, chatId, callback.from.id);
+    }
+    return true;
+  }
+  if (action === "save") {
+    if (
+      !draft.amountMinor ||
+      draft.maxWinners === undefined ||
+      draft.minReferralCount === undefined ||
+      draft.minWagerMinor === undefined ||
+      !draft.periodDays ||
+      !draft.currency
+    ) {
+      await bot.sendMessage(chatId, "Complete every giveaway setting before creating it.");
+      return true;
+    }
+    const allSettings = await db.select().from(casinoGiveawaySettingsTable);
+    const nextNumber = allSettings.reduce((highest, row) => {
+      const match = row.kind.match(/^giveaway_(\d+)$/);
+      return match ? Math.max(highest, Number(match[1])) : highest;
+    }, allSettings.some((row) => row.kind === "giveaway") ? 1 : 0) + 1;
+    await configureGiveaway(bot, chatId, callback.from.id, `giveaway_${nextNumber}`, {
+      amountMinor: draft.amountMinor,
+      currency: draft.currency,
+      maxWinners: draft.maxWinners,
+      minWagerMinor: draft.minWagerMinor,
+      minReferralCount: draft.minReferralCount,
+      periodDays: draft.periodDays,
+    });
+    giveawayDrafts.delete(callback.from.id);
+    await sendGiveawayAdminPanel(bot, chatId, callback.from);
+    return true;
+  }
+  return true;
 }
 
 async function handleGiveawayUpdate(
@@ -12480,9 +15567,19 @@ async function handleGiveawayUpdate(
   update: TelegramUpdate,
 ): Promise<void> {
   if (update.callback_query) {
+    const callbackData = update.callback_query.data ?? "";
+    const isPublicHouseJoin =
+      callbackData.startsWith("house:join:") &&
+      update.callback_query.message &&
+      isGroupChat(update.callback_query.message.chat);
+    const isPublicGiveawayAction =
+      callbackData.startsWith("giveaway:select:") ||
+      callbackData.startsWith("giveaway:join:") ||
+      callbackData.startsWith("giveaway:rank:");
     if (
       update.callback_query.message &&
-      !isPrivateChat(update.callback_query.message.chat)
+      !isPrivateChat(update.callback_query.message.chat) &&
+      !(isPublicHouseJoin || (isPublicGiveawayAction && isGroupChat(update.callback_query.message.chat)))
     ) {
       return;
     }
@@ -12491,7 +15588,34 @@ async function handleGiveawayUpdate(
     const message = callback.message;
     if (!message) return;
     const parts = (callback.data ?? "").split(":");
+    if (parts[0] === "house") {
+      const royaleId = Number(parts[2]);
+      if (!Number.isInteger(royaleId) || royaleId <= 0) {
+        await bot.sendMessage(message.chat.id, "That House Royale button is invalid.");
+        return;
+      }
+      if (parts[1] === "join") {
+        await joinHouseRoyale(bot, message.chat.id, callback.from, royaleId);
+      } else if (parts[1] === "draw") {
+        if (!isAdmin(callback.from.id)) {
+          await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
+          return;
+        }
+        await drawHouseRoyale(bot, royaleId);
+      } else if (parts[1] === "cancel") {
+        if (!isAdmin(callback.from.id)) {
+          await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
+          return;
+        }
+        await cancelHouseRoyale(bot, message.chat.id, royaleId);
+      }
+      return;
+    }
     if (parts[0] !== "giveaway") return;
+    if (parts[1] === "admin") {
+      await handleGiveawayAdminAction(bot, callback);
+      return;
+    }
     const settings = await activeGiveawaySettings();
     const selectedKind = parts[2];
     const selected = settings.find((settingsRow) => settingsRow.kind === selectedKind);
@@ -12499,21 +15623,34 @@ async function handleGiveawayUpdate(
       await bot.sendMessage(message.chat.id, "That giveaway is no longer active.");
       return;
     }
-    if (parts[1] === "select") {
+    if (parts[1] === "rank") {
+      await giveawayRankings(bot, message.chat.id, selected);
+    } else if (parts[1] === "select") {
       await sendGiveawayRequirements(
         bot,
         message.chat.id,
         selected,
         Math.max(0, settings.indexOf(selected)),
+        callback.from,
+        message,
       );
     } else if (parts[1] === "join") {
-      await joinGiveaway(bot, message.chat.id, callback.from, selected);
+      await joinGiveaway(
+        bot,
+        message.chat.id,
+        callback.from,
+        selected,
+        Math.max(0, settings.indexOf(selected)),
+        message,
+      );
     }
     return;
   }
   const message = update.message;
-  if (!message?.from || !message.text || !message.text.trim().startsWith("/")) return;
+  if (!message?.from || !message.text) return;
   if (!isPrivateChat(message.chat)) return;
+  if (await handleGiveawayAdminText(bot, message, message.text)) return;
+  if (!message.text.trim().startsWith("/")) return;
   const { command, args } = commandFrom(message.text);
   const giveawayCommands = new Set([
     "start",
@@ -12523,9 +15660,19 @@ async function handleGiveawayUpdate(
     "latest",
     "giveawayrank",
     "givewayrank",
+    "rank",
+    "giveaway_rank",
     "giveawayadd",
     "givewayadd",
     "giveawayoff",
+    "cancelgiveaway",
+    "hr",
+    "royale",
+    "houseroyale",
+    "joinroyale",
+    "organize",
+    "house",
+    "hb",
   ]);
   if (!giveawayCommands.has(command)) return;
   if (command === "start" && isAdmin(message.from.id)) {
@@ -12540,7 +15687,11 @@ async function handleGiveawayUpdate(
         "",
         "<b>/latest</b> — show the latest giveaway",
         "<b>/join</b> — join the latest giveaway",
-         "<b>/giveawayrank</b> — view giveaway points and referrals",
+         "<b>/giveawayrank</b> or <b>/rank</b> — view the top 10 player ranking image with wager, messages, referrals, points, and conditions",
+         "<b>/cancelgiveaway</b> — cancel an active giveaway (admins only, private DM)",
+         "<b>/royale</b> — show the active House Royale",
+         "<b>/joinroyale</b> — join the active House Royale",
+         "<b>/organize PRIZEPOOL TIME MINWAGER</b> — organize an 8-player House Royale (admins)",
         "",
         "Giveaway settings are managed from the main RolexCasino bot.",
       ].join("\n"),
@@ -12551,13 +15702,39 @@ async function handleGiveawayUpdate(
     await sendLatestGiveaway(bot, message.chat.id);
     return;
   }
+  if (command === "organize" || command === "hr" || command === "royale" || command === "houseroyale") {
+    if ((command === "organize" || command === "hr") && args.length > 0) {
+      if (!isAdmin(message.from.id)) {
+        await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
+        return;
+      }
+      await createHouseRoyale(bot, message.chat.id, message.from.id, args);
+      return;
+    }
+    await sendHouseRoyale(bot, message.chat.id, await activeHouseRoyale(), message.from.id);
+    return;
+  }
+  if (command === "joinroyale") {
+    const royale = await activeHouseRoyale();
+    if (royale) {
+      await joinHouseRoyale(bot, message.chat.id, message.from, royale.id);
+    } else {
+      await bot.sendMessage(message.chat.id, "No House Royale is open right now.");
+    }
+    return;
+  }
   if (command === "join") {
     const settings = await activeGiveawaySettings();
     if (settings[0]) await joinGiveaway(bot, message.chat.id, message.from, settings[0]);
     else await bot.sendMessage(message.chat.id, "<b>🎁 No active giveaway right now.</b>\nPlease check again soon.");
     return;
   }
-  if (command === "giveawayrank" || command === "givewayrank") {
+  if (
+    command === "giveawayrank" ||
+    command === "givewayrank" ||
+    command === "rank" ||
+    command === "giveaway_rank"
+  ) {
     await giveawayRankings(bot, message.chat.id);
     return;
   }
@@ -12566,41 +15743,7 @@ async function handleGiveawayUpdate(
       await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
       return;
     }
-    const amountMinor = parseMoney(args[0]);
-    const maxWinners = Number(args[1]);
-    const periodDays = Number(args[2]);
-    const minWagerMinor = parseMoney(args[3]) ?? 0;
-    const minReferralCount = Number(args[4]);
-    const currency = parseCurrency(args[5], "INR");
-    if (
-      !amountMinor ||
-      !Number.isInteger(maxWinners) ||
-      maxWinners < 1 ||
-      !Number.isInteger(periodDays) ||
-      periodDays < 1 ||
-      !Number.isInteger(minReferralCount) ||
-      minReferralCount < 0 ||
-      !isSupportedCurrency(currency)
-    ) {
-      await bot.sendMessage(
-        message.chat.id,
-        "<b>Usage:</b> <code>/giveawayadd AMOUNT MAX_WINNERS DAYS MIN_WAGER MIN_REFERRALS INR|USD</code>",
-      );
-      return;
-    }
-    const allSettings = await db.select().from(casinoGiveawaySettingsTable);
-    const nextNumber = allSettings.reduce((highest, settingsRow) => {
-      const match = settingsRow.kind.match(/^giveaway_(\d+)$/);
-      return match ? Math.max(highest, Number(match[1])) : highest;
-    }, allSettings.some((settingsRow) => settingsRow.kind === "giveaway") ? 1 : 0) + 1;
-    await configureGiveaway(bot, message.chat.id, message.from.id, `giveaway_${nextNumber}`, {
-      amountMinor,
-      currency,
-      maxWinners,
-      minWagerMinor,
-      minReferralCount,
-      periodDays,
-    });
+    await sendGiveawayAdminPanel(bot, message.chat.id, message.from);
     return;
   }
   if (command === "giveawayoff") {
@@ -12608,18 +15751,15 @@ async function handleGiveawayUpdate(
       await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
       return;
     }
-    const number = Number(args[0]);
-    const settings = await activeGiveawaySettings();
-    const selected = settings[number - 1];
-    if (!selected) {
-      await bot.sendMessage(message.chat.id, "<b>Usage:</b> <code>/giveawayoff NUMBER</code>");
+    await sendGiveawayAdminPanel(bot, message.chat.id, message.from);
+    return;
+  }
+  if (command === "cancelgiveaway") {
+    if (!isAdmin(message.from.id)) {
+      await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
       return;
     }
-    await db
-      .update(casinoGiveawaySettingsTable)
-      .set({ enabled: false, updatedAt: new Date() })
-      .where(eq(casinoGiveawaySettingsTable.id, selected.id));
-    await bot.sendMessage(message.chat.id, `<b>✅ Giveaway ${number} disabled.</b>`);
+    await sendGiveawayCancelPanel(bot, message.chat.id);
     return;
   }
   if (command === "houseroyale" || command === "house" || command === "hb") {
@@ -12649,7 +15789,19 @@ async function handleGiveawayUpdate(
               ? "multi_day"
               : "giveaway";
     if (args.length === 0) {
-      await sendGiveawaySettings(bot, message.chat.id, requestedKind);
+      if (requestedKind === "monthly") {
+        await sendMonthlyBonusStatus(
+          bot,
+          message.chat.id,
+          await ensurePlayer(message.from),
+        );
+      } else {
+        await sendGiveawaySettings(bot, message.chat.id, requestedKind);
+      }
+      return;
+    }
+    if (!isAdmin(message.from.id)) {
+      await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
       return;
     }
     const amountMinor = parseMoney(args[0]);
@@ -12821,6 +15973,7 @@ export async function startRolexCasinoBots(): Promise<void> {
     void (async () => {
       try {
         await giveawayBot.initialize();
+        activeGiveawayBot = giveawayBot;
         await Promise.race([
           giveawayBot.preparePolling(),
           wait(5_000).then(() => {
@@ -12832,11 +15985,24 @@ export async function startRolexCasinoBots(): Promise<void> {
             "Giveaway webhook cleanup did not finish quickly; starting polling anyway",
           );
         });
+        void syncOpenHouseRoyales(giveawayBot).catch((error) => {
+          logger.error({ err: error }, "House Royale live eligibility sync failed");
+        });
+        setInterval(() => {
+          void syncOpenHouseRoyales(giveawayBot).catch((error) => {
+            logger.error({ err: error }, "House Royale live eligibility sync failed");
+          });
+        }, 60_000);
         await giveawayBot.setCommands([
           { command: "start", description: "Open the giveaway panel" },
           { command: "latest", description: "Show active giveaways" },
           { command: "join", description: "Join the latest giveaway" },
-          { command: "giveawayrank", description: "Show giveaway points" },
+          { command: "giveawayrank", description: "Show top 10 player ranking image" },
+          { command: "cancelgiveaway", description: "Cancel an active giveaway (admins)" },
+          { command: "royale", description: "Show the active House Royale" },
+          { command: "joinroyale", description: "Join the active House Royale" },
+          { command: "organize", description: "Organize an 8-player House Royale (admins)" },
+          { command: "hr", description: "Host House Royale (admins)" },
         ]);
         void giveawayBot.start(handleGiveawayUpdate);
       } catch (error) {
