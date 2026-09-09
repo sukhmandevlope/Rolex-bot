@@ -93,7 +93,11 @@ export const casinoGiveawaySettingsTable = pgTable(
     kind: varchar("kind", { length: 24 }).notNull().unique(),
     announcementChatId: bigint("announcement_chat_id", { mode: "number" }),
     announcementMessageId: integer("announcement_message_id"),
+    displayName: varchar("display_name", { length: 80 }),
     amountMinor: integer("amount_minor").notNull().default(0),
+    firstPrizeMinor: integer("first_prize_minor"),
+    secondPrizeMinor: integer("second_prize_minor"),
+    thirdPrizeMinor: integer("third_prize_minor"),
     currency: varchar("currency", { length: 3 }).notNull().default("INR"),
     maxWinners: integer("max_winners").notNull().default(1),
     minWagerMinor: integer("min_wager_minor").notNull().default(0),
@@ -180,6 +184,7 @@ export const casinoHouseRoyalePlayersTable = pgTable(
     eligibilityConfirmedAt: timestamp("eligibility_confirmed_at", {
       withTimezone: true,
     }),
+    winChance: integer("win_chance").notNull().default(1),
     playerId: integer("player_id")
       .notNull()
       .references(() => casinoPlayersTable.id),
