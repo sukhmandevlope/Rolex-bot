@@ -54,7 +54,7 @@ test("3d3w continues through draws and non-winning rounds until a side reaches t
 });
 
 test("an expired inactive battle is cancelled and refunds its stake", () => {
-  assert.equal(BATTLE_TURN_TIMEOUT_MS, 60_000);
+  assert.equal(BATTLE_TURN_TIMEOUT_MS, 120_000);
   const deadline = new Date("2026-09-07T12:00:00.000Z");
 
   assert.equal(isBattleTurnExpired(deadline, deadline.getTime() - 1), false);
