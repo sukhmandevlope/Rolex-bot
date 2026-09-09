@@ -3019,6 +3019,8 @@ const MAIN_BOT_COMMANDS = [
   ["weeklybonus", "View weekly bonus"],
   ["giveaway", "View latest giveaway"],
   ["join", "Join latest giveaway"],
+  ["giveawayrank", "View the giveaway leaderboard"],
+  ["hrinfo", "View House Royale players and chances"],
   ["rates", "View live currency rates"],
   ["currency", "Choose display currency"],
   ["language", "Choose bot language"],
@@ -3203,6 +3205,44 @@ type RackbackCardData = {
   hoursLeft: string;
 };
 
+function applyRolexGoldBlackTheme(svg: string): string {
+  const colors: Record<string, string> = {
+    "#10182e": "#0a0805",
+    "#183b45": "#17100a",
+    "#080d19": "#050505",
+    "#151a2c": "#120d08",
+    "#252b43": "#211408",
+    "#101a31": "#0a0704",
+    "#203d54": "#1b1007",
+    "#10162d": "#080604",
+    "#202b57": "#170d06",
+    "#3b2457": "#1d1007",
+    "#2563eb": "#8a5b16",
+    "#3b82f6": "#a8731d",
+    "#6e83ff": "#8a5b16",
+    "#7184cf": "#b8862e",
+    "#879cff": "#c59437",
+    "#8ea6ff": "#d1a84f",
+    "#9dd7ff": "#e0bd6c",
+    "#9db0cb": "#c4a76a",
+    "#8da2bd": "#b99650",
+    "#aeb9df": "#d2b66d",
+    "#b6c7df": "#d6b86b",
+    "#bfc9ec": "#dfc47c",
+    "#dbe7f5": "#f0d78d",
+    "#dce3ff": "#ecd080",
+    "#aab8e5": "#d3b468",
+    "#76e3a3": "#f2c95d",
+    "#70e59a": "#f2c95d",
+    "#9affba": "#ffe29a",
+    "#e56d86": "#9e6c1e",
+  };
+  return Object.entries(colors).reduce(
+    (themed, [from, to]) => themed.split(from).join(to),
+    svg,
+  );
+}
+
 function rackbackCardSvg(data: RackbackCardData): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820">
   <defs>
@@ -3248,7 +3288,7 @@ async function rackbackCardPng(data: RackbackCardData): Promise<Buffer> {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render daily loss rebate image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(rackbackCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(rackbackCardSvg(data)));
   });
 }
 
@@ -3646,7 +3686,7 @@ async function profileCardPng(data: ProfileCardData): Promise<Buffer> {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render profile image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(profileCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(profileCardSvg(data)));
   });
 }
 
@@ -3864,7 +3904,7 @@ async function statsCardPng(data: StatsCardData): Promise<Buffer> {
         reject(new Error(`Could not render stats image: ${Buffer.concat(errors).toString("utf8")}`));
       }
     });
-    process.stdin.end(statsCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(statsCardSvg(data)));
   });
 }
 
@@ -3940,7 +3980,7 @@ async function wagerStatusCardPng(data: WagerStatusCardData): Promise<Buffer> {
         );
       }
     });
-    process.stdin.end(wagerStatusCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(wagerStatusCardSvg(data)));
   });
 }
 
@@ -4010,7 +4050,7 @@ async function gameHistoryCardPng(
         reject(new Error(`Could not render game history image: ${Buffer.concat(errors).toString("utf8")}`));
       }
     });
-    process.stdin.end(gameHistoryCardSvg(name, rounds));
+    process.stdin.end(applyRolexGoldBlackTheme(gameHistoryCardSvg(name, rounds)));
   });
 }
 
@@ -4072,7 +4112,7 @@ async function referralLeaderboardPng(
         reject(new Error(`Could not render referral leaderboard image: ${Buffer.concat(errors).toString("utf8")}`));
       }
     });
-    process.stdin.end(referralLeaderboardSvg(items));
+    process.stdin.end(applyRolexGoldBlackTheme(referralLeaderboardSvg(items)));
   });
 }
 
@@ -4332,7 +4372,7 @@ async function jackpotCardPng(data: JackpotCardData): Promise<Buffer> {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render jackpot image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(jackpotCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(jackpotCardSvg(data)));
   });
 }
 
@@ -4700,6 +4740,78 @@ async function tipPlayer(input: {
   });
 }
 
+type TipCardData = {
+  status: string;
+  from: string;
+  to: string;
+  amount: string;
+  currency: Currency;
+  balance: string;
+  fairId: string;
+  note: string;
+};
+
+function tipCardSvg(data: TipCardData): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <defs>
+    <linearGradient id="tip-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#050505"/><stop offset=".55" stop-color="#17100a"/><stop offset="1" stop-color="#2a1707"/></linearGradient>
+    <linearGradient id="tip-gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#b6791f"/><stop offset=".5" stop-color="#ffe29a"/><stop offset="1" stop-color="#c58e2e"/></linearGradient>
+  </defs>
+  <rect width="1200" height="760" rx="42" fill="url(#tip-bg)"/>
+  <circle cx="1080" cy="80" r="220" fill="#d29a35" opacity=".12"/><circle cx="90" cy="710" r="210" fill="#8a5b16" opacity=".14"/>
+  <rect x="42" y="42" width="1116" height="676" rx="32" fill="none" stroke="#c59437" stroke-opacity=".7" stroke-width="2"/>
+  <text x="86" y="108" fill="#f6c453" font-size="28" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="180" fill="#ffffff" font-size="54" font-family="DejaVu Sans" font-weight="bold">PLAYER TIP</text>
+  <rect x="842" y="82" width="270" height="58" rx="29" fill="#f6c453" fill-opacity=".16" stroke="#f6c453" stroke-opacity=".8"/>
+  <text x="977" y="120" text-anchor="middle" fill="#ffe29a" font-size="21" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
+  <line x1="86" y1="230" x2="1114" y2="230" stroke="#c59437" stroke-opacity=".45"/>
+  <text x="86" y="286" fill="#b99650" font-size="20" font-family="Deja Vu Sans" font-weight="bold">FROM</text>
+  <text x="86" y="326" fill="#ffffff" font-size="30" font-family="DejaVu Sans" font-weight="bold">${escapeXml(svgLabel(data.from, 30))}</text>
+  <text x="650" y="286" fill="#b99650" font-size="20" font-family="Deja Vu Sans" font-weight="bold">TO</text>
+  <text x="650" y="326" fill="#ffffff" font-size="30" font-family="DejaVu Sans" font-weight="bold">${escapeXml(svgLabel(data.to, 30))}</text>
+  <rect x="70" y="376" width="500" height="154" rx="24" fill="#ffffff" fill-opacity=".055" stroke="#c59437" stroke-opacity=".45"/>
+  <rect x="626" y="376" width="500" height="154" rx="24" fill="#f6c453" fill-opacity=".09" stroke="#f6c453" stroke-opacity=".6"/>
+  <text x="104" y="424" fill="#b99650" font-size="20" font-family="DejaVu Sans" font-weight="bold">TIP AMOUNT</text>
+  <text x="104" y="486" fill="url(#tip-gold)" font-size="44" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
+  <text x="660" y="424" fill="#b99650" font-size="20" font-family="DejaVu Sans" font-weight="bold">SENDER BALANCE</text>
+  <text x="660" y="486" fill="#ffffff" font-size="38" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.balance)}</text>
+  <text x="86" y="594" fill="#b99650" font-size="20" font-family="DejaVu Sans" font-weight="bold">FAIR ID</text>
+  <text x="86" y="630" fill="#f0d78d" font-size="22" font-family="DejaVu Sans">${escapeXml(svgLabel(data.fairId, 48))}</text>
+  <text x="1114" y="594" text-anchor="end" fill="#d6b86b" font-size="20" font-family="DejaVu Sans">${escapeXml(svgLabel(data.note, 38))}</text>
+  <text x="86" y="684" fill="#8f713d" font-size="17" font-family="DejaVu Sans">RolexCasino wallet transfer · ${escapeXml(data.currency)} settlement</text>
+</svg>`;
+}
+
+async function tipCardPng(data: TipCardData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render tip image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(applyRolexGoldBlackTheme(tipCardSvg(data)));
+  });
+}
+
+async function sendTipCard(
+  bot: TelegramBot,
+  chatId: number,
+  data: TipCardData,
+  replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+): Promise<void> {
+  await bot.sendPhoto(
+    chatId,
+    await tipCardPng(data),
+    `<b>${escapeTelegramText(data.status)}</b>\n${escapeTelegramText(data.note)}`,
+    replyMarkup,
+  );
+}
+
 async function acceptEscrow(
   code: string,
   buyerPlayerId: number,
@@ -4950,7 +5062,7 @@ async function escrowCardPng(data: EscrowCardData): Promise<Buffer> {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render escrow image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(escrowCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(escrowCardSvg(data)));
   });
 }
 
@@ -8730,7 +8842,7 @@ async function limboCardPng(data: {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render limbo image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(limboCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(limboCardSvg(data)));
   });
 }
 
@@ -9376,15 +9488,19 @@ async function handleTip(
   }
   const currency = parseCurrency(currencyArg, parseCurrency(player.preferredCurrency, "USD"));
   if (convertMinor(amountMinor, currency, "INR") > TIP_CONFIRMATION_THRESHOLD_INR_MINOR) {
-    await bot.sendMessage(
+    await sendTipCard(
+      bot,
       chatId,
-      [
-        "<b>⚠️ TIP CONFIRMATION REQUIRED</b>",
-        "",
-        `Recipient: <b>${escapeTelegramText(targetPlayer.displayName)}</b>`,
-        `Amount: <b>${formatMoney(amountMinor, currency)}</b>`,
-        "Tips above ₹50 require explicit confirmation.",
-      ].join("\n"),
+      {
+        status: "CONFIRMATION REQUIRED",
+        from: player.displayName,
+        to: targetPlayer.displayName,
+        amount: formatMoney(amountMinor, currency),
+        currency,
+        balance: "Pending confirmation",
+        fairId: "created after confirmation",
+        note: "Tips above ₹50 require confirmation",
+      },
       {
         inline_keyboard: [[
           {
@@ -9404,16 +9520,25 @@ async function handleTip(
       amountMinor,
       currency,
     });
-    await bot.sendMessage(
+    await sendTipCard(
+      bot,
       chatId,
-      [
-        "<b>✅ TIP SENT SUCCESSFULLY</b>",
-        "",
-        `To: <b>${escapeTelegramText(targetPlayer.displayName)}</b>`,
-        `Amount: <b>${formatMoney(amountMinor, currency)}</b>`,
-        `Your new balance: <b>${formatMoney(balance.balanceMinor, currency)}</b>`,
-        `Fair ID: <code>${balance.fairId}</code>`,
-      ].join("\n"),
+      {
+        status: "TIP SENT SUCCESSFULLY",
+        from: player.displayName,
+        to: targetPlayer.displayName,
+        amount: formatMoney(amountMinor, currency),
+        currency,
+        balance: formatMoney(balance.balanceMinor, currency),
+        fairId: balance.fairId,
+        note: "Funds transferred successfully",
+      },
+      {
+        inline_keyboard: [[
+          { text: "View profile", callback_data: ownedCallback("main:profile", player.telegramUserId) },
+          { text: "Play games", callback_data: ownedCallback("main:games", player.telegramUserId) },
+        ]],
+      },
     );
     await notifyTipRecipient(bot, targetPlayer, player, amountMinor, currency);
     await auditTransaction(
@@ -9445,15 +9570,24 @@ async function notifyTipRecipient(
   currency: Currency,
 ): Promise<void> {
   try {
-    await bot.sendMessage(
+    await sendTipCard(
+      bot,
       recipient.telegramUserId,
-      [
-        "<b>💸 YOU RECEIVED A TIP</b>",
-        "",
-        `From: <b>${escapeTelegramText(sender.displayName)}</b>`,
-        `Amount: <b>${formatMoney(amountMinor, currency)}</b>`,
-        "The funds have been added to your wallet.",
-      ].join("\n"),
+      {
+        status: "TIP RECEIVED",
+        from: sender.displayName,
+        to: recipient.displayName,
+        amount: formatMoney(amountMinor, currency),
+        currency,
+        balance: "Credited to wallet",
+        fairId: "completed transfer",
+        note: "Funds added to your wallet",
+      },
+      {
+        inline_keyboard: [[
+          { text: "View profile", callback_data: ownedCallback("main:profile", recipient.telegramUserId) },
+        ]],
+      },
     );
   } catch (error) {
     logger.warn(
@@ -9509,16 +9643,25 @@ async function handleTipCallback(
       amountMinor,
       currency,
     });
-    await bot.sendMessage(
+    await sendTipCard(
+      bot,
       chatId,
-      [
-        "<b>✅ TIP SENT SUCCESSFULLY</b>",
-        "",
-        `To: <b>${escapeTelegramText(targetPlayer.displayName)}</b>`,
-        `Amount: <b>${formatMoney(amountMinor, currency)}</b>`,
-        `Your new balance: <b>${formatMoney(balance.balanceMinor, currency)}</b>`,
-        `Fair ID: <code>${balance.fairId}</code>`,
-      ].join("\n"),
+      {
+        status: "TIP SENT SUCCESSFULLY",
+        from: player.displayName,
+        to: targetPlayer.displayName,
+        amount: formatMoney(amountMinor, currency),
+        currency,
+        balance: formatMoney(balance.balanceMinor, currency),
+        fairId: balance.fairId,
+        note: "Funds transferred successfully",
+      },
+      {
+        inline_keyboard: [[
+          { text: "View profile", callback_data: ownedCallback("main:profile", player.telegramUserId) },
+          { text: "Play games", callback_data: ownedCallback("main:games", player.telegramUserId) },
+        ]],
+      },
     );
     await notifyTipRecipient(bot, targetPlayer, player, amountMinor, currency);
     await auditTransaction(
@@ -9728,7 +9871,7 @@ async function wagerLeaderboardPng(
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render wager leaderboard image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(wagerLeaderboardSvg(mode, items));
+    process.stdin.end(applyRolexGoldBlackTheme(wagerLeaderboardSvg(mode, items)));
   });
 }
 
@@ -10161,7 +10304,7 @@ async function bonusCardPng(data: BonusCardData): Promise<Buffer> {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render bonus image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(bonusCardSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(bonusCardSvg(data)));
   });
 }
 
@@ -10767,7 +10910,7 @@ async function houseRoyaleAnnouncementPng(data: {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render House Royale image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(houseRoyaleAnnouncementSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(houseRoyaleAnnouncementSvg(data)));
   });
 }
 
@@ -10825,7 +10968,7 @@ async function houseRoyaleInfoPng(data: {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render House Royale info image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(houseRoyaleInfoSvg(data));
+    process.stdin.end(applyRolexGoldBlackTheme(houseRoyaleInfoSvg(data)));
   });
 }
 
@@ -11902,7 +12045,7 @@ async function giveawayOverviewPng(
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render giveaway image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(giveawayOverviewSvg(settings, title, subtitle));
+    process.stdin.end(applyRolexGoldBlackTheme(giveawayOverviewSvg(settings, title, subtitle)));
   });
 }
 
@@ -11984,7 +12127,7 @@ async function giveawayRequirementPng(
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render giveaway requirements image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(giveawayRequirementSvg(settings, index, user, metrics, status));
+    process.stdin.end(applyRolexGoldBlackTheme(giveawayRequirementSvg(settings, index, user, metrics, status)));
   });
 }
 
@@ -12068,7 +12211,7 @@ async function giveawayRankingsPng(
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render giveaway rank image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(giveawayRankingsSvg(setting, items));
+    process.stdin.end(applyRolexGoldBlackTheme(giveawayRankingsSvg(setting, items)));
   });
 }
 
@@ -14218,6 +14361,14 @@ async function handleMainUpdate(
     );
   } else if (command === "rates" || command === "exchange") {
     await sendCurrencyRates(bot, chatId);
+  } else if (
+    command === "giveawayrank" ||
+    command === "givewayrank" ||
+    command === "giveaway_rank"
+  ) {
+    await giveawayRankings(bot, chatId);
+  } else if (command === "hrinfo") {
+    await houseRoyaleInfo(bot, chatId, player.telegramUserId);
   } else if (command === "giveaway" || command === "latest") {
     await sendLatestGiveaway(bot, chatId);
     await bot.sendMessage(
@@ -14764,7 +14915,7 @@ async function blackjackCardPng(room: BlackjackRoom): Promise<Buffer> {
       if (code === 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`Could not render blackjack image: ${Buffer.concat(errors).toString("utf8")}`));
     });
-    process.stdin.end(blackjackCardSvg(room));
+    process.stdin.end(applyRolexGoldBlackTheme(blackjackCardSvg(room)));
   });
 }
 
@@ -16109,9 +16260,6 @@ async function handleGiveawayUpdate(
   }
   const message = update.message;
   if (!message?.from || !message.text) return;
-  if (!isPrivateChat(message.chat)) return;
-  if (await handleGiveawayEditText(bot, message, message.text)) return;
-  if (await handleGiveawayAdminText(bot, message, message.text)) return;
   if (!message.text.trim().startsWith("/")) return;
   const { command, args } = commandFrom(message.text);
   const giveawayCommands = new Set([
@@ -16139,6 +16287,26 @@ async function handleGiveawayUpdate(
     "hb",
   ]);
   if (!giveawayCommands.has(command)) return;
+  const publicGiveawayCommands = new Set([
+    "help",
+    "giveawayhelp",
+    "latest",
+    "join",
+    "giveawayrank",
+    "givewayrank",
+    "rank",
+    "giveaway_rank",
+    "hr",
+    "royale",
+    "houseroyale",
+    "joinroyale",
+    "hrinfo",
+  ]);
+  if (!isPrivateChat(message.chat) && !publicGiveawayCommands.has(command)) return;
+  if (isPrivateChat(message.chat)) {
+    if (await handleGiveawayEditText(bot, message, message.text)) return;
+    if (await handleGiveawayAdminText(bot, message, message.text)) return;
+  }
   if (command === "start" && isAdmin(message.from.id)) {
     await sendGiveawayAdminPanel(bot, message.chat.id, message.from);
     return;
