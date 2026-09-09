@@ -1,5 +1,6 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { and, desc, eq, gte, inArray, or, sql } from "drizzle-orm";
 import {
   casinoChallengeParticipantsTable,
@@ -199,6 +200,29 @@ const REFERRAL_BONUS_MINOR: Record<Currency, number> = { INR: 500, USD: 5 };
 const JACKPOT_CONTRIBUTION_RATE = 0.005;
 const DEPOSIT_NETWORKS = ["upi", "btc", "bsc", "solana", "ethereum"] as const;
 type DepositNetwork = (typeof DEPOSIT_NETWORKS)[number];
+
+const DEPOSIT_QR_ASSET_PATHS: Record<DepositNetwork, string> = {
+  upi: new URL("../assets/deposit-upi.png", import.meta.url).pathname,
+  btc: new URL("../assets/deposit-btc.png", import.meta.url).pathname,
+  solana: new URL("../assets/deposit-solana.png", import.meta.url).pathname,
+  ethereum: new URL("../assets/deposit-ethereum.png", import.meta.url).pathname,
+  bsc: new URL("../assets/deposit-bsc.png", import.meta.url).pathname,
+};
+
+const depositQrCache = new Map<DepositNetwork, Buffer>();
+
+async function depositQrImage(network: DepositNetwork): Promise<Buffer | null> {
+  const cached = depositQrCache.get(network);
+  if (cached) return cached;
+  try {
+    const image = await readFile(DEPOSIT_QR_ASSET_PATHS[network]);
+    depositQrCache.set(network, image);
+    return image;
+  } catch (error) {
+    logger.error({ err: error, network }, "Deposit QR asset could not be loaded");
+    return null;
+  }
+}
 type CashFlowStage = "amount" | "network" | "paid" | "utr" | "screenshot" | "address";
 
 type PendingDeposit = {
@@ -10462,6 +10486,22 @@ type GiveawayDraft = {
 
 const giveawayDrafts = new Map<number, GiveawayDraft>();
 
+type GiveawayEditStep = "name" | "pool" | "first" | "second" | "third";
+
+type GiveawayEditDraft = {
+  settingId: number;
+  kind: string;
+  currency: Currency;
+  step: GiveawayEditStep;
+  displayName?: string | null;
+  amountMinor?: number;
+  firstPrizeMinor?: number | null;
+  secondPrizeMinor?: number | null;
+  thirdPrizeMinor?: number | null;
+};
+
+const giveawayEditDrafts = new Map<number, GiveawayEditDraft>();
+
 function isUserGiveawaySetting(settings: GiveawaySetting): boolean {
   return settings.kind === "giveaway" || /^giveaway_\d+$/.test(settings.kind);
 }
@@ -10477,7 +10517,38 @@ async function activeGiveawaySettings(): Promise<GiveawaySetting[]> {
 }
 
 function giveawayLabel(settings: GiveawaySetting, index: number): string {
-  return `GIVEAWAY ${index + 1}`;
+  return settings.displayName?.trim() || `GIVEAWAY ${index + 1}`;
+}
+
+function giveawayRankPrize(
+  settings: GiveawaySetting,
+  rank: number,
+): number {
+  if (rank === 0 && settings.firstPrizeMinor != null) return settings.firstPrizeMinor;
+  if (rank === 1 && settings.secondPrizeMinor != null) return settings.secondPrizeMinor;
+  if (rank === 2 && settings.thirdPrizeMinor != null) return settings.thirdPrizeMinor;
+  return settings.amountMinor;
+}
+
+function giveawayPrizeSummary(
+  settings: GiveawaySetting,
+): string {
+  const currency = parseCurrency(settings.currency, "INR");
+  const prizes = [
+    settings.firstPrizeMinor != null ? `1st ${formatMoney(settings.firstPrizeMinor, currency)}` : null,
+    settings.secondPrizeMinor != null ? `2nd ${formatMoney(settings.secondPrizeMinor, currency)}` : null,
+    settings.thirdPrizeMinor != null ? `3rd ${formatMoney(settings.thirdPrizeMinor, currency)}` : null,
+  ].filter(Boolean);
+  return prizes.length > 0
+    ? prizes.join(" · ")
+    : `Default reward ${formatMoney(settings.amountMinor, currency)}`;
+}
+
+function giveawayEditValueText(
+  value: number | null | undefined,
+  currency: Currency,
+): string {
+  return value == null ? "clear" : formatMoney(value, currency);
 }
 
 async function giveawayPlayerMetrics(
@@ -10698,6 +10769,141 @@ async function houseRoyaleAnnouncementPng(data: {
     });
     process.stdin.end(houseRoyaleAnnouncementSvg(data));
   });
+}
+
+function houseRoyaleInfoSvg(data: {
+  royale: HouseRoyale;
+  players: Array<{
+    name: string;
+    eligible: boolean;
+    winChance: number;
+  }>;
+}): string {
+  const rows = data.players.length > 0
+    ? data.players.slice(0, 8).map((player, index) => {
+        const y = 260 + index * 68;
+        const status = player.eligible ? "ELIGIBLE" : "PENDING";
+        const statusColor = player.eligible ? "#76e3a3" : "#f6c453";
+        return [
+          `<rect x="70" y="${y - 38}" width="1260" height="52" rx="14" fill="#ffffff" fill-opacity="${index % 2 === 0 ? ".09" : ".045"}" stroke="#ffffff" stroke-opacity=".08"/>`,
+          `<text x="102" y="${y}" fill="#f6c453" font-size="24" font-family="DejaVu Sans" font-weight="bold">${index + 1}</text>`,
+          `<text x="170" y="${y}" fill="#ffffff" font-size="23" font-family="DejaVu Sans" font-weight="bold">${escapeXml(svgLabel(player.name, 28))}</text>`,
+          `<text x="820" y="${y}" fill="#dbe7f5" font-size="21" font-family="DejaVu Sans">Win chance type ${player.winChance}/5</text>`,
+          `<text x="1120" y="${y}" fill="${statusColor}" font-size="20" font-family="DejaVu Sans" font-weight="bold">${status}</text>`,
+        ].join("");
+      }).join("")
+    : `<text x="700" y="410" text-anchor="middle" fill="#b6c7df" font-size="30" font-family="DejaVu Sans">No players have joined yet</text>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900">
+  <defs><linearGradient id="hr-info-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10162d"/><stop offset=".55" stop-color="#202b57"/><stop offset="1" stop-color="#3b2457"/></linearGradient></defs>
+  <rect width="1400" height="900" rx="42" fill="url(#hr-info-bg)"/>
+  <circle cx="1280" cy="90" r="230" fill="#8ea6ff" opacity=".14"/><circle cx="90" cy="850" r="250" fill="#f1b83d" opacity=".08"/>
+  <rect x="42" y="42" width="1316" height="816" rx="32" fill="none" stroke="#f1b83d" stroke-opacity=".55" stroke-width="2"/>
+  <text x="86" y="110" fill="#f1b83d" font-size="29" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="172" fill="#ffffff" font-size="44" font-family="DejaVu Sans" font-weight="bold">HOUSE ROYALE #${data.royale.id} · JOINED PLAYERS</text>
+  <text x="86" y="210" fill="#bfc9ec" font-size="21" font-family="DejaVu Sans">Status: ${escapeXml(data.royale.status.toUpperCase())} · Registered ${data.players.length}/${data.royale.maxPlayers} · Admin win-chance tier: 1–5</text>
+  <text x="102" y="246" fill="#8da2bd" font-size="17" font-family="DejaVu Sans" font-weight="bold">#</text>
+  <text x="170" y="246" fill="#8da2bd" font-size="17" font-family="DejaVu Sans" font-weight="bold">PLAYER</text>
+  <text x="820" y="246" fill="#8da2bd" font-size="17" font-family="DejaVu Sans" font-weight="bold">CHANCE TYPE</text>
+  <text x="1120" y="246" fill="#8da2bd" font-size="17" font-family="DejaVu Sans" font-weight="bold">ELIGIBILITY</text>
+  ${rows}
+  <text x="86" y="830" fill="#7185a3" font-size="18" font-family="DejaVu Sans">Only administrators can change chance tiers. Dice results remain visible in the official group.</text>
+</svg>`;
+}
+
+async function houseRoyaleInfoPng(data: {
+  royale: HouseRoyale;
+  players: Array<{ name: string; eligible: boolean; winChance: number }>;
+}): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render House Royale info image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(houseRoyaleInfoSvg(data));
+  });
+}
+
+async function houseRoyaleInfo(
+  bot: TelegramBot,
+  chatId: number,
+  viewerTelegramUserId: number,
+): Promise<void> {
+  const [royale] = await db
+    .select()
+    .from(casinoHouseRoyalesTable)
+    .orderBy(desc(casinoHouseRoyalesTable.id))
+    .limit(1);
+  if (!royale) {
+    await bot.sendMessage(chatId, "<b>👑 HOUSE ROYALE INFO</b>\n\nNo House Royale has been organized yet.");
+    return;
+  }
+  const rows = await houseRoyalePlayers(royale.id);
+  const players = await db.select().from(casinoPlayersTable);
+  const playerById = new Map(players.map((player) => [player.id, player]));
+  const infoPlayers = rows.map((row) => {
+    const player = playerById.get(row.playerId);
+    return {
+      name: player?.username ? `@${player.username}` : player?.displayName ?? `Player ${row.playerId}`,
+      eligible: Boolean(row.eligibilityConfirmedAt),
+      winChance: Math.min(5, Math.max(1, row.winChance)),
+    };
+  });
+  const image = await houseRoyaleInfoPng({ royale, players: infoPlayers });
+  const keyboard: InlineKeyboardButton[][] = [];
+  if (isAdmin(viewerTelegramUserId) && isPrivateChat({ id: chatId, type: "private" })) {
+    for (const row of rows) {
+      const player = playerById.get(row.playerId);
+      const label = player?.username ? `@${player.username}` : player?.displayName ?? `Player ${row.playerId}`;
+      keyboard.push([
+        { text: `${svgLabel(label, 18)} · chance ${row.winChance}/5`, callback_data: `house:chance:${royale.id}:${row.playerId}:show` },
+      ]);
+      keyboard.push([1, 2, 3, 4, 5].map((chance) => ({
+        text: chance === row.winChance ? `✅ ${chance}` : String(chance),
+        callback_data: `house:chance:${royale.id}:${row.playerId}:${chance}`,
+      })));
+    }
+    keyboard.push([{ text: "↻ Refresh /hrinfo", callback_data: `house:info:${royale.id}` }]);
+  }
+  await bot.sendPhoto(
+    chatId,
+    image,
+    `<b>👑 HOUSE ROYALE #${royale.id}</b>\nJoined players are listed below. ${isAdmin(viewerTelegramUserId) ? "Choose a 1–5 chance tier for each player." : ""}`,
+    keyboard.length > 0 ? { inline_keyboard: keyboard } : undefined,
+  );
+}
+
+async function setHouseRoyaleWinChance(
+  bot: TelegramBot,
+  callback: TelegramCallbackQuery,
+  royaleId: number,
+  playerId: number,
+  chance: number,
+): Promise<void> {
+  if (!isAdmin(callback.from.id) || !callback.message || !isPrivateChat(callback.message.chat)) {
+    await bot.sendMessage(callback.message?.chat.id ?? callback.from.id, ADMIN_RESTRICTED_MESSAGE);
+    return;
+  }
+  if (!Number.isInteger(chance) || chance < 1 || chance > 5) return;
+  const [updated] = await db
+    .update(casinoHouseRoyalePlayersTable)
+    .set({ winChance: chance })
+    .where(and(
+      eq(casinoHouseRoyalePlayersTable.royaleId, royaleId),
+      eq(casinoHouseRoyalePlayersTable.playerId, playerId),
+    ))
+    .returning({ id: casinoHouseRoyalePlayersTable.id });
+  if (!updated) {
+    await bot.sendMessage(callback.message.chat.id, "That House Royale player is no longer registered.");
+    return;
+  }
+  await bot.sendMessage(callback.message.chat.id, `✅ Player chance type updated to ${chance}/5.`);
+  await houseRoyaleInfo(bot, callback.message.chat.id, callback.from.id);
 }
 
 async function sendHouseRoyale(
@@ -11923,6 +12129,8 @@ async function sendGiveawaySettings(
       `<b>🎁 ${kind.toUpperCase()} CONFIGURATION</b>`,
       "",
       `Reward: <b>${kind === "rakeback" ? `${(settings.amountMinor / 100).toFixed(2)}%` : formatMoney(settings.amountMinor, currency)}</b>`,
+      `Name: <b>${escapeTelegramText(giveawayLabel(settings, 0))}</b>`,
+      `Ranked prizes: <b>${escapeTelegramText(giveawayPrizeSummary(settings))}</b>`,
       `Maximum winners: <b>${settings.maxWinners || "all eligible"}</b>`,
       `Minimum wager: <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
       `Minimum referrals: <b>${settings.minReferralCount}</b>`,
@@ -11957,7 +12165,8 @@ async function publishGiveawayAnnouncement(
   };
   const caption = [
     `<b>🎁 ${giveawayLabel(settings, 0)}</b>`,
-    `<b>Prize pool:</b> ${formatMoney(settings.amountMinor, parseCurrency(settings.currency, "INR"))}`,
+    `<b>Prize pool / default reward:</b> ${formatMoney(settings.amountMinor, parseCurrency(settings.currency, "INR"))}`,
+    `<b>Ranked prizes:</b> ${giveawayPrizeSummary(settings)}`,
     `<b>Minimum wager:</b> ${formatMoney(settings.minWagerMinor, parseCurrency(settings.currency, "INR"))}`,
     `<b>Minimum referrals:</b> ${settings.minReferralCount}`,
     `<b>Draw:</b> ${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "scheduled soon"}`,
@@ -12102,7 +12311,7 @@ async function distributeConfiguredGiveaways(bot: TelegramBot): Promise<void> {
     for (const recipient of eligible) {
       const rewardMinor = kind === "rakeback"
         ? Math.floor((wagerByPlayer.get(recipient.id) ?? 0) * settings.amountMinor / 10_000)
-        : settings.amountMinor;
+        : giveawayRankPrize(settings, eligible.indexOf(recipient));
       if (rewardMinor <= 0) continue;
       const [claim] = await db
         .insert(casinoGiveawayClaimsTable)
@@ -12756,40 +12965,43 @@ async function selectDepositNetwork(
     network,
     address,
   });
-  await bot.sendMessage(
-    chatId,
-    [
-      "<b>Payment details</b>",
-      "",
-      `Currency: <b>${currency}</b>`,
-      `Exact amount: <b>${formatMoney(pending.amountMinor, currency)}</b>`,
-      `Deposit fee: <b>${formatMoney(depositFeeMinor(pending.amountMinor, currency), currency)}</b> (${currency === "USD" ? "3%" : "1%"})`,
-      `Net credit after approval: <b>${formatMoney(pending.amountMinor - depositFeeMinor(pending.amountMinor, currency), currency)}</b>`,
-      `Network: <b>${networkLabel(network)}</b>`,
-      `Payment address: <code>${address}</code>`,
-      "",
-      "Send the exact amount, then tap the button below.",
-    ].join("\n"),
-    {
-      inline_keyboard: [[
-        {
-          text: "I have paid",
-          callback_data: ownedCallback(
-            `deposit:paid:${requestId}`,
-            user.id,
-          ),
-        },
-      ], [
-        {
-          text: "Cancel",
-          callback_data: ownedCallback(
-            `deposit:cancel:${requestId}`,
-            user.id,
-          ),
-        },
-      ]],
-    },
-  );
+  const paymentDetails = [
+    "<b>Payment details</b>",
+    "",
+    `Currency: <b>${currency}</b>`,
+    `Exact amount: <b>${formatMoney(pending.amountMinor, currency)}</b>`,
+    `Deposit fee: <b>${formatMoney(depositFeeMinor(pending.amountMinor, currency), currency)}</b> (${currency === "USD" ? "3%" : "1%"})`,
+    `Net credit after approval: <b>${formatMoney(pending.amountMinor - depositFeeMinor(pending.amountMinor, currency), currency)}</b>`,
+    `Network: <b>${networkLabel(network)}</b>`,
+    `Payment address: <code>${address}</code>`,
+    "",
+    "Scan the QR code or copy the address. Send the exact amount, then tap the button below.",
+  ].join("\n");
+  const paymentKeyboard = {
+    inline_keyboard: [[
+      {
+        text: "I have paid",
+        callback_data: ownedCallback(
+          `deposit:paid:${requestId}`,
+          user.id,
+        ),
+      },
+    ], [
+      {
+        text: "Cancel",
+        callback_data: ownedCallback(
+          `deposit:cancel:${requestId}`,
+          user.id,
+        ),
+      },
+    ]],
+  };
+  const qrImage = await depositQrImage(network);
+  if (qrImage) {
+    await bot.sendPhoto(chatId, qrImage, paymentDetails, paymentKeyboard);
+  } else {
+    await bot.sendMessage(chatId, paymentDetails, paymentKeyboard);
+  }
 }
 
 async function askForDepositProof(
@@ -15179,6 +15391,149 @@ async function handleGiveawayAdminText(
   return true;
 }
 
+async function sendGiveawayEditPanel(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<void> {
+  const settings = await activeGiveawaySettings();
+  if (!settings.length) {
+    await bot.sendMessage(chatId, "<b>🎁 No active giveaways are available to edit.</b>");
+    return;
+  }
+  const image = await giveawayOverviewPng(
+    settings,
+    "EDIT GIVEAWAY",
+    "Select a prize pool. The old group announcement will be replaced after saving.",
+  );
+  await bot.sendPhoto(
+    chatId,
+    image,
+    "<b>✏️ EDIT GIVEAWAY</b>\nChoose a giveaway to update its name, default prize pool, and first/second/third prizes.",
+    {
+      inline_keyboard: settings.map((settingsRow, index) => [{
+        text: `✏️ Edit ${index + 1} · ${formatMoney(settingsRow.amountMinor, parseCurrency(settingsRow.currency, "INR"))}`,
+        callback_data: `giveaway:admin:edit:${settingsRow.kind}`,
+      }]),
+    },
+  );
+}
+
+async function sendGiveawayEditStep(
+  bot: TelegramBot,
+  chatId: number,
+  adminId: number,
+): Promise<void> {
+  const draft = giveawayEditDrafts.get(adminId);
+  if (!draft) return;
+  const currency = draft.currency;
+  const prompt = draft.step === "name"
+    ? "Send the new giveaway name (up to 80 characters). Send <code>/skip</code> to keep the current name or <code>/clear</code> to use the default."
+    : draft.step === "pool"
+      ? `Send the default prize pool/reward in ${currency}, for example <code>1000</code>.`
+      : `Send the ${draft.step} prize in ${currency}, or <code>0</code> to clear it.`;
+  await bot.sendMessage(
+    chatId,
+    `<b>✏️ Edit giveaway</b>\n\n${prompt}\n\nSend <code>/cancel</code> to stop editing.`,
+  );
+}
+
+async function sendGiveawayEditReview(
+  bot: TelegramBot,
+  chatId: number,
+  adminId: number,
+): Promise<void> {
+  const draft = giveawayEditDrafts.get(adminId);
+  if (!draft) return;
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>Review giveaway changes</b>",
+      "",
+      `Name: <b>${escapeTelegramText(draft.displayName || "default giveaway name")}</b>`,
+      `Default prize pool/reward: <b>${formatMoney(draft.amountMinor ?? 0, draft.currency)}</b>`,
+      `1st prize: <b>${giveawayEditValueText(draft.firstPrizeMinor, draft.currency)}</b>`,
+      `2nd prize: <b>${giveawayEditValueText(draft.secondPrizeMinor, draft.currency)}</b>`,
+      `3rd prize: <b>${giveawayEditValueText(draft.thirdPrizeMinor, draft.currency)}</b>`,
+    ].join("\n"),
+    {
+      inline_keyboard: [
+        [{ text: "✅ Save and republish", callback_data: "giveaway:admin:editsave" }],
+        [{ text: "Cancel", callback_data: "giveaway:admin:editcancel" }],
+      ],
+    },
+  );
+}
+
+function nextGiveawayEditStep(
+  draft: GiveawayEditDraft,
+): GiveawayEditStep | null {
+  return draft.step === "name"
+    ? "pool"
+    : draft.step === "pool"
+      ? "first"
+      : draft.step === "first"
+        ? "second"
+        : draft.step === "second"
+          ? "third"
+          : null;
+}
+
+async function handleGiveawayEditText(
+  bot: TelegramBot,
+  message: TelegramMessage,
+  text: string,
+): Promise<boolean> {
+  if (!message.from) return false;
+  const draft = giveawayEditDrafts.get(message.from.id);
+  if (!draft) return false;
+  const value = text.trim();
+  if (value.toLowerCase() === "/cancel") {
+    giveawayEditDrafts.delete(message.from.id);
+    await bot.sendMessage(message.chat.id, "Giveaway editing cancelled.");
+    return true;
+  }
+  if (value.startsWith("/") && value.toLowerCase() !== "/skip" && value.toLowerCase() !== "/clear") {
+    return false;
+  }
+  if (draft.step === "name") {
+    if (value.toLowerCase() === "/skip") {
+      // Keep the current value.
+    } else {
+      draft.displayName = value.toLowerCase() === "/clear" ? null : value.slice(0, 80);
+      if (!draft.displayName && value.toLowerCase() !== "/clear") {
+        await bot.sendMessage(message.chat.id, "Send a non-empty name, /skip, or /clear.");
+        return true;
+      }
+    }
+  } else {
+    const parsed = value === "0" && draft.step !== "pool" ? 0 : parseMoney(value);
+    if (draft.step === "pool") {
+      if (!parsed || parsed < 1) {
+        await bot.sendMessage(message.chat.id, "Send a positive prize pool/reward amount.");
+        return true;
+      }
+      draft.amountMinor = parsed;
+    } else {
+      if (value !== "0" && (!parsed || parsed < 1)) {
+        await bot.sendMessage(message.chat.id, "Send a positive prize amount, or 0 to clear it.");
+        return true;
+      }
+      const prize = parsed === 0 ? null : parsed;
+      if (draft.step === "first") draft.firstPrizeMinor = prize;
+      if (draft.step === "second") draft.secondPrizeMinor = prize;
+      if (draft.step === "third") draft.thirdPrizeMinor = prize;
+    }
+  }
+  const next = nextGiveawayEditStep(draft);
+  if (next) {
+    draft.step = next;
+    await sendGiveawayEditStep(bot, message.chat.id, message.from.id);
+  } else {
+    await sendGiveawayEditReview(bot, message.chat.id, message.from.id);
+  }
+  return true;
+}
+
 async function sendGiveawayAdminPanel(
   bot: TelegramBot,
   chatId: number,
@@ -15208,8 +15563,10 @@ async function sendGiveawayAdminPanel(
     [{ text: "＋ Create giveaway", callback_data: "giveaway:admin:new" }],
     ...settings.map((settingsRow, index) => [
       { text: `Manage ${index + 1}`, callback_data: `giveaway:select:${settingsRow.kind}` },
+      { text: `✏️ Edit ${index + 1}`, callback_data: `giveaway:admin:edit:${settingsRow.kind}` },
       { text: `Disable ${index + 1}`, callback_data: `giveaway:admin:disable:${settingsRow.kind}` },
     ]),
+    [{ text: "✏️ Edit a giveaway", callback_data: "giveaway:admin:editpanel" }],
     [{ text: "↻ Refresh panel", callback_data: "giveaway:admin:refresh" }],
   ];
   await bot.sendPhoto(chatId, image, undefined, { inline_keyboard: keyboard });
@@ -15243,6 +15600,24 @@ async function sendGiveawayCancelPanel(
   );
 }
 
+async function deleteGiveawayAnnouncement(
+  bot: TelegramBot,
+  settings: GiveawaySetting,
+): Promise<void> {
+  const groupId = settings.announcementChatId ?? officialGroupChatId();
+  if (groupId === null || !settings.announcementMessageId) return;
+  try {
+    await bot.unpinChatMessage(groupId, settings.announcementMessageId);
+  } catch {
+    // The announcement may already be unpinned.
+  }
+  try {
+    await bot.deleteMessage(groupId, settings.announcementMessageId);
+  } catch (error) {
+    logger.debug({ err: error, kind: settings.kind }, "Giveaway announcement deletion failed");
+  }
+}
+
 async function cancelConfiguredGiveaway(
   bot: TelegramBot,
   adminChatId: number,
@@ -15262,18 +15637,7 @@ async function cancelConfiguredGiveaway(
     .set({ enabled: false, announcementMessageId: null, updatedAt: new Date() })
     .where(eq(casinoGiveawaySettingsTable.id, settings.id));
   const groupId = settings.announcementChatId ?? officialGroupChatId();
-  if (groupId !== null && settings.announcementMessageId) {
-    try {
-      await bot.unpinChatMessage(groupId, settings.announcementMessageId);
-    } catch {
-      // The old announcement may already be unpinned.
-    }
-    try {
-      await bot.deleteMessage(groupId, settings.announcementMessageId);
-    } catch (error) {
-      logger.debug({ err: error, kind }, "Giveaway announcement deletion failed");
-    }
-  }
+  await deleteGiveawayAnnouncement(bot, settings);
   if (groupId !== null) {
     const notice = await bot.sendMessage(
       groupId,
@@ -15403,11 +15767,92 @@ async function handleGiveawayAdminAction(
   const action = parts[2];
   const value = parts.slice(3).join(":");
   const chatId = message.chat.id;
+  if (action === "editpanel") {
+    await sendGiveawayEditPanel(bot, chatId);
+    return true;
+  }
+  if (action === "edit") {
+    const [selected] = await db
+      .select()
+      .from(casinoGiveawaySettingsTable)
+      .where(and(
+        eq(casinoGiveawaySettingsTable.kind, value),
+        eq(casinoGiveawaySettingsTable.enabled, true),
+      ))
+      .limit(1);
+    if (!selected) {
+      await bot.sendMessage(chatId, "That giveaway is no longer active.");
+      return true;
+    }
+    giveawayEditDrafts.set(callback.from.id, {
+      settingId: selected.id,
+      kind: selected.kind,
+      currency: parseCurrency(selected.currency, "INR"),
+      step: "name",
+      displayName: selected.displayName,
+      amountMinor: selected.amountMinor,
+      firstPrizeMinor: selected.firstPrizeMinor,
+      secondPrizeMinor: selected.secondPrizeMinor,
+      thirdPrizeMinor: selected.thirdPrizeMinor,
+    });
+    await sendGiveawayEditStep(bot, chatId, callback.from.id);
+    return true;
+  }
+  if (action === "editcancel") {
+    giveawayEditDrafts.delete(callback.from.id);
+    await bot.sendMessage(chatId, "Giveaway editing cancelled.");
+    return true;
+  }
+  if (action === "editsave") {
+    const draft = giveawayEditDrafts.get(callback.from.id);
+    if (!draft?.amountMinor) {
+      await bot.sendMessage(chatId, "The giveaway edit is incomplete. Start /editgiveaway again.");
+      return true;
+    }
+    const [selected] = await db
+      .select()
+      .from(casinoGiveawaySettingsTable)
+      .where(and(
+        eq(casinoGiveawaySettingsTable.id, draft.settingId),
+        eq(casinoGiveawaySettingsTable.enabled, true),
+      ))
+      .limit(1);
+    if (!selected) {
+      giveawayEditDrafts.delete(callback.from.id);
+      await bot.sendMessage(chatId, "That giveaway is no longer active.");
+      return true;
+    }
+    await deleteGiveawayAnnouncement(bot, selected);
+    await db
+      .update(casinoGiveawaySettingsTable)
+      .set({
+        displayName: draft.displayName,
+        amountMinor: draft.amountMinor,
+        firstPrizeMinor: draft.firstPrizeMinor,
+        secondPrizeMinor: draft.secondPrizeMinor,
+        thirdPrizeMinor: draft.thirdPrizeMinor,
+        announcementChatId: null,
+        announcementMessageId: null,
+        updatedByTelegramUserId: callback.from.id,
+        updatedAt: new Date(),
+      })
+      .where(eq(casinoGiveawaySettingsTable.id, selected.id));
+    const [saved] = await db
+      .select()
+      .from(casinoGiveawaySettingsTable)
+      .where(eq(casinoGiveawaySettingsTable.id, selected.id))
+      .limit(1);
+    if (saved) await publishGiveawayAnnouncement(bot, saved);
+    giveawayEditDrafts.delete(callback.from.id);
+    await bot.sendMessage(chatId, "✅ Giveaway updated. The old group announcement was removed and a new one was published.");
+    await sendGiveawayEditPanel(bot, chatId);
+    return true;
+  }
   if (action === "cancelpanel") {
     await sendGiveawayCancelPanel(bot, chatId);
     return true;
   }
-  if (action === "cancel") {
+  if (action === "cancel" && value) {
     await cancelConfiguredGiveaway(bot, chatId, value);
     await sendGiveawayCancelPanel(bot, chatId);
     return true;
@@ -15568,8 +16013,8 @@ async function handleGiveawayUpdate(
 ): Promise<void> {
   if (update.callback_query) {
     const callbackData = update.callback_query.data ?? "";
-    const isPublicHouseJoin =
-      callbackData.startsWith("house:join:") &&
+    const isPublicHouseAction =
+      callbackData.startsWith("house:") &&
       update.callback_query.message &&
       isGroupChat(update.callback_query.message.chat);
     const isPublicGiveawayAction =
@@ -15579,7 +16024,7 @@ async function handleGiveawayUpdate(
     if (
       update.callback_query.message &&
       !isPrivateChat(update.callback_query.message.chat) &&
-      !(isPublicHouseJoin || (isPublicGiveawayAction && isGroupChat(update.callback_query.message.chat)))
+      !(isPublicHouseAction || (isPublicGiveawayAction && isGroupChat(update.callback_query.message.chat)))
     ) {
       return;
     }
@@ -15595,7 +16040,23 @@ async function handleGiveawayUpdate(
         return;
       }
       if (parts[1] === "join") {
-        await joinHouseRoyale(bot, message.chat.id, callback.from, royaleId);
+        try {
+          await joinHouseRoyale(bot, message.chat.id, callback.from, royaleId);
+        } catch (error) {
+          logger.error({ err: error, royaleId, userId: callback.from.id }, "House Royale join callback failed");
+          await bot.sendMessage(
+            message.chat.id,
+            "House Royale could not process that join button. Please use /joinroyale in the giveaway bot.",
+          );
+        }
+      } else if (parts[1] === "info") {
+        await houseRoyaleInfo(bot, message.chat.id, callback.from.id);
+      } else if (parts[1] === "chance") {
+        const playerId = Number(parts[3]);
+        const chance = Number(parts[4]);
+        if (parts[4] !== "show") {
+          await setHouseRoyaleWinChance(bot, callback, royaleId, playerId, chance);
+        }
       } else if (parts[1] === "draw") {
         if (!isAdmin(callback.from.id)) {
           await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
@@ -15649,6 +16110,7 @@ async function handleGiveawayUpdate(
   const message = update.message;
   if (!message?.from || !message.text) return;
   if (!isPrivateChat(message.chat)) return;
+  if (await handleGiveawayEditText(bot, message, message.text)) return;
   if (await handleGiveawayAdminText(bot, message, message.text)) return;
   if (!message.text.trim().startsWith("/")) return;
   const { command, args } = commandFrom(message.text);
@@ -15666,10 +16128,12 @@ async function handleGiveawayUpdate(
     "givewayadd",
     "giveawayoff",
     "cancelgiveaway",
+    "editgiveaway",
     "hr",
     "royale",
     "houseroyale",
     "joinroyale",
+    "hrinfo",
     "organize",
     "house",
     "hb",
@@ -15689,8 +16153,10 @@ async function handleGiveawayUpdate(
         "<b>/join</b> — join the latest giveaway",
          "<b>/giveawayrank</b> or <b>/rank</b> — view the top 10 player ranking image with wager, messages, referrals, points, and conditions",
          "<b>/cancelgiveaway</b> — cancel an active giveaway (admins only, private DM)",
+         "<b>/editgiveaway</b> — edit an active giveaway name and prize tiers (admins only, private DM)",
          "<b>/royale</b> — show the active House Royale",
          "<b>/joinroyale</b> — join the active House Royale",
+         "<b>/hrinfo</b> — show the latest House Royale players and admin chance controls",
          "<b>/organize PRIZEPOOL TIME MINWAGER</b> — organize an 8-player House Royale (admins)",
         "",
         "Giveaway settings are managed from the main RolexCasino bot.",
@@ -15721,6 +16187,10 @@ async function handleGiveawayUpdate(
     } else {
       await bot.sendMessage(message.chat.id, "No House Royale is open right now.");
     }
+    return;
+  }
+  if (command === "hrinfo") {
+    await houseRoyaleInfo(bot, message.chat.id, message.from.id);
     return;
   }
   if (command === "join") {
@@ -15760,6 +16230,14 @@ async function handleGiveawayUpdate(
       return;
     }
     await sendGiveawayCancelPanel(bot, message.chat.id);
+    return;
+  }
+  if (command === "editgiveaway") {
+    if (!isAdmin(message.from.id)) {
+      await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
+      return;
+    }
+    await sendGiveawayEditPanel(bot, message.chat.id);
     return;
   }
   if (command === "houseroyale" || command === "house" || command === "hb") {
@@ -15999,8 +16477,10 @@ export async function startRolexCasinoBots(): Promise<void> {
           { command: "join", description: "Join the latest giveaway" },
           { command: "giveawayrank", description: "Show top 10 player ranking image" },
           { command: "cancelgiveaway", description: "Cancel an active giveaway (admins)" },
+          { command: "editgiveaway", description: "Edit an active giveaway (admins)" },
           { command: "royale", description: "Show the active House Royale" },
           { command: "joinroyale", description: "Join the active House Royale" },
+          { command: "hrinfo", description: "Show latest House Royale players and chances" },
           { command: "organize", description: "Organize an 8-player House Royale (admins)" },
           { command: "hr", description: "Host House Royale (admins)" },
         ]);
