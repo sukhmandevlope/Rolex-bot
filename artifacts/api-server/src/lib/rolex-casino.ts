@@ -7,11 +7,14 @@ import {
   casinoChallengesTable,
   casinoBonusClaimsTable,
   casinoCashRequestsTable,
+  casinoCryptoTipsTable,
   casinoDailyBonusSettingsTable,
   casinoWeeklyBonusSettingsTable,
   casinoEscrowsTable,
   casinoGameBetSettingsTable,
   casinoGameRoundsTable,
+  casinoGiveawayClaimsTable,
+  casinoGiveawaySettingsTable,
   casinoHouseWalletsTable,
   casinoJackpotParticipantsTable,
   casinoJackpotsTable,
@@ -36,6 +39,18 @@ import {
 } from "./rolex-casino-admin";
 import { INR_PER_USD, summarizeCasinoStats } from "./rolex-casino-stats";
 import type { Currency, CasinoStatsSummary } from "./rolex-casino-stats";
+import {
+  ccApiRequestSignature,
+  isAcceptedVerificationResponse,
+  isBep20Network,
+  normalizeCcUsername,
+  usdAmountMinor,
+  verifyCcWebhookSignature,
+} from "./rolex-casino-ccpayment";
+import type {
+  CcPaymentTipData,
+  CcPaymentWebhook,
+} from "./rolex-casino-ccpayment";
 import {
   BATTLE_TURN_TIMEOUT_MS,
   battleTimeoutOutcome,
@@ -63,6 +78,8 @@ import type { BlackjackGame, BlackjackStatus } from "./rolex-casino-blackjack";
 
 type TelegramUser = {
   id: number;
+  is_bot?: boolean;
+  language_code?: string;
   first_name?: string;
   last_name?: string;
   username?: string;
@@ -111,6 +128,7 @@ type TelegramResponse<T> = {
 };
 
 type TelegramSticker = {
+  file_id?: string;
   emoji?: string;
   custom_emoji_id?: string;
 };
@@ -152,6 +170,7 @@ const CONFIGURABLE_GAME_TYPES = new Set([
   "limbo",
   "mines",
   "bj",
+  "roulette",
 ]);
 const LIMBO_MIN_BET_INR_MINOR = 2_000;
 const MIN_DEPOSIT_MINOR: Record<Currency, number> = { INR: 5_000, USD: 50 };
@@ -202,14 +221,23 @@ type MinesGame = {
   revealed: Set<number>;
   multiplier: number;
   status: "active" | "lost" | "cashed_out";
+  autoMode?: boolean;
+  autoRunning?: boolean;
   messageId?: number;
 };
 
 const activeMinesGames = new Map<string, MinesGame>();
 const minesFairRecords = new Map<string, MinesGame>();
+const settlingMinesGames = new Set<string>();
+const clientSeeds = new Map<number, string>();
+const currencyMenuMessages = new Map<number, { chatId: number; messageId: number }>();
+let rouletteStickerIds: string[] = [];
+let lastRouletteStickerIndex = -1;
+let activeMainBot: TelegramBot | null = null;
 type BlackjackRoom = {
   roomId: string;
   userId: number;
+  playerLabel: string;
   playerId: number;
   chatId: number;
   amountMinor: number;
@@ -220,6 +248,7 @@ type BlackjackRoom = {
 };
 
 const activeBlackjackRooms = new Map<string, BlackjackRoom>();
+const blackjackActionsInFlight = new Set<string>();
 const withdrawalConfirmations = new Map<
   string,
   {
@@ -235,7 +264,8 @@ const withdrawalConfirmations = new Map<
 let casinoPowerOn = true;
 
 const MAINTENANCE_MESSAGE =
-  "🔧 RolexCasino is temporarily in maintenance mode. Please try again later.";
+  "🚧 RolexCasino is under maintenance. Please try again!";
+const BUTTON_NOT_FOR_YOU_MESSAGE = "This button is not for you!!!";
 
 const helperConfigs: BotConfig[] = [
   {
@@ -303,6 +333,34 @@ function escapeTelegramText(value: string): string {
 
 const premiumEmojiByUnicode = new Map<string, string>();
 
+const requestedPremiumEmojiOverrides: Record<string, string> = {
+  "✅": "5938109560249127910",
+  "❌": "5938290000415167172",
+  "🚀": "6262728561484894770",
+  "⚠️": "5938167138580741203",
+  "💵": "5938026800524301051",
+  "📢": "5935759787936453301",
+  "📌": "5938027397524754858",
+  "🎲": "4918297527461086252",
+  "🎯": "5350460637182993292",
+  "🎳": "5120769733267817374",
+  "🏆": "6321227987446404067",
+  "🖤": "5348576757152759323",
+  "❤️": "5938543334766153912",
+  "💯": "5341498088408234504",
+  "🤩": "5303479226882603449",
+  "🏳️": "5460755126761312667",
+  "🎉": "5436040291507247633",
+  "💣": "5469654973308476699",
+  "⚽": "5123352773844271919",
+  "🏀": "5120609599707153336",
+  "🎰": "6249287461332062273",
+};
+
+for (const [unicode, customEmojiId] of Object.entries(requestedPremiumEmojiOverrides)) {
+  premiumEmojiByUnicode.set(unicode, customEmojiId);
+}
+
 function applyPremiumEmojis(
   text: string,
   options?: { copyableCode?: string },
@@ -314,8 +372,6 @@ function applyPremiumEmojis(
     ? escapeTelegramText(options.copyableCode)
     : null;
   const hasHtmlMarkup = /<\/?(?:b|strong|code|i|u|blockquote)>/.test(text);
-  if (premiumEmojiByUnicode.size === 0 && !copyableCode && !hasHtmlMarkup) return { text };
-
   let formatted = escapeTelegramText(text);
   if (hasHtmlMarkup) {
     formatted = formatted.replace(
@@ -343,25 +399,6 @@ function applyPremiumEmojis(
     });
     replacementIndex += 1;
   }
-  if (replacements.length === 0 && !codeToken) {
-    const preferredId = premiumEmojiByUnicode.get("✨");
-    const fallbackEntry = premiumEmojiByUnicode.entries().next().value as
-      | [string, string]
-      | undefined;
-    const defaultEntry = preferredId
-      ? (["✨", preferredId] as [string, string])
-      : fallbackEntry;
-    if (defaultEntry) {
-      const [unicode, customEmojiId] = defaultEntry;
-      const token = `\uE000${replacementIndex}\uE001`;
-      formatted = `${formatted}\n${token}`;
-      replacements.push({
-        token,
-        tag: `<tg-emoji emoji-id="${customEmojiId}">${unicode}</tg-emoji>`,
-      });
-    }
-  }
-
   for (const replacement of replacements) {
     formatted = formatted.split(replacement.token).join(replacement.tag);
   }
@@ -370,9 +407,10 @@ function applyPremiumEmojis(
       .split(codeToken)
       .join(`<code>${copyableCode}</code>`);
   }
-  return replacements.length > 0 || Boolean(codeToken) || hasHtmlMarkup
-    ? { text: formatted, parseMode: "HTML" }
-    : { text };
+  return {
+    text: `<b>${formatted}</b>`,
+    parseMode: "HTML",
+  };
 }
 
 function playerName(user: TelegramUser): string {
@@ -382,6 +420,115 @@ function playerName(user: TelegramUser): string {
 function parseCurrency(value: string | undefined, fallback: Currency): Currency {
   const normalized = value?.toUpperCase();
   return normalized === "INR" || normalized === "USD" ? normalized : fallback;
+}
+
+type DisplayCurrency =
+  | Currency
+  | "JPY"
+  | "CNY"
+  | "KRW"
+  | "SGD"
+  | "HKD"
+  | "THB"
+  | "MYR"
+  | "IDR"
+  | "PHP"
+  | "BDT";
+
+const DISPLAY_CURRENCIES: Array<{
+  code: DisplayCurrency;
+  flag: string;
+  name: string;
+}> = [
+  { code: "USD", flag: "🇺🇸", name: "US Dollar" },
+  { code: "INR", flag: "🇮🇳", name: "Indian Rupee" },
+  { code: "JPY", flag: "🇯🇵", name: "Japanese Yen" },
+  { code: "CNY", flag: "🇨🇳", name: "Chinese Yuan" },
+  { code: "KRW", flag: "🇰🇷", name: "Korean Won" },
+  { code: "SGD", flag: "🇸🇬", name: "Singapore Dollar" },
+  { code: "HKD", flag: "🇭🇰", name: "Hong Kong Dollar" },
+  { code: "THB", flag: "🇹🇭", name: "Thai Baht" },
+  { code: "MYR", flag: "🇲🇾", name: "Malaysian Ringgit" },
+  { code: "IDR", flag: "🇮🇩", name: "Indonesian Rupiah" },
+  { code: "PHP", flag: "🇵🇭", name: "Philippine Peso" },
+  { code: "BDT", flag: "🇧🇩", name: "Bangladeshi Taka" },
+];
+
+const FALLBACK_INR_RATES: Record<DisplayCurrency, number> = {
+  INR: 1,
+  USD: 1 / INR_PER_USD,
+  JPY: 1.62,
+  CNY: 0.073,
+  KRW: 15.1,
+  SGD: 0.0138,
+  HKD: 0.093,
+  THB: 0.37,
+  MYR: 0.050,
+  IDR: 191.5,
+  PHP: 0.68,
+  BDT: 1.42,
+};
+
+let displayRatesInr = { ...FALLBACK_INR_RATES };
+
+function parseDisplayCurrency(
+  value: string | undefined,
+  fallback: DisplayCurrency,
+): DisplayCurrency {
+  const normalized = value?.toUpperCase() as DisplayCurrency | undefined;
+  return DISPLAY_CURRENCIES.some((item) => item.code === normalized)
+    ? normalized as DisplayCurrency
+    : fallback;
+}
+
+function displayCurrencyLabel(currency: DisplayCurrency): string {
+  return DISPLAY_CURRENCIES.find((item) => item.code === currency)?.name ?? currency;
+}
+
+function formatDisplayAmount(inrMinor: number, currency: DisplayCurrency): string {
+  const amount = (inrMinor / 100) * (displayRatesInr[currency] ?? 1);
+  const digits = currency === "JPY" || currency === "KRW" || currency === "IDR" ? 0 : 2;
+  const formatted = amount.toLocaleString("en-IN", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+  const symbol: Record<DisplayCurrency, string> = {
+    INR: "₹",
+    USD: "$",
+    JPY: "¥",
+    CNY: "¥",
+    KRW: "₩",
+    SGD: "S$",
+    HKD: "HK$",
+    THB: "฿",
+    MYR: "RM",
+    IDR: "Rp",
+    PHP: "₱",
+    BDT: "৳",
+  };
+  return `${symbol[currency]}${formatted}`;
+}
+
+async function refreshDisplayRates(): Promise<void> {
+  let progressUpdated = false;
+  try {
+    const response = await fetch(
+      "https://open.er-api.com/v6/latest/INR",
+      { signal: AbortSignal.timeout(4_000) },
+    );
+    if (!response.ok) return;
+    const payload = await response.json() as { rates?: Record<string, number> };
+    const next = { ...displayRatesInr };
+    for (const item of DISPLAY_CURRENCIES) {
+      const rate = payload.rates?.[item.code];
+      if (typeof rate === "number" && Number.isFinite(rate) && rate > 0) {
+        next[item.code] = rate;
+      }
+    }
+    displayRatesInr = next;
+  } catch (error) {
+    logger.warn({ err: error }, "Live display currency rates unavailable; using fallback rates");
+  }
 }
 
 function parseMoney(value: string | undefined): number | null {
@@ -496,6 +643,8 @@ function normalizeConfigurableGameType(value: string | undefined): string | null
     limbo: "limbo",
     bj: "bj",
     blackjack: "bj",
+    roul: "roulette",
+    roulette: "roulette",
   };
   const gameType = aliases[normalized ?? ""];
   return gameType && CONFIGURABLE_GAME_TYPES.has(gameType) ? gameType : null;
@@ -645,6 +794,17 @@ function createFairId(): string {
   return value;
 }
 
+const CLIENT_SEED_ALPHABET =
+  "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789_-!@#$%";
+
+function createClientSeed(): string {
+  let seed = "";
+  while (seed.length < 32) {
+    seed += CLIENT_SEED_ALPHABET[randomInt(CLIENT_SEED_ALPHABET.length)];
+  }
+  return seed;
+}
+
 function parseAmountAndCurrency(
   value: string | undefined,
   fallback: Currency,
@@ -757,19 +917,33 @@ class TelegramBot {
     return this.username;
   }
 
-  async call<T>(method: string, body?: Record<string, unknown>): Promise<T> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await fetch(
-        `https://api.telegram.org/bot${this.config.token}/${method}`,
-        {
-          method: body ? "POST" : "GET",
-          headers: body ? { "content-type": "application/json" } : undefined,
-          body: body ? JSON.stringify(body) : undefined,
-        },
-      );
+  async call<T>(
+    method: string,
+    body?: Record<string, unknown>,
+    options?: { timeoutMs?: number; maxAttempts?: number },
+  ): Promise<T> {
+    const maxAttempts = options?.maxAttempts ?? 3;
+    const timeoutMs = options?.timeoutMs ?? 15_000;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      let response: Response;
+      try {
+        response = await fetch(
+          `https://api.telegram.org/bot${this.config.token}/${method}`,
+          {
+            method: body ? "POST" : "GET",
+            headers: body ? { "content-type": "application/json" } : undefined,
+            body: body ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
+          },
+        );
+      } finally {
+        clearTimeout(timeout);
+      }
       const payload = (await response.json()) as TelegramResponse<T>;
       if (response.ok && payload.ok) return payload.result;
-      if (response.status === 429 && attempt < 2) {
+      if (response.status === 429 && attempt < maxAttempts - 1) {
         const retryAfterSeconds = Math.max(
           1,
           Math.min(payload.parameters?.retry_after ?? 1, 10),
@@ -793,8 +967,25 @@ class TelegramBot {
     );
   }
 
+  async setCommands(
+    commands: Array<{ command: string; description: string }>,
+  ): Promise<void> {
+    await this.call("setMyCommands", { commands });
+  }
+
   async preparePolling(): Promise<void> {
-    await this.call("deleteWebhook", { drop_pending_updates: false });
+    try {
+      await this.call(
+        "deleteWebhook",
+        { drop_pending_updates: false },
+        { timeoutMs: 5_000, maxAttempts: 1 },
+      );
+    } catch (error) {
+      logger.warn(
+        { err: error, bot: this.config.label },
+        "Telegram webhook cleanup timed out; continuing with polling setup",
+      );
+    }
   }
 
   async getStickerSet(name: string): Promise<TelegramStickerSet> {
@@ -830,6 +1021,18 @@ class TelegramBot {
       text: formatted.text,
       ...(formatted.parseMode ? { parse_mode: formatted.parseMode } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    });
+  }
+
+  async editReplyMarkup(
+    chatId: number,
+    messageId: number,
+    replyMarkup: { inline_keyboard: InlineKeyboardButton[][] },
+  ): Promise<void> {
+    await this.call("editMessageReplyMarkup", {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
     });
   }
 
@@ -883,6 +1086,13 @@ class TelegramBot {
       ...(formattedCaption ? { caption: formattedCaption.text } : {}),
       ...(formattedCaption?.parseMode ? { parse_mode: formattedCaption.parseMode } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    });
+  }
+
+  async sendSticker(chatId: number, sticker: string): Promise<TelegramMessage> {
+    return this.call<TelegramMessage>("sendSticker", {
+      chat_id: chatId,
+      sticker,
     });
   }
 
@@ -958,8 +1168,11 @@ class TelegramBot {
     });
   }
 
-  async answerCallback(id: string): Promise<void> {
-    await this.call("answerCallbackQuery", { callback_query_id: id });
+  async answerCallback(id: string, text?: string, showAlert = false): Promise<void> {
+    await this.call("answerCallbackQuery", {
+      callback_query_id: id,
+      ...(text ? { text, show_alert: showAlert } : {}),
+    });
   }
 
   async start(handler: (bot: TelegramBot, update: TelegramUpdate) => Promise<void>): Promise<void> {
@@ -1013,6 +1226,21 @@ async function loadPremiumEmojiPack(bot: TelegramBot): Promise<void> {
       { err: error, packName },
       "Custom emoji pack unavailable; using standard emoji fallback",
     );
+  }
+}
+
+async function loadRouletteStickerPack(bot: TelegramBot): Promise<void> {
+  try {
+    const stickerSet = await bot.getStickerSet("roulete");
+    rouletteStickerIds = stickerSet.stickers
+      .map((sticker) => sticker.file_id)
+      .filter((fileId): fileId is string => Boolean(fileId));
+    logger.info(
+      { stickerCount: rouletteStickerIds.length },
+      "RolexCasino roulette sticker pack loaded",
+    );
+  } catch (error) {
+    logger.warn({ err: error }, "Roulette sticker pack unavailable at startup");
   }
 }
 
@@ -1088,7 +1316,7 @@ async function broadcastPlayerWin(
   try {
     await bot.sendMessage(
       chatId,
-      `🏆🎉 ${gameType.toUpperCase()} ${winnerName} WON ${formatMoney(payoutMinor, currency)} (${time})`,
+      `✅ ${gameType.toUpperCase()} ${winnerName} WON ${formatMoney(payoutMinor, currency)} (${time})`,
     );
   } catch (error) {
     logger.warn(
@@ -1104,6 +1332,8 @@ async function ensurePlayer(user: TelegramUser): Promise<typeof casinoPlayersTab
     .insert(casinoPlayersTable)
     .values({
       telegramUserId: user.id,
+      isBot: Boolean(user.is_bot),
+      language: "en",
       username,
       displayName: playerName(user),
       referralCode: referralCodeFor(user.id),
@@ -1113,6 +1343,7 @@ async function ensurePlayer(user: TelegramUser): Promise<typeof casinoPlayersTab
       set: {
         username,
         displayName: playerName(user),
+        isBot: Boolean(user.is_bot),
         updatedAt: new Date(),
       },
     });
@@ -1170,6 +1401,399 @@ async function ensureHouseWallet(
     .limit(1);
   if (!wallet) throw new Error("Could not create house wallet");
   return wallet;
+}
+
+type CcWebhookResult = {
+  httpStatus: number;
+  body: {
+    status: "success" | "error";
+    code: number;
+    message: string;
+  };
+};
+
+function ccResult(
+  status: "success" | "error",
+  code: number,
+  message: string,
+  httpStatus = code,
+): CcWebhookResult {
+  return { httpStatus, body: { status, code, message } };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function ccTelegramUserId(value: unknown): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d+$/.test(value.trim())
+        ? Number(value.trim())
+        : NaN;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function ccTipPayload(value: unknown): CcPaymentWebhook | null {
+  if (!isRecord(value)) return null;
+  const dataValue = value.data;
+  if (
+    typeof value.event_id !== "string" ||
+    !value.event_id.trim() ||
+    typeof value.event_type !== "string" ||
+    typeof value.timestamp !== "number" ||
+    !Number.isSafeInteger(value.timestamp) ||
+    !isRecord(dataValue)
+  ) {
+    return null;
+  }
+  const sender = dataValue.sender;
+  const recipient = dataValue.recipient;
+  const confirmations = dataValue.confirmations;
+  if (
+    typeof dataValue.transaction_id !== "string" ||
+    !dataValue.transaction_id.trim() ||
+    typeof dataValue.token !== "string" ||
+    !dataValue.token.trim() ||
+    typeof dataValue.network !== "string" ||
+    !dataValue.network.trim() ||
+    typeof dataValue.amount !== "string" ||
+    !isRecord(sender) ||
+    !isRecord(recipient) ||
+    typeof dataValue.status !== "string" ||
+    typeof confirmations !== "number" ||
+    !Number.isSafeInteger(confirmations) ||
+    typeof dataValue.is_flagged_as_risky !== "boolean" ||
+    typeof dataValue.flash_usdt_detected !== "boolean"
+  ) {
+    return null;
+  }
+  const senderUserId = ccTelegramUserId(sender.user_id);
+  if (senderUserId === null) return null;
+  if (typeof recipient.username !== "string") return null;
+
+  return {
+    event_id: value.event_id.trim(),
+    event_type: value.event_type.trim(),
+    timestamp: value.timestamp as number,
+    data: {
+      transaction_id: dataValue.transaction_id.trim(),
+      token: dataValue.token.trim(),
+      network: dataValue.network.trim(),
+      amount: dataValue.amount.trim(),
+      sender: {
+        user_id: senderUserId,
+        ...(typeof sender.username === "string"
+          ? { username: sender.username.trim() }
+          : {}),
+      },
+      recipient: {
+        ...(typeof recipient.user_id === "string" ||
+        typeof recipient.user_id === "number"
+          ? { user_id: recipient.user_id }
+          : {}),
+        username: recipient.username.trim(),
+        ...(typeof recipient.address === "string"
+          ? { address: recipient.address.trim() }
+          : {}),
+      },
+      status: dataValue.status.trim().toLowerCase(),
+      confirmations: confirmations as number,
+      is_flagged_as_risky: dataValue.is_flagged_as_risky,
+      flash_usdt_detected: dataValue.flash_usdt_detected,
+      ...(typeof dataValue.usd_amount === "string" ||
+      typeof dataValue.usd_amount === "number"
+        ? { usd_amount: dataValue.usd_amount }
+        : {}),
+      ...(typeof dataValue.amount_usd === "string" ||
+      typeof dataValue.amount_usd === "number"
+        ? { amount_usd: dataValue.amount_usd }
+        : {}),
+      ...(typeof dataValue.fiat_amount_usd === "string" ||
+      typeof dataValue.fiat_amount_usd === "number"
+        ? { fiat_amount_usd: dataValue.fiat_amount_usd }
+        : {}),
+    },
+  };
+}
+
+async function verifyCcTipWithProvider(
+  webhook: CcPaymentWebhook,
+): Promise<boolean> {
+  const apiKey = process.env.CC_PAYMENT_API_KEY?.trim();
+  const secret = process.env.CC_PAYMENT_API_SECRET?.trim();
+  if (!apiKey || !secret) {
+    logger.error("CCPayment verification is unavailable because credentials are missing");
+    return false;
+  }
+
+  const body = JSON.stringify({
+    event_id: webhook.event_id,
+    transaction_id: webhook.data.transaction_id,
+    sender_user_id: webhook.data.sender.user_id,
+    recipient_username: webhook.data.recipient.username,
+    recipient_address: webhook.data.recipient.address,
+    token: webhook.data.token,
+    network: webhook.data.network,
+    amount: webhook.data.amount,
+  });
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const endpoint =
+    process.env.CC_PAYMENT_VERIFY_ENDPOINT?.trim() ||
+    "https://api.ccpayment.com/v2/wallet/verify-tip";
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-CC-API-Key": apiKey,
+        "X-CC-Timestamp": timestamp,
+        "X-CC-Signature": ccApiRequestSignature(timestamp, body, secret),
+      },
+      body,
+      signal: AbortSignal.timeout(8_000),
+    });
+    const responseBody = (await response.json().catch(() => null)) as unknown;
+    return isAcceptedVerificationResponse(response.status, responseBody);
+  } catch (error) {
+    logger.error(
+      { err: error, transactionId: webhook.data.transaction_id },
+      "CCPayment verification request failed",
+    );
+    return false;
+  }
+}
+
+async function creditVerifiedCcTip(
+  webhook: CcPaymentWebhook,
+  player: typeof casinoPlayersTable.$inferSelect,
+  grossAmountMinor: number,
+): Promise<
+  | { kind: "credited"; balanceMinor: number; feeMinor: number; creditedAmountMinor: number }
+  | { kind: "duplicate" }
+> {
+  const feeMinor = Math.floor(grossAmountMinor * 0.02);
+  const creditedAmountMinor = grossAmountMinor - feeMinor;
+  if (creditedAmountMinor <= 0) throw new Error("CC_TIP_AMOUNT_TOO_SMALL");
+
+  const wallet = await ensureWallet(player.id, "USD");
+  const houseWallet = await ensureHouseWallet("USD");
+  const data = webhook.data;
+  return db.transaction(async (tx) => {
+    const [tip] = await tx
+      .insert(casinoCryptoTipsTable)
+      .values({
+        eventId: webhook.event_id,
+        transactionId: data.transaction_id,
+        playerId: player.id,
+        senderTelegramUserId: Number(data.sender.user_id),
+        senderUsername: data.sender.username
+          ? normalizeCcUsername(data.sender.username)
+          : null,
+        recipientUsername: normalizeCcUsername(data.recipient.username),
+        token: data.token.toUpperCase(),
+        network: data.network.toUpperCase(),
+        currency: "USD",
+        grossAmountMinor,
+        feeMinor,
+        creditedAmountMinor,
+        confirmations: data.confirmations,
+        isRisky: data.is_flagged_as_risky,
+        flashDetected: data.flash_usdt_detected,
+        status: "credited",
+        processedAt: new Date(),
+      })
+      .onConflictDoNothing()
+      .returning({ id: casinoCryptoTipsTable.id });
+    if (!tip) return { kind: "duplicate" as const };
+
+    const [updatedWallet] = await tx
+      .update(casinoWalletsTable)
+      .set({
+        balanceMinor: sql`${casinoWalletsTable.balanceMinor} + ${creditedAmountMinor}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(casinoWalletsTable.id, wallet.id))
+      .returning();
+    if (!updatedWallet) throw new Error("CC_TIP_CREDIT_FAILED");
+
+    await tx.insert(casinoLedgerEntriesTable).values({
+      walletId: wallet.id,
+      transactionId: data.transaction_id,
+      entryType: "cc_tip_credit",
+      amountMinor: creditedAmountMinor,
+      description: `Verified ${data.token.toUpperCase()} BEP20 tip; 2% fee retained by HB`,
+    });
+    await tx
+      .update(casinoHouseWalletsTable)
+      .set({
+        balanceMinor: sql`${casinoHouseWalletsTable.balanceMinor} + ${feeMinor}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(casinoHouseWalletsTable.id, houseWallet.id));
+
+    await tx
+      .insert(casinoWagerRequirementsTable)
+      .values({
+        playerId: player.id,
+        currency: "USD",
+        requiredMinor: creditedAmountMinor,
+        completedMinor: 0,
+      })
+      .onConflictDoUpdate({
+        target: [
+          casinoWagerRequirementsTable.playerId,
+          casinoWagerRequirementsTable.currency,
+        ],
+        set: {
+          requiredMinor: sql`${casinoWagerRequirementsTable.requiredMinor} + ${creditedAmountMinor}`,
+          updatedAt: new Date(),
+        },
+      });
+
+    return {
+      kind: "credited" as const,
+      balanceMinor: updatedWallet.balanceMinor,
+      feeMinor,
+      creditedAmountMinor,
+    };
+  });
+}
+
+export async function processCcPaymentWebhook(input: {
+  payload: unknown;
+  rawBody: Buffer;
+  timestampHeader: string | undefined;
+  signatureHeader: string | undefined;
+}): Promise<CcWebhookResult> {
+  const secret = process.env.CC_PAYMENT_API_SECRET?.trim();
+  if (!secret) {
+    return ccResult("error", 503, "CCPayment verification is not configured.", 503);
+  }
+  if (
+    !verifyCcWebhookSignature({
+      rawBody: input.rawBody,
+      timestampHeader: input.timestampHeader,
+      signatureHeader: input.signatureHeader,
+      secret,
+    })
+  ) {
+    return ccResult("error", 401, "Invalid CCPayment webhook signature.", 401);
+  }
+
+  const webhook = ccTipPayload(input.payload);
+  if (!webhook) {
+    return ccResult("error", 400, "Invalid CCPayment webhook payload.", 400);
+  }
+  const data = webhook.data;
+  if (webhook.event_type !== "tip.received") {
+    return ccResult("success", 200, "Webhook ignored because it is not a tip event.");
+  }
+  if (normalizeCcUsername(data.recipient.username) !== "lucifer_1205") {
+    return ccResult("success", 200, "Tip ignored because the recipient is not authorized.");
+  }
+  const configuredAddress = process.env.CC_PAYMENT_BEP20_ADDRESS?.trim().toLowerCase();
+  if (configuredAddress && data.recipient.address?.trim().toLowerCase() !== configuredAddress) {
+    return ccResult("success", 200, "Tip ignored because the BEP20 address does not match.");
+  }
+  if (!isBep20Network(data.network)) {
+    return ccResult("success", 200, "Tip ignored because only BEP20 is supported.");
+  }
+  if (data.status !== "confirmed" || data.confirmations < 1) {
+    return ccResult("success", 200, "Tip received but is not confirmed yet; no funds were credited.");
+  }
+  if (data.is_flagged_as_risky || data.flash_usdt_detected) {
+    return ccResult("success", 200, "Tip rejected by CCPayment risk checks; no funds were credited.");
+  }
+  const grossAmountMinor = usdAmountMinor(data);
+  if (grossAmountMinor === null) {
+    return ccResult(
+      "success",
+      200,
+      "Tip rejected because CCPayment did not provide a verifiable USD value for this token.",
+    );
+  }
+  if (!(await verifyCcTipWithProvider(webhook))) {
+    return ccResult(
+      "success",
+      200,
+      "Tip verification is pending or failed; no funds were credited.",
+    );
+  }
+
+  const senderUserId = Number(data.sender.user_id);
+  const player = await ensurePlayer({
+    id: senderUserId,
+    first_name: data.sender.username
+      ? `@${normalizeCcUsername(data.sender.username)}`
+      : `Telegram ${senderUserId}`,
+    ...(data.sender.username ? { username: normalizeCcUsername(data.sender.username) } : {}),
+  });
+  const result = await creditVerifiedCcTip(webhook, player, grossAmountMinor);
+  if (result.kind === "duplicate") {
+    return ccResult("success", 200, "Webhook already processed; no duplicate credit was made.");
+  }
+
+  const bot = activeMainBot;
+  if (bot) {
+    const playerLabel = player.username ? `@${player.username}` : player.displayName;
+    await Promise.allSettled([
+      bot.sendMessage(
+        player.telegramUserId,
+        [
+          "<b>✅ CC TIP VERIFIED AND CREDITED</b>",
+          "",
+          `Transaction: <code>${escapeTelegramText(data.transaction_id)}</code>`,
+          `Amount: <b>$${(grossAmountMinor / 100).toFixed(2)}</b>`,
+          `Token: <b>${escapeTelegramText(data.token.toUpperCase())}</b>`,
+          "Network: <b>BEP20</b>",
+          `Fee (2%): <b>$${(result.feeMinor / 100).toFixed(2)}</b>`,
+          `Credited to your USD wallet: <b>$${(result.creditedAmountMinor / 100).toFixed(2)}</b>`,
+          `Updated balance: <b>$${(result.balanceMinor / 100).toFixed(2)}</b>`,
+          `Wager rule: <b>1× ($${(result.creditedAmountMinor / 100).toFixed(2)})</b>`,
+          "",
+          "Your CC tip has been verified by CCPayment and credited successfully.",
+        ].join("\n"),
+        officialGroupKeyboard(),
+      ),
+      notifyAdmins(
+        bot,
+        [
+          "<b>🧾 CC WALLET RECHARGE VERIFIED</b>",
+          "",
+          `User: <b>${escapeTelegramText(playerLabel)}</b>`,
+          `Telegram ID: <code>${player.telegramUserId}</code>`,
+          `Token: <b>${escapeTelegramText(data.token.toUpperCase())}</b>`,
+          "Network: <b>BEP20</b>",
+          `Gross amount: <b>$${(grossAmountMinor / 100).toFixed(2)}</b>`,
+          `Fee to HB (2%): <b>$${(result.feeMinor / 100).toFixed(2)}</b>`,
+          `Credited: <b>$${(result.creditedAmountMinor / 100).toFixed(2)}</b>`,
+          `Transaction: <code>${escapeTelegramText(data.transaction_id)}</code>`,
+          `Event: <code>${escapeTelegramText(webhook.event_id)}</code>`,
+          "API verification: <b>success</b>",
+        ].join("\n"),
+      ),
+      auditTransaction(
+        bot,
+        [
+          "Type: CCPayment verified tip",
+          `Player: ${player.telegramUserId}`,
+          `Transaction: ${data.transaction_id}`,
+          `Gross: $${(grossAmountMinor / 100).toFixed(2)}`,
+          `Fee: $${(result.feeMinor / 100).toFixed(2)}`,
+          `Credited: $${(result.creditedAmountMinor / 100).toFixed(2)}`,
+        ].join("\n"),
+      ),
+    ]);
+  } else {
+    logger.warn(
+      { transactionId: data.transaction_id, playerId: player.id },
+      "CCPayment credit completed before the main Telegram bot was ready",
+    );
+  }
+
+  return ccResult("success", 200, "Webhook processed, funds credited to user wallet.");
 }
 
 function jackpotDayInfo(now = new Date()): {
@@ -1231,18 +1855,14 @@ function houseContribution(
     : stakeMinor;
 }
 
-async function balanceText(playerId: number, preferredCurrency: Currency): Promise<string> {
+async function balanceText(
+  playerId: number,
+  preferredCurrency: DisplayCurrency,
+): Promise<string> {
   const wallets = await db
     .select()
     .from(casinoWalletsTable)
     .where(eq(casinoWalletsTable.playerId, playerId));
-  const selectedBalance =
-    wallets.find((wallet) => wallet.currency === preferredCurrency)?.balanceMinor ??
-    0;
-  const alternateCurrency = preferredCurrency === "INR" ? "USD" : "INR";
-  const alternateBalance =
-    wallets.find((wallet) => wallet.currency === alternateCurrency)?.balanceMinor ??
-    0;
   const totalInrMinor = wallets.reduce(
     (total, wallet) =>
       total +
@@ -1254,59 +1874,22 @@ async function balanceText(playerId: number, preferredCurrency: Currency): Promi
     0,
   );
   return [
-    `💰 ${preferredCurrency} wallet: ${formatMoney(selectedBalance, preferredCurrency)}`,
-    `💼 ${alternateCurrency} wallet: ${formatMoney(alternateBalance, alternateCurrency)}`,
-    `📊 Total value: ${formatMoney(totalInrMinor, "INR")}`,
-    `📈 Rate: 1 USD = ₹${INR_PER_USD}`,
+    `💰 Display currency: <b>${preferredCurrency}</b>`,
+    `INR wallet: ${formatMoney(wallets.find((wallet) => wallet.currency === "INR")?.balanceMinor ?? 0, "INR")}`,
+    `USD wallet: ${formatMoney(wallets.find((wallet) => wallet.currency === "USD")?.balanceMinor ?? 0, "USD")}`,
+    `📊 Total value: <b>${formatDisplayAmount(totalInrMinor, preferredCurrency)}</b>`,
+    `📈 1 USD ≈ ₹${INR_PER_USD} · 1 ${preferredCurrency} ≈ ₹${(1 / (displayRatesInr[preferredCurrency] ?? 1)).toFixed(4)}`,
   ].join("\n");
 }
 
 async function changePlayerCurrency(
   playerId: number,
-  preferredCurrency: Currency,
+  preferredCurrency: DisplayCurrency,
 ): Promise<void> {
-  await ensureWallet(playerId, "INR");
-  await ensureWallet(playerId, "USD");
-  const wallets = await db
-    .select()
-    .from(casinoWalletsTable)
-    .where(eq(casinoWalletsTable.playerId, playerId));
-  const totalInrMinor = wallets.reduce(
-    (total, wallet) =>
-      total +
-      convertMinor(
-        wallet.balanceMinor,
-        parseCurrency(wallet.currency, "INR"),
-        "INR",
-      ),
-    0,
-  );
-  const targetMinor = convertMinor(totalInrMinor, "INR", preferredCurrency);
-  const otherCurrency = preferredCurrency === "INR" ? "USD" : "INR";
-  await db.transaction(async (tx) => {
-    await tx
-      .update(casinoWalletsTable)
-      .set({ balanceMinor: targetMinor, updatedAt: new Date() })
-      .where(
-        and(
-          eq(casinoWalletsTable.playerId, playerId),
-          eq(casinoWalletsTable.currency, preferredCurrency),
-        ),
-      );
-    await tx
-      .update(casinoWalletsTable)
-      .set({ balanceMinor: 0, updatedAt: new Date() })
-      .where(
-        and(
-          eq(casinoWalletsTable.playerId, playerId),
-          eq(casinoWalletsTable.currency, otherCurrency),
-        ),
-      );
-    await tx
-      .update(casinoPlayersTable)
-      .set({ preferredCurrency, updatedAt: new Date() })
-      .where(eq(casinoPlayersTable.id, playerId));
-  });
+  await db
+    .update(casinoPlayersTable)
+    .set({ preferredCurrency, updatedAt: new Date() })
+    .where(eq(casinoPlayersTable.id, playerId));
 }
 
 async function settleGame(input: {
@@ -2156,30 +2739,184 @@ function mainMenu(
     ],
     [
       { text: "Currency", callback_data: ownedCallback("main:currency", ownerTelegramUserId) },
+      { text: "Language", callback_data: ownedCallback("main:language", ownerTelegramUserId) },
+    ],
+    [
       { text: "Support", callback_data: ownedCallback("main:support", ownerTelegramUserId) },
+      { text: "🎁 Giveaways", callback_data: ownedCallback("main:giveaway", ownerTelegramUserId) },
+    ],
+    [
+      { text: "❔ How to play", callback_data: ownedCallback("main:how", ownerTelegramUserId) },
+      { text: "📜 Terms", callback_data: ownedCallback("main:terms", ownerTelegramUserId) },
     ],
   ];
   return { inline_keyboard: keyboard };
 }
 
+const BOT_LANGUAGES: Array<{ code: string; label: string; flag: string }> = [
+  { code: "en", label: "English", flag: "🇬🇧" },
+  { code: "hi", label: "हिन्दी", flag: "🇮🇳" },
+  { code: "es", label: "Español", flag: "🇪🇸" },
+  { code: "ru", label: "Русский", flag: "🇷🇺" },
+  { code: "bn", label: "বাংলা", flag: "🇧🇩" },
+  { code: "ar", label: "العربية", flag: "🇸🇦" },
+  { code: "ta", label: "தமிழ்", flag: "🇮🇳" },
+  { code: "te", label: "తెలుగు", flag: "🇮🇳" },
+];
+
+const MAIN_BOT_COMMANDS = [
+  ["start", "Open the RolexCasino menu"],
+  ["help", "Show all bot commands"],
+  ["wallet", "View wallet balances"],
+  ["deposit", "Deposit funds privately"],
+  ["withdraw", "Withdraw funds privately"],
+  ["games", "View available games"],
+  ["dice", "Play Dice"],
+  ["slots", "Play Slots"],
+  ["darts", "Play Darts"],
+  ["coin", "Play Coin Flip"],
+  ["7up", "Play 7 Up"],
+  ["limbo", "Play Limbo"],
+  ["mines", "Play Mines"],
+  ["blackjack", "Play Blackjack"],
+  ["pvp", "Create a player battle"],
+  ["pvb", "Create a bot battle"],
+  ["global", "Global wager leaderboard"],
+  ["weekly", "Weekly wager leaderboard"],
+  ["monthly", "Monthly wager leaderboard"],
+  ["rank", "Show global rankings"],
+  ["stats", "View your stats"],
+  ["refer", "View referral rewards"],
+  ["daily", "View daily bonus"],
+  ["weeklybonus", "View weekly bonus"],
+  ["giveaway", "View latest giveaway"],
+  ["join", "Join latest giveaway"],
+  ["rates", "View live currency rates"],
+  ["currency", "Choose display currency"],
+  ["language", "Choose bot language"],
+  ["support", "Contact support"],
+].map(([command, description]) => ({ command, description }));
+
+async function sendCurrencyRates(bot: TelegramBot, chatId: number): Promise<void> {
+  await refreshDisplayRates();
+  const lines = DISPLAY_CURRENCIES.map((item) => {
+    const inrPerUnit = 1 / (displayRatesInr[item.code] ?? 1);
+    const usdPerUnit = inrPerUnit / INR_PER_USD;
+    return `<b>${item.code}</b> — 1 ${item.code} ≈ ₹${inrPerUnit.toFixed(item.code === "IDR" ? 4 : 2)} / $${usdPerUnit.toFixed(4)}`;
+  });
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>💱 LIVE CURRENCY RATES</b>",
+      "",
+      "Reference: 1 unit of each currency compared with INR and USD.",
+      "",
+      ...lines,
+      "",
+      "<i>Rates refresh automatically every hour.</i>",
+    ].join("\n"),
+  );
+}
+
+function languageKeyboard(
+  selectedLanguage: string,
+  ownerTelegramUserId: number,
+): { inline_keyboard: InlineKeyboardButton[][] } {
+  const rows: InlineKeyboardButton[][] = [];
+  for (let index = 0; index < BOT_LANGUAGES.length; index += 2) {
+    rows.push(
+      BOT_LANGUAGES.slice(index, index + 2).map((language) => ({
+        text: `${language.flag} ${language.label}${selectedLanguage === language.code ? " ✓" : ""}`,
+        callback_data: ownedCallback(`language:set:${language.code}`, ownerTelegramUserId),
+      })),
+    );
+  }
+  return { inline_keyboard: rows };
+}
+
 function currencyKeyboard(
-  preferredCurrency: Currency,
+  preferredCurrency: DisplayCurrency,
   ownerTelegramUserId: number,
 ): {
   inline_keyboard: InlineKeyboardButton[][];
 } {
+  const rows: InlineKeyboardButton[][] = [];
+  for (let index = 0; index < DISPLAY_CURRENCIES.length; index += 3) {
+    rows.push(
+      DISPLAY_CURRENCIES.slice(index, index + 3).map((item) => ({
+        text: `${item.flag} ${item.code}${preferredCurrency === item.code ? " ✅" : ""}`,
+        callback_data: ownedCallback(`currency:set:${item.code}`, ownerTelegramUserId),
+      })),
+    );
+  }
   return {
-    inline_keyboard: [[
-      {
-        text: `🇮🇳 INR ${preferredCurrency === "INR" ? "✓" : ""}`,
-        callback_data: ownedCallback("currency:set:INR", ownerTelegramUserId),
-      },
-      {
-        text: `🇺🇸 USD ${preferredCurrency === "USD" ? "✓" : ""}`,
-        callback_data: ownedCallback("currency:set:USD", ownerTelegramUserId),
-      },
-    ]],
+    inline_keyboard: rows,
   };
+}
+
+function currencyMenuText(
+  currency: DisplayCurrency,
+  balance?: string,
+): string {
+  return [
+    `<b>🔄 Display Currency — ${currency}</b>`,
+    `✅ Selected: <b>${currency}</b>`,
+    "",
+    "Choose the currency shown for your wallet and new bets.",
+    "INR and USD remain the only settlement wallets; other currencies are display-only.",
+    "",
+    balance ?? "",
+  ].filter(Boolean).join("\n");
+}
+
+async function openCurrencyMenu(
+  bot: TelegramBot,
+  chatId: number,
+  player: typeof casinoPlayersTable.$inferSelect,
+  currency: DisplayCurrency,
+  messageId?: number,
+): Promise<void> {
+  const keyboard = currencyKeyboard(currency, player.telegramUserId);
+  const text = currencyMenuText(currency, await balanceText(player.id, currency));
+  if (isPrivateChat({ id: chatId, type: "private" })) {
+    if (messageId) {
+      await bot.editMessageText(chatId, messageId, text, keyboard);
+      currencyMenuMessages.set(player.telegramUserId, { chatId, messageId });
+      return;
+    }
+    const sent = await bot.sendMessage(chatId, text, keyboard);
+    currencyMenuMessages.set(player.telegramUserId, {
+      chatId,
+      messageId: sent.message_id,
+    });
+    return;
+  }
+
+  const existing = currencyMenuMessages.get(player.telegramUserId);
+  if (existing) {
+    try {
+      await bot.editMessageText(existing.chatId, existing.messageId, text, keyboard);
+      return;
+    } catch (error) {
+      logger.debug(
+        { err: error, userId: player.telegramUserId },
+        "Currency DM menu was not editable; creating a replacement",
+      );
+      currencyMenuMessages.delete(player.telegramUserId);
+    }
+  }
+  try {
+    const sent = await bot.sendMessage(player.telegramUserId, text, keyboard);
+    currencyMenuMessages.set(player.telegramUserId, {
+      chatId: player.telegramUserId,
+      messageId: sent.message_id,
+    });
+  } catch (error) {
+    logger.warn(
+      { err: error, userId: player.telegramUserId },
+      "Could not deliver currency menu in private chat",
+    );
+  }
 }
 
 async function sendMainWelcome(
@@ -2227,12 +2964,21 @@ async function sendMainHelp(
       "<b>/deposit</b> — fund your wallet privately",
       "<b>/withdraw</b> — request a payout privately",
       "<b>/currency</b> — switch INR/USD display",
+      "<b>/rates</b> — compare all supported currencies with INR and USD",
+      "<b>/language</b> — choose English, हिन्दी, Español, Русский, বাংলা, العربية, தமிழ், or తెలుగు",
       "<b>/setwallet</b> — save a payout destination",
       "<b>/refer</b> — get your verified referral link and rewards",
       "<b>/daily</b> — check your bot-selected daily bonus result",
-      "<b>/weekly</b> — check your bot-selected weekly bonus result",
+      "<b>/weeklybonus</b> — check your bot-selected weekly bonus result",
+      "<b>/global</b> — all-time top 10 by wager",
+      "<b>/weekly</b> — top 10 by wager in the last 7 days",
+      "<b>/monthly</b> — top 10 by wager in the last 30 days",
+      "<b>/giveaway</b> — see the latest giveaway and giveaway-bot commands",
       "<b>/mygames</b> — view your latest 10 rounds",
       "<b>/stats</b> — view your performance card",
+      "",
+      "<b>Games:</b> /dice /slots /darts /basket /bowling /football /basketball /coin /roul /7up /limbo /mines /minesauto /blackjack",
+      "<b>Battles:</b> use a game command with <b>pvp</b> or <b>pvb</b>, for example <code>/dice pvp 1d1w 10 USD</code>.",
       "",
       `<b>Game minimums:</b> Dice ${diceMinimum}; Slots ${slotsMinimum}. Use /games for every game.`,
       "<b>Battle format:</b> 1d1w, 2d2w, or 3d3w = game emojis per round and round wins. Add <b>crazy</b> for lowest-score-wins.",
@@ -2243,8 +2989,44 @@ async function sendMainHelp(
       inline_keyboard: [[
         { text: "🎮 Games", callback_data: ownedCallback("main:games", ownerTelegramUserId) },
         { text: "🎧 Support", callback_data: ownedCallback("main:support", ownerTelegramUserId) },
+      ], [
+        { text: "❔ How to play", callback_data: ownedCallback("main:how", ownerTelegramUserId) },
+        { text: "📜 Terms", callback_data: ownedCallback("main:terms", ownerTelegramUserId) },
       ]],
     },
+  );
+}
+
+async function sendHowToPlay(bot: TelegramBot, chatId: number): Promise<void> {
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>❔ HOW TO PLAY</b>",
+      "",
+      "<b>1.</b> Fund your wallet privately with /deposit or receive a verified CC Wallet tip.",
+      "<b>2.</b> Open /games and choose a supported game in the official RolexCasino group.",
+      "<b>3.</b> Use a supported amount and currency, then follow the game buttons or prompts.",
+      "<b>4.</b> Payouts and wager progress are settled automatically. Use /wagerstatus for your card.",
+      "<b>5.</b> For PVP, reply to a player. For PVB, choose the bot mode where available.",
+      "",
+      "<b>Fairness:</b> Every completed result includes a Fair ID that can be checked with /fair.",
+    ].join("\n"),
+  );
+}
+
+async function sendGameTerms(bot: TelegramBot, chatId: number): Promise<void> {
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>📜 ROLEXCASINO TERMS</b>",
+      "",
+      "<b>•</b> Games are available only in the official RolexCasino group.",
+      "<b>•</b> Never share your wallet destination, screenshots, or private account details in public chats.",
+      "<b>•</b> A withdrawal may remain locked until the displayed 1× wagering requirement is complete.",
+      "<b>•</b> Results are final after settlement. Duplicate, replayed, or invalid game messages are rejected.",
+      "<b>•</b> PVP/PVB rooms must be completed before stakes are settled; expired rooms follow the displayed cancellation rules.",
+      "<b>•</b> Play responsibly and only use funds you can afford to lose.",
+    ].join("\n"),
   );
 }
 
@@ -2267,7 +3049,7 @@ async function sendProfile(
       "",
       await balanceText(
         player.id,
-        parseCurrency(player.preferredCurrency, "USD"),
+        parseDisplayCurrency(player.preferredCurrency, "USD"),
       ),
     ].join("\n"),
   );
@@ -2310,7 +3092,7 @@ async function sendWallet(
     [
       "<b>🏦 Your Wallet</b>",
       "",
-      await balanceText(player.id, parseCurrency(player.preferredCurrency, "USD")),
+      await balanceText(player.id, parseDisplayCurrency(player.preferredCurrency, "USD")),
       "",
       `👨‍💻 Payout wallet: ${maskPayoutWallet(player.payoutWallet)}`,
       "⚠️ Promo Lock: wagering must be completed before withdrawal.",
@@ -2318,7 +3100,7 @@ async function sendWallet(
       "Minimum withdrawal: ₹100 or $1.00",
     ].join("\n"),
     currencyKeyboard(
-      parseCurrency(player.preferredCurrency, "USD"),
+      parseDisplayCurrency(player.preferredCurrency, "USD"),
       player.telegramUserId,
     ),
   );
@@ -2354,12 +3136,23 @@ async function sendMyStats(
   const winRate = currencyStats.rounds
     ? Math.round((currencyStats.wins / currencyStats.rounds) * 100)
     : 0;
+  const lossRate = currencyStats.rounds
+    ? Math.round((currencyStats.losses / currencyStats.rounds) * 100)
+    : 0;
+  const gameTypes = [...new Set([
+    ...rounds
+      .filter((round) => round.currency === currency)
+      .map((round) => round.gameType.toUpperCase()),
+    ...battles
+      .filter((battle) => battle.currency === currency)
+      .map((battle) => battle.gameType.toUpperCase()),
+  ])].sort().join(", ") || "—";
   const joined = new Intl.DateTimeFormat("en-IN", {
     dateStyle: "medium",
     timeZone: "Asia/Kolkata",
   }).format(new Date(player.createdAt));
   const image = await statsCardPng({
-    name: player.displayName,
+    name: player.username ? `@${player.username}` : player.displayName,
     joined,
     currency,
     totalWager: formatMoney(currencyStats.wagerMinor, currency),
@@ -2367,11 +3160,13 @@ async function sendMyStats(
     category: stats.category,
     rounds: currencyStats.rounds,
     winRate,
+    lossRate,
+    gameTypes,
   });
   await bot.sendPhoto(
     chatId,
     image,
-    `📊 ${player.displayName} · ${stats.category} · Total wager ${formatMoney(currencyStats.wagerMinor, currency)}`,
+    `📊 ${player.username ? `@${player.username}` : player.displayName} · ${stats.category} · Total wager ${formatMoney(currencyStats.wagerMinor, currency)}`,
   );
 }
 
@@ -2384,6 +3179,8 @@ type StatsCardData = {
   category: string;
   rounds: number;
   winRate: number;
+  lossRate: number;
+  gameTypes: string;
 };
 
 function escapeXml(value: string): string {
@@ -2397,6 +3194,12 @@ function escapeXml(value: string): string {
     };
     return entities[character] ?? character;
   });
+}
+
+function svgLabel(value: string, maxLength = 24): string {
+  return value.length > maxLength
+    ? `${value.slice(0, Math.max(1, maxLength - 1))}…`
+    : value;
 }
 
 function statsCardSvg(data: StatsCardData): string {
@@ -2414,23 +3217,23 @@ function statsCardSvg(data: StatsCardData): string {
   <circle cx="1040" cy="90" r="190" fill="#3b82f6" opacity=".12"/>
   <circle cx="112" cy="670" r="220" fill="#f59e0b" opacity=".08"/>
   <rect x="42" y="42" width="1116" height="636" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
-  <text x="86" y="112" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
-  <text x="86" y="184" fill="#ffffff" font-size="46" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.name)}</text>
-  <text x="86" y="226" fill="#9db0cb" font-size="23" font-family="DejaVu Sans, sans-serif">PLAYER STATISTICS</text>
-  <rect x="900" y="92" width="180" height="62" rx="31" fill="${categoryColor}" fill-opacity=".18" stroke="${categoryColor}" stroke-opacity=".8"/>
-  <text x="990" y="132" text-anchor="middle" fill="${categoryColor}" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.category)}</text>
-  <text x="86" y="286" fill="#8da2bd" font-size="21" font-family="DejaVu Sans, sans-serif">JOINED</text>
-  <text x="86" y="323" fill="#ffffff" font-size="27" font-family="DejaVu Sans, sans-serif">${escapeXml(data.joined)}</text>
+  <text x="86" y="112" fill="#f6c453" font-size="28" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="184" fill="#ffffff" font-size="54" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(data.name, 22))}</text>
+  <text x="86" y="226" fill="#9db0cb" font-size="25" font-family="DejaVu Sans, sans-serif" letter-spacing="2">PLAYER PROFILE · PERFORMANCE</text>
+  <rect x="900" y="88" width="205" height="70" rx="35" fill="${categoryColor}" fill-opacity=".18" stroke="${categoryColor}" stroke-opacity=".8" stroke-width="2"/>
+  <text x="1002" y="133" text-anchor="middle" fill="${categoryColor}" font-size="28" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.category)}</text>
+  <text x="86" y="286" fill="#8da2bd" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">MEMBER SINCE</text>
+  <text x="86" y="326" fill="#ffffff" font-size="30" font-family="DejaVu Sans, sans-serif">${escapeXml(data.joined)}</text>
   <line x1="86" y1="362" x2="1114" y2="362" stroke="#ffffff" stroke-opacity=".14"/>
-  <text x="86" y="416" fill="#8da2bd" font-size="20" font-family="DejaVu Sans, sans-serif">TOTAL WAGER (${data.currency})</text>
-  <text x="86" y="466" fill="url(#accent)" font-size="42" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.totalWager)}</text>
-  <text x="650" y="416" fill="#8da2bd" font-size="20" font-family="DejaVu Sans, sans-serif">TOTAL PROFIT (${data.currency})</text>
-  <text x="650" y="466" fill="#76e3a3" font-size="42" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.totalProfit)}</text>
-  <text x="86" y="548" fill="#8da2bd" font-size="20" font-family="DejaVu Sans, sans-serif">ROUNDS PLAYED</text>
-  <text x="86" y="588" fill="#ffffff" font-size="29" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.rounds}</text>
-  <text x="650" y="548" fill="#8da2bd" font-size="20" font-family="DejaVu Sans, sans-serif">WIN RATE</text>
-  <text x="650" y="588" fill="#ffffff" font-size="29" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.winRate}%</text>
-  <text x="86" y="640" fill="#7185a3" font-size="17" font-family="DejaVu Sans, sans-serif">VIP category starts at ₹1,00,000 total wager equivalent.</text>
+  <rect x="70" y="382" width="500" height="180" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <rect x="626" y="382" width="500" height="180" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="104" y="428" fill="#8da2bd" font-size="22" font-family="DejaVu Sans, sans-serif" font-weight="bold">TOTAL WAGER · ${data.currency}</text>
+  <text x="104" y="492" fill="url(#accent)" font-size="48" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.totalWager)}</text>
+  <text x="660" y="428" fill="#8da2bd" font-size="22" font-family="DejaVu Sans, sans-serif" font-weight="bold">TOTAL PROFIT · ${data.currency}</text>
+  <text x="660" y="492" fill="#76e3a3" font-size="48" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.totalProfit)}</text>
+  <text x="104" y="542" fill="#8da2bd" font-size="21" font-family="DejaVu Sans, sans-serif">MATCHES <tspan fill="#ffffff" font-size="30" font-weight="bold">${data.rounds}</tspan> · WIN <tspan fill="#76e3a3" font-size="30" font-weight="bold">${data.winRate}%</tspan> · LOSS <tspan fill="#ff8d9b" font-size="30" font-weight="bold">${data.lossRate}%</tspan></text>
+  <text x="104" y="600" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif">GAME TYPES · <tspan fill="#ffffff">${escapeXml(svgLabel(data.gameTypes, 76))}</tspan></text>
+  <text x="86" y="640" fill="#7185a3" font-size="18" font-family="DejaVu Sans, sans-serif">VIP category starts at ₹1,00,000 total wager equivalent · RolexCasino player profile</text>
 </svg>`;
 }
 
@@ -2450,6 +3253,82 @@ async function statsCardPng(data: StatsCardData): Promise<Buffer> {
       }
     });
     process.stdin.end(statsCardSvg(data));
+  });
+}
+
+type WagerStatusCardData = {
+  name: string;
+  currency: Currency;
+  required: string;
+  completed: string;
+  remaining: string;
+  progressPercent: number;
+  isComplete: boolean;
+};
+
+function wagerStatusCardSvg(data: WagerStatusCardData): string {
+  const statusColor = data.isComplete ? "#76e3a3" : "#f6c453";
+  const progressWidth = Math.round(880 * (data.progressPercent / 100));
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <defs>
+    <linearGradient id="wager-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1428"/><stop offset="1" stop-color="#1a2d4d"/>
+    </linearGradient>
+    <linearGradient id="wager-gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e6ad42"/><stop offset="1" stop-color="#ffe7a5"/>
+    </linearGradient>
+    <linearGradient id="wager-progress" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#d99b32"/><stop offset="1" stop-color="${statusColor}"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="760" rx="44" fill="url(#wager-bg)"/>
+  <circle cx="1060" cy="86" r="210" fill="#f6c453" opacity=".09"/>
+  <circle cx="82" cy="710" r="230" fill="#3b82f6" opacity=".11"/>
+  <rect x="38" y="38" width="1124" height="684" rx="34" fill="none" stroke="#ffffff" stroke-opacity=".15"/>
+  <text x="84" y="112" fill="#f6c453" font-size="28" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="84" y="184" fill="#ffffff" font-size="54" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(data.name, 24))}</text>
+  <text x="84" y="226" fill="#9db0cb" font-size="24" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="2">WITHDRAWAL WAGER STATUS · ${data.currency}</text>
+  <rect x="906" y="88" width="208" height="72" rx="36" fill="${statusColor}" fill-opacity=".16" stroke="${statusColor}" stroke-opacity=".9" stroke-width="2"/>
+  <text x="1010" y="134" text-anchor="middle" fill="${statusColor}" font-size="26" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.isComplete ? "COMPLETE" : `${data.progressPercent}% DONE`}</text>
+  <line x1="84" y1="278" x2="1116" y2="278" stroke="#ffffff" stroke-opacity=".14"/>
+  <rect x="72" y="312" width="1056" height="152" rx="26" fill="#ffffff" fill-opacity=".05" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="108" y="358" fill="#8da2bd" font-size="22" font-family="DejaVu Sans, sans-serif" font-weight="bold">PROGRESS</text>
+  <rect x="108" y="386" width="880" height="28" rx="14" fill="#07101f" stroke="#ffffff" stroke-opacity=".12"/>
+  <rect x="108" y="386" width="${progressWidth}" height="28" rx="14" fill="url(#wager-progress)"/>
+  <text x="1020" y="409" text-anchor="end" fill="#ffffff" font-size="24" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.progressPercent}%</text>
+  <rect x="72" y="500" width="324" height="142" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <rect x="438" y="500" width="324" height="142" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <rect x="804" y="500" width="324" height="142" rx="24" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="108" y="544" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">REQUIRED · 1×</text>
+  <text x="108" y="600" fill="url(#wager-gold)" font-size="34" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.required)}</text>
+  <text x="474" y="544" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">COMPLETED</text>
+  <text x="474" y="600" fill="#76e3a3" font-size="34" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.completed)}</text>
+  <text x="840" y="544" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">REMAINING</text>
+  <text x="840" y="600" fill="${statusColor}" font-size="34" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.remaining)}</text>
+  <text x="84" y="690" fill="#7185a3" font-size="18" font-family="DejaVu Sans, sans-serif">${data.isComplete ? "Your wallet is eligible for withdrawal review." : "Play eligible casino rounds to complete the requirement before withdrawal."}</text>
+</svg>`;
+}
+
+async function wagerStatusCardPng(data: WagerStatusCardData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(
+          new Error(
+            `Could not render wager status image: ${Buffer.concat(errors).toString("utf8")}`,
+          ),
+        );
+      }
+    });
+    process.stdin.end(wagerStatusCardSvg(data));
   });
 }
 
@@ -2474,13 +3353,13 @@ function gameHistoryCardSvg(
             ? "#f6c453"
             : "#ff8291";
       const date = new Date(round.createdAt).toLocaleDateString("en-IN");
-      const y = 230 + index * 64;
+      const y = 305 + index * 58;
       return [
-        `<text x="70" y="${y}" fill="#ffffff" font-size="22" font-family="DejaVu Sans, sans-serif">${index + 1}. ${escapeXml(round.gameType.toUpperCase())}</text>`,
-        `<text x="330" y="${y}" fill="#a9bad2" font-size="20" font-family="DejaVu Sans, sans-serif">${escapeXml(round.currency)} ${escapeXml(formatMoney(round.stakeMinor, round.currency as Currency))}</text>`,
-        `<text x="580" y="${y}" fill="${color}" font-size="21" font-family="DejaVu Sans, sans-serif" font-weight="bold">${round.outcome}</text>`,
-        `<text x="710" y="${y}" fill="#a9bad2" font-size="18" font-family="DejaVu Sans, sans-serif">${escapeXml(date)}</text>`,
-        `<line x1="70" y1="${y + 18}" x2="1110" y2="${y + 18}" stroke="#ffffff" stroke-opacity=".08"/>`,
+        `<rect x="56" y="${y - 34}" width="1088" height="48" rx="16" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".08"/>`,
+        `<text x="82" y="${y}" fill="#ffffff" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold">${index + 1}. ${escapeXml(svgLabel(round.gameType.toUpperCase(), 12))}</text>`,
+        `<text x="350" y="${y}" fill="#c5d3e6" font-size="23" font-family="DejaVu Sans, sans-serif">${escapeXml(round.currency)} ${escapeXml(formatMoney(round.stakeMinor, round.currency as Currency))}</text>`,
+        `<text x="610" y="${y}" fill="${color}" font-size="24" font-family="DejaVu Sans, sans-serif" font-weight="bold">${round.outcome}</text>`,
+        `<text x="790" y="${y}" fill="#c5d3e6" font-size="21" font-family="DejaVu Sans, sans-serif">${escapeXml(date)}</text>`,
       ].join("");
     })
     .join("");
@@ -2491,12 +3370,12 @@ function gameHistoryCardSvg(
   <rect width="1200" height="920" rx="42" fill="url(#historyBg)"/>
   <rect x="42" y="42" width="1116" height="836" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
   <text x="70" y="105" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="4">ROLEXCASINO</text>
-  <text x="70" y="164" fill="#ffffff" font-size="38" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(name)}</text>
-  <text x="70" y="202" fill="#9db0cb" font-size="20" font-family="DejaVu Sans, sans-serif">LATEST 10 GAME RESULTS</text>
-  <text x="70" y="245" fill="#8da2bd" font-size="17" font-family="DejaVu Sans, sans-serif">GAME</text>
-  <text x="330" y="245" fill="#8da2bd" font-size="17" font-family="DejaVu Sans, sans-serif">STAKE</text>
-  <text x="580" y="245" fill="#8da2bd" font-size="17" font-family="DejaVu Sans, sans-serif">RESULT</text>
-  <text x="710" y="245" fill="#8da2bd" font-size="17" font-family="DejaVu Sans, sans-serif">DATE</text>
+  <text x="70" y="164" fill="#ffffff" font-size="48" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(name, 24))}</text>
+  <text x="70" y="207" fill="#9db0cb" font-size="23" font-family="DejaVu Sans, sans-serif" letter-spacing="2">LATEST 10 GAME RESULTS</text>
+  <text x="82" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">GAME</text>
+  <text x="350" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">STAKE</text>
+  <text x="610" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">RESULT</text>
+  <text x="790" y="270" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">DATE</text>
   ${rows}
 </svg>`;
 }
@@ -2535,13 +3414,13 @@ function referralLeaderboardSvg(
 ): string {
   const rows = items.length > 0
     ? items.map((item, index) => {
-        const y = 250 + index * 58;
+        const y = 286 + index * 50;
         return [
-          `<text x="78" y="${y}" fill="#f6c453" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.rank}</text>`,
-          `<text x="150" y="${y}" fill="#ffffff" font-size="23" font-family="DejaVu Sans, sans-serif">${escapeXml(item.name)}</text>`,
-          `<text x="780" y="${y}" text-anchor="end" fill="#76e3a3" font-size="23" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.referrals}</text>`,
-          `<text x="1080" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="21" font-family="DejaVu Sans, sans-serif">${escapeXml(item.earnings)}</text>`,
-          `<line x1="78" y1="${y + 19}" x2="1080" y2="${y + 19}" stroke="#ffffff" stroke-opacity=".08"/>`,
+          `<rect x="60" y="${y - 32}" width="1080" height="42" rx="14" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".08"/>`,
+          `<text x="86" y="${y}" fill="#f6c453" font-size="27" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.rank}</text>`,
+          `<text x="165" y="${y}" fill="#ffffff" font-size="27" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(item.name, 25))}</text>`,
+          `<text x="800" y="${y}" text-anchor="end" fill="#76e3a3" font-size="26" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.referrals}</text>`,
+          `<text x="1100" y="${y}" text-anchor="end" fill="#dbe7f5" font-size="24" font-family="DejaVu Sans, sans-serif">${escapeXml(item.earnings)}</text>`,
         ].join("");
       }).join("")
     : `<text x="600" y="330" text-anchor="middle" fill="#a9bad2" font-size="25" font-family="DejaVu Sans, sans-serif">No verified referrals yet</text>`;
@@ -2554,11 +3433,11 @@ function referralLeaderboardSvg(
   <circle cx="90" cy="820" r="210" fill="#2563eb" opacity=".11"/>
   <rect x="42" y="42" width="1116" height="816" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
   <text x="78" y="112" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
-  <text x="78" y="174" fill="#ffffff" font-size="40" font-family="DejaVu Sans, sans-serif" font-weight="bold">REFERRAL LEADERBOARD</text>
-  <text x="78" y="214" fill="#9db0cb" font-size="20" font-family="DejaVu Sans, sans-serif">VERIFIED INVITES · TOP 10 PLAYERS</text>
-  <text x="150" y="236" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif">PLAYER</text>
-  <text x="780" y="236" text-anchor="end" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif">REFERRALS</text>
-  <text x="1080" y="236" text-anchor="end" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif">EARNED (INR)</text>
+  <text x="78" y="174" fill="#ffffff" font-size="46" font-family="DejaVu Sans, sans-serif" font-weight="bold">REFERRAL LEADERBOARD</text>
+  <text x="78" y="214" fill="#9db0cb" font-size="23" font-family="DejaVu Sans, sans-serif" letter-spacing="2">VERIFIED INVITES · TOP 10 PLAYERS</text>
+  <text x="165" y="252" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">PLAYER</text>
+  <text x="800" y="252" text-anchor="end" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">REFERRALS</text>
+  <text x="1100" y="252" text-anchor="end" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">EARNED (INR)</text>
   ${rows}
   <text x="78" y="825" fill="#7185a3" font-size="17" font-family="DejaVu Sans, sans-serif">A referral is verified when a new player opens the bot from a referral link.</text>
 </svg>`;
@@ -2782,13 +3661,14 @@ type JackpotCardData = {
 
 function jackpotCardSvg(data: JackpotCardData): string {
   const rows = data.participants
-    .slice(0, 12)
+    .slice(0, 10)
     .map((participant, index) => {
-      const y = 410 + index * 30;
+      const y = 425 + index * 35;
       return [
-        `<text x="92" y="${y}" fill="#ffffff" font-size="18" font-family="DejaVu Sans, sans-serif">${index + 1}. ${escapeXml(participant.username)}</text>`,
-        `<text x="710" y="${y}" text-anchor="end" fill="#f6c453" font-size="17" font-family="DejaVu Sans, sans-serif">${escapeXml(formatMoney(participant.contributionMinor, data.currency))}</text>`,
-        `<text x="1088" y="${y}" text-anchor="end" fill="#76e3a3" font-size="17" font-family="DejaVu Sans, sans-serif" font-weight="bold">${participant.chancePercent.toFixed(1)}%</text>`,
+        `<rect x="74" y="${y - 27}" width="1052" height="38" rx="13" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".08"/>`,
+        `<text x="98" y="${y}" fill="#ffffff" font-size="22" font-family="DejaVu Sans, sans-serif" font-weight="bold">${index + 1}. ${escapeXml(participant.username)}</text>`,
+        `<text x="720" y="${y}" text-anchor="end" fill="#f6c453" font-size="21" font-family="DejaVu Sans, sans-serif">${escapeXml(formatMoney(participant.contributionMinor, data.currency))}</text>`,
+        `<text x="1095" y="${y}" text-anchor="end" fill="#76e3a3" font-size="21" font-family="DejaVu Sans, sans-serif" font-weight="bold">${participant.chancePercent.toFixed(1)}%</text>`,
       ].join("");
     })
     .join("");
@@ -2809,18 +3689,19 @@ function jackpotCardSvg(data: JackpotCardData): string {
   <circle cx="90" cy="790" r="200" fill="#7c3aed" opacity=".14"/>
   <rect x="42" y="42" width="1116" height="776" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".14"/>
   <text x="86" y="108" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
-  <text x="86" y="172" fill="#ffffff" font-size="42" font-family="DejaVu Sans, sans-serif" font-weight="bold">💰 ${data.currency} DAILY JACKPOT</text>
-  <text x="86" y="218" fill="#9db0cb" font-size="20" font-family="DejaVu Sans, sans-serif">BOT-SELECTED WINNER · CONTRIBUTION-WEIGHTED CHANCES</text>
-  <text x="86" y="274" fill="#8da2bd" font-size="18" font-family="DejaVu Sans, sans-serif">CURRENT POOL</text>
-  <text x="86" y="320" fill="url(#jackpot-gold)" font-size="38" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.pool)}</text>
-  <text x="480" y="274" fill="#8da2bd" font-size="18" font-family="DejaVu Sans, sans-serif">TOTAL CONTRIBUTION</text>
-  <text x="480" y="320" fill="#ffffff" font-size="28" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.totalContribution)}</text>
-  <text x="850" y="274" fill="#8da2bd" font-size="18" font-family="DejaVu Sans, sans-serif">PLAYERS</text>
-  <text x="850" y="320" fill="#ffffff" font-size="28" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.participantCount}</text>
+  <text x="86" y="172" fill="#ffffff" font-size="46" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.currency} DAILY JACKPOT</text>
+  <text x="86" y="218" fill="#9db0cb" font-size="22" font-family="DejaVu Sans, sans-serif" letter-spacing="1">BOT-SELECTED WINNER · CONTRIBUTION-WEIGHTED CHANCES</text>
+  <rect x="70" y="242" width="430" height="100" rx="22" fill="#f6c453" fill-opacity=".08" stroke="#f6c453" stroke-opacity=".35"/>
+  <text x="96" y="278" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">CURRENT POOL</text>
+  <text x="96" y="322" fill="url(#jackpot-gold)" font-size="43" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.pool)}</text>
+  <text x="560" y="274" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">TOTAL CONTRIBUTION</text>
+  <text x="560" y="320" fill="#ffffff" font-size="31" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(data.totalContribution)}</text>
+  <text x="900" y="274" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">PLAYERS</text>
+  <text x="900" y="320" fill="#ffffff" font-size="31" font-family="DejaVu Sans, sans-serif" font-weight="bold">${data.participantCount}</text>
   <line x1="86" y1="344" x2="1114" y2="344" stroke="#ffffff" stroke-opacity=".14"/>
-  <text x="92" y="382" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif" font-weight="bold">JOINED USERNAME</text>
-  <text x="710" y="382" text-anchor="end" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif" font-weight="bold">CONTRIBUTION</text>
-  <text x="1088" y="382" text-anchor="end" fill="#8da2bd" font-size="16" font-family="DejaVu Sans, sans-serif" font-weight="bold">WIN CHANCE</text>
+  <text x="98" y="390" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">JOINED USERNAME</text>
+  <text x="720" y="390" text-anchor="end" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">CONTRIBUTION</text>
+  <text x="1095" y="390" text-anchor="end" fill="#8da2bd" font-size="19" font-family="DejaVu Sans, sans-serif" font-weight="bold">WIN CHANCE</text>
   ${rows}
   <text x="92" y="780" fill="#9db0cb" font-size="17" font-family="DejaVu Sans, sans-serif">${escapeXml(footer)}</text>
   <text x="92" y="805" fill="#7185a3" font-size="15" font-family="DejaVu Sans, sans-serif">Every eligible bet adds 0.5%. The winner is chosen by the bot at the scheduled draw.</text>
@@ -3070,32 +3951,45 @@ async function sendWagerStatus(
   playerId: number,
   currency: Currency,
 ): Promise<void> {
-  const [requirement] = await db
-    .select()
-    .from(casinoWagerRequirementsTable)
-    .where(
-      and(
-        eq(casinoWagerRequirementsTable.playerId, playerId),
-        eq(casinoWagerRequirementsTable.currency, currency),
-      ),
-    )
-    .limit(1);
+  const [[requirement], [player]] = await Promise.all([
+    db
+      .select()
+      .from(casinoWagerRequirementsTable)
+      .where(
+        and(
+          eq(casinoWagerRequirementsTable.playerId, playerId),
+          eq(casinoWagerRequirementsTable.currency, currency),
+        ),
+      )
+      .limit(1),
+    db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.id, playerId))
+      .limit(1),
+  ]);
   const remaining = requirement
     ? Math.max(0, requirement.requiredMinor - requirement.completedMinor)
     : 0;
-  await bot.sendMessage(
+  const requiredMinor = requirement?.requiredMinor ?? 0;
+  const completedMinor = requirement?.completedMinor ?? 0;
+  const progressPercent =
+    requiredMinor > 0
+      ? Math.min(100, Math.round((completedMinor / requiredMinor) * 100))
+      : 100;
+  const image = await wagerStatusCardPng({
+    name: player?.username ? `@${player.username}` : player?.displayName ?? "Player",
+    currency,
+    required: formatMoney(requiredMinor, currency),
+    completed: formatMoney(completedMinor, currency),
+    remaining: formatMoney(remaining, currency),
+    progressPercent,
+    isComplete: remaining <= 0,
+  });
+  await bot.sendPhoto(
     chatId,
-    [
-      "🎯 Wager status",
-      "",
-      `Currency: ${currency}`,
-      `Required: ${formatMoney(requirement?.requiredMinor ?? 0, currency)}`,
-      `Completed: ${formatMoney(requirement?.completedMinor ?? 0, currency)}`,
-      `Remaining: ${formatMoney(remaining, currency)}`,
-      remaining > 0
-        ? "Complete gameplay wagering before requesting a withdrawal."
-        : "No active wagering restriction for this currency.",
-    ].join("\n"),
+    image,
+    `<b>🎯 WAGER STATUS · ${currency}</b>\n${remaining > 0 ? "Complete gameplay wagering before requesting a withdrawal." : "No active wagering restriction for this currency."}`,
   );
 }
 
@@ -3397,17 +4291,19 @@ function escrowCardSvg(data: EscrowCardData): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
   <defs><linearGradient id="felt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#061d25"/><stop offset="1" stop-color="#123d3b"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#bb8a2d"/><stop offset=".5" stop-color="#ffe9a2"/><stop offset="1" stop-color="#c99b3b"/></linearGradient></defs>
   <rect width="1200" height="720" rx="42" fill="url(#felt)"/><circle cx="1060" cy="80" r="230" fill="#d0a848" opacity=".08"/><circle cx="120" cy="680" r="250" fill="#4fd1c5" opacity=".07"/><rect x="38" y="38" width="1124" height="644" rx="30" fill="none" stroke="#d9b55c" stroke-opacity=".42" stroke-width="2"/>
-  <text x="78" y="104" fill="#f5d477" font-size="24" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text>
-  <text x="78" y="166" fill="#fff" font-size="43" font-family="DejaVu Sans" font-weight="bold">SECURE ESCROW</text>
-  <rect x="78" y="202" width="350" height="70" rx="35" fill="#d9b55c" fill-opacity=".13" stroke="#d9b55c" stroke-opacity=".75" stroke-width="2"/><text x="253" y="247" text-anchor="middle" fill="#ffe9a2" font-size="29" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.code)}</text>
-  <rect x="920" y="82" width="190" height="52" rx="26" fill="${statusColor}" fill-opacity=".16" stroke="${statusColor}" stroke-opacity=".72"/><text x="1015" y="116" text-anchor="middle" fill="${statusColor}" font-size="18" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
-  <text x="78" y="340" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">BUYER</text><text x="78" y="380" fill="#fff" font-size="28" font-family="DejaVu Sans">${escapeXml(data.buyer)}</text>
-  <text x="650" y="340" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">SELLER</text><text x="650" y="380" fill="#fff" font-size="28" font-family="DejaVu Sans">${escapeXml(data.seller)}</text>
+  <text x="78" y="104" fill="#f5d477" font-size="28" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text>
+  <text x="78" y="166" fill="#fff" font-size="48" font-family="DejaVu Sans" font-weight="bold">SECURE ESCROW</text>
+  <rect x="78" y="202" width="380" height="76" rx="38" fill="#d9b55c" fill-opacity=".13" stroke="#d9b55c" stroke-opacity=".75" stroke-width="2"/><text x="268" y="252" text-anchor="middle" fill="#ffe9a2" font-size="33" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.code)}</text>
+  <rect x="900" y="82" width="220" height="58" rx="29" fill="${statusColor}" fill-opacity=".16" stroke="${statusColor}" stroke-opacity=".72" stroke-width="2"/><text x="1010" y="120" text-anchor="middle" fill="${statusColor}" font-size="20" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.status)}</text>
+  <rect x="62" y="305" width="510" height="105" rx="22" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <rect x="628" y="305" width="510" height="105" rx="22" fill="#ffffff" fill-opacity=".045" stroke="#ffffff" stroke-opacity=".1"/>
+  <text x="94" y="342" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">BUYER</text><text x="94" y="383" fill="#fff" font-size="35" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.buyer)}</text>
+  <text x="660" y="342" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">SELLER</text><text x="660" y="383" fill="#fff" font-size="35" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.seller)}</text>
   <line x1="78" y1="424" x2="1122" y2="424" stroke="#d9b55c" stroke-opacity=".24"/>
-  <text x="78" y="474" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">AMOUNT HELD</text><text x="78" y="530" fill="url(#gold)" font-size="43" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
-  <text x="650" y="474" fill="#9cc4bd" font-size="19" font-family="DejaVu Sans" font-weight="bold">SERVICE FEE</text><text x="650" y="526" fill="#fff" font-size="32" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.fee)}</text><text x="650" y="554" fill="#9cc4bd" font-size="17" font-family="DejaVu Sans">0.2% · charged at creation</text>
-  <text x="78" y="620" fill="${statusColor}" font-size="24" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.cancelStatus)}</text>
-  <text x="78" y="656" fill="#80aaa4" font-size="17" font-family="DejaVu Sans">Buyer accepts · seller releases · both can request cancellation</text>
+  <text x="78" y="474" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">AMOUNT HELD</text><text x="78" y="532" fill="url(#gold)" font-size="50" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.amount)}</text>
+  <text x="650" y="474" fill="#9cc4bd" font-size="21" font-family="DejaVu Sans" font-weight="bold">SERVICE FEE</text><text x="650" y="526" fill="#fff" font-size="38" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.fee)}</text><text x="650" y="558" fill="#9cc4bd" font-size="18" font-family="DejaVu Sans">0.2% · charged at creation</text>
+  <text x="78" y="620" fill="${statusColor}" font-size="27" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.cancelStatus)}</text>
+  <text x="78" y="656" fill="#80aaa4" font-size="18" font-family="DejaVu Sans">Buyer accepts · seller releases · both can request cancellation</text>
  </svg>`;
 }
 
@@ -3445,8 +4341,8 @@ async function sendEscrowCard(
           : "LIVE DEAL";
   const image = await escrowCardPng({
     code: escrow.code,
-    buyer: buyer.displayName,
-    seller: seller.displayName,
+    buyer: buyer.username ? `@${buyer.username}` : buyer.displayName,
+    seller: seller.username ? `@${seller.username}` : seller.displayName,
     amount: formatMoney(escrow.amountMinor, currency),
     fee: formatMoney(escrow.feeMinor, currency),
     status: escrow.status.toUpperCase(),
@@ -3454,8 +4350,8 @@ async function sendEscrowCard(
   });
   const caption = [
     `<b>🔐 ESCROW ${escrow.code}</b>`,
-    `<b>Buyer:</b> ${escapeTelegramText(buyer.displayName)}`,
-    `<b>Seller:</b> ${escapeTelegramText(seller.displayName)}`,
+    `<b>Buyer:</b> ${escapeTelegramText(buyer.username ? `@${buyer.username}` : buyer.displayName)}`,
+    `<b>Seller:</b> ${escapeTelegramText(seller.username ? `@${seller.username}` : seller.displayName)}`,
     `<b>Amount:</b> ${formatMoney(escrow.amountMinor, currency)}`,
     `<b>Fee:</b> ${formatMoney(escrow.feeMinor, currency)} (0.2%)`,
     `<b>Fair ID:</b> <code>${escrow.fairId ?? "legacy"}</code>`,
@@ -3560,6 +4456,7 @@ async function handleEscrowCallback(
     if (verb === "reject") {
       const escrow = await cancelEscrowImmediately(code, player.id);
       await refreshEscrowCard(bot, escrow, true);
+      await unpinEscrow(bot, escrow);
       await auditTransaction(
         bot,
         [
@@ -3574,6 +4471,7 @@ async function handleEscrowCallback(
     if (verb === "release") {
       const escrow = await releaseEscrow(code, player.id);
       await refreshEscrowCard(bot, escrow, true);
+      await unpinEscrow(bot, escrow);
       await auditTransaction(
         bot,
         [
@@ -3641,6 +4539,7 @@ async function handleEscrowCommand(
       if (action === "release") {
         const escrow = await releaseEscrow(code, player.id);
         await refreshEscrowCard(bot, escrow, true);
+        await unpinEscrow(bot, escrow);
         await auditTransaction(
           bot,
           [
@@ -3820,6 +4719,8 @@ const battleGameMap: Record<
   slots: { gameType: "slots", emoji: "🎰" },
 };
 
+type BattleResultRule = "high" | "crazy" | "heads" | "tails";
+
 function parseBattleArguments(args: string[], fallbackCurrency: Currency): {
   mode: "pvb" | "pvp";
   amountMinor: number | null;
@@ -3827,7 +4728,7 @@ function parseBattleArguments(args: string[], fallbackCurrency: Currency): {
   rollsPerRound: number;
   targetWins: number | null;
   currency: Currency;
-  resultRule: "high" | "crazy";
+  resultRule: BattleResultRule;
 } {
   const mode = args[0]?.toLowerCase() === "pvp" ? "pvp" : "pvb";
   const offset = args[0]?.toLowerCase() === "pvp" || args[0]?.toLowerCase() === "pvb" ? 1 : 0;
@@ -3885,7 +4786,7 @@ async function expirePvbBattle(
   if (
     !battle ||
     battle.mode !== "pvb" ||
-      !["pending_confirmation", "running", "rolling"].includes(battle.status)
+      !["pending_confirmation", "running", "rolling", "roulette_choice"].includes(battle.status)
   ) {
     clearBattleTimeout(battleId);
     return;
@@ -3905,7 +4806,12 @@ async function expirePvbBattle(
     .where(
       and(
         eq(casinoChallengesTable.id, battle.id),
-        eq(casinoChallengesTable.status, "running"),
+        inArray(casinoChallengesTable.status, [
+          "pending_confirmation",
+          "running",
+          "rolling",
+          "roulette_choice",
+        ]),
       ),
     )
     .returning();
@@ -3919,7 +4825,7 @@ async function expirePvbBattle(
       ? "⏰ PVB room expired because Play was not confirmed in time. No balance was changed."
       : [
           "⏰ Time expired.",
-          "The player did not finish the required rolls within 60 seconds.",
+          "The player did not finish the required action within 120 seconds.",
           `The stake ${formatMoney(timeoutOutcome.refundMinor, parseCurrency(battle.currency, "USD"))} was refunded.`,
           "Challenge cancelled automatically.",
         ].join("\n"),
@@ -3942,6 +4848,7 @@ async function expirePvpBattle(
         eq(casinoChallengesTable.id, battleId),
         eq(casinoChallengesTable.mode, "pvp"),
         inArray(casinoChallengesTable.status, [
+          "open",
           "coin_choice",
           "awaiting_player_one",
           "awaiting_player_two",
@@ -3992,12 +4899,14 @@ async function recoverPvbBattleTimeouts(resultBot: TelegramBot): Promise<void> {
     .from(casinoChallengesTable)
     .where(
       inArray(casinoChallengesTable.status, [
+        "open",
         "pending_confirmation",
         "running",
           "rolling",
         "coin_choice",
         "awaiting_player_one",
         "awaiting_player_two",
+          "roulette_choice",
       ]),
     );
   for (const battle of battles) {
@@ -4030,6 +4939,7 @@ async function settleBattle(input: {
   playerTwoScore: number;
   playerOneWon: boolean;
   fairId: string;
+  payoutMultiplier?: number;
 }): Promise<{
   playerOneBalance: number;
   playerTwoBalance: number | null;
@@ -4112,17 +5022,43 @@ async function settleBattle(input: {
       playerTwoBalance = playerTwo.balanceMinor;
     }
 
-    const {
-      tie,
-      playerOnePayout,
-      playerTwoPayout,
-    } = calculateBattlePayouts({
+    const { tie } = calculateBattlePayouts({
       stakeMinor: input.stakeMinor,
       playerOneScore: input.playerOneScore,
       playerTwoScore: input.playerTwoScore,
       playerOneWon: input.playerOneWon,
       hasPlayerTwo: Boolean(input.playerTwoId),
     });
+    const customMultiplier =
+      input.payoutMultiplier !== undefined && Number.isFinite(input.payoutMultiplier)
+        ? Math.max(0, input.payoutMultiplier)
+        : null;
+    const playerOnePayout = customMultiplier === null
+      ? calculateBattlePayouts({
+          stakeMinor: input.stakeMinor,
+          playerOneScore: input.playerOneScore,
+          playerTwoScore: input.playerTwoScore,
+          playerOneWon: input.playerOneWon,
+          hasPlayerTwo: Boolean(input.playerTwoId),
+        }).playerOnePayout
+      : tie
+        ? input.stakeMinor
+        : input.playerOneWon
+          ? Math.round(input.stakeMinor * customMultiplier)
+          : 0;
+    const playerTwoPayout = customMultiplier === null
+      ? calculateBattlePayouts({
+          stakeMinor: input.stakeMinor,
+          playerOneScore: input.playerOneScore,
+          playerTwoScore: input.playerTwoScore,
+          playerOneWon: input.playerOneWon,
+          hasPlayerTwo: Boolean(input.playerTwoId),
+        }).playerTwoPayout
+      : tie && input.playerTwoId
+        ? input.stakeMinor
+        : input.playerTwoId && !input.playerOneWon
+          ? Math.round(input.stakeMinor * customMultiplier)
+          : 0;
 
     if (playerOnePayout > 0) {
       const [updated] = await tx
@@ -4206,7 +5142,7 @@ async function settleBattle(input: {
         transactionId,
         entryType: tie ? "battle_refund" : "battle_payout",
         amountMinor: playerOnePayout,
-        description: `${input.gameType} battle ${tie ? "refund" : "payout"} at 1.92x; fair ${input.fairId}`,
+        description: `${input.gameType} battle ${tie ? "refund" : "payout"}${customMultiplier === null ? " at 1.92x" : ` at ${customMultiplier}x`}; fair ${input.fairId}`,
       });
     }
     if (input.playerTwoId && playerTwoWallet) {
@@ -4232,7 +5168,7 @@ async function settleBattle(input: {
           transactionId,
           entryType: tie ? "battle_refund" : "battle_payout",
           amountMinor: playerTwoPayout,
-          description: `${input.gameType} battle ${tie ? "refund" : "payout"} at 1.92x; fair ${input.fairId}`,
+          description: `${input.gameType} battle ${tie ? "refund" : "payout"}${customMultiplier === null ? " at 1.92x" : ` at ${customMultiplier}x`}; fair ${input.fairId}`,
         });
       }
     }
@@ -4285,69 +5221,46 @@ function battleResultText(options: {
   currency: Currency;
   fairId: string;
 }): string {
-  const roundLines = options.rounds.flatMap((round, index) => {
-    const playerOneRoundWon = options.crazyMode
-      ? round.playerOneScore < round.playerTwoScore
-      : round.playerOneScore > round.playerTwoScore;
-    const roundTie = round.playerOneScore === round.playerTwoScore;
-    const winner = roundTie
-      ? "Draw"
-      : playerOneRoundWon
-        ? options.playerOneLabel
-        : options.playerTwoLabel;
-    return [
-      `<b>Round ${index + 1}</b> · ${roundTie ? "🤝 Draw" : `🏆 <b>${winner}</b> wins`}`,
-      `Score: <b>${round.playerOneScore}</b> — <b>${round.playerTwoScore}</b>`,
-    ];
-  });
-
-  const playerOneRoundWins = options.rounds.filter((round) =>
-    options.crazyMode
-      ? round.playerOneScore < round.playerTwoScore
-      : round.playerOneScore > round.playerTwoScore,
-  ).length;
-  const playerTwoRoundWins = options.rounds.filter((round) =>
-    options.crazyMode
-      ? round.playerTwoScore < round.playerOneScore
-      : round.playerTwoScore > round.playerOneScore,
-  ).length;
+  const roundLines = options.rounds.map(
+    (round, index) =>
+      `<b>ROUND ${index + 1}: ${round.playerOneScore}–${round.playerTwoScore}</b>`,
+  );
   const winnerLabel = options.playerOneWon
     ? options.playerOneLabel
     : options.playerTwoLabel;
-  const matchPrefix = options.gameType.slice(0, 3).toUpperCase();
   const stakeLabel = formatMoney(options.stakeMinor, options.currency);
-  const payoutLabel = options.tie
-    ? `<b>Stake refunded:</b> <b>${stakeLabel}</b>`
-    : options.playerOneWon || options.mode === "pvp"
-      ? `<b>Win:</b> <b>${formatMoney(options.payoutMinor, options.currency)}</b> <i>(1.92×)</i>`
-      : `<b>Win:</b> <b>${formatMoney(0, options.currency)}</b> — the house bot won this match.`;
-  const winnerLine = options.tie
-    ? "<b>Result:</b> Draw"
-    : `<b>Winner:</b> <b>${winnerLabel}</b>`;
+  const winAmountMinor = options.tie
+    ? options.stakeMinor
+    : options.playerOneWon
+      ? options.payoutMinor
+      : options.stakeMinor;
+  const winAmountLabel = formatMoney(winAmountMinor, options.currency);
+  const gameEmoji = battleGameMap[options.gameType]?.emoji ?? "🎮";
+  const versusLabel = options.mode === "pvb" ? "VS BOT" : "VS PLAYER";
+  const creditedLine = options.tie
+    ? `<b>✅ PUSH — ${stakeLabel} returned to your wallet.</b>`
+    : options.mode === "pvb"
+      ? options.playerOneWon
+        ? `<b>✅ WIN — ${formatMoney(options.payoutMinor, options.currency)} credited to your wallet.</b>`
+        : `<b>❌ LOSS — ${stakeLabel} goes to @Rolex_C_BOT.</b>`
+      : options.playerOneWon
+        ? `<b>✅ WIN — ${winAmountLabel} ${winnerLabel} takes the round.</b>`
+        : `<b>❌ LOSS — ${winnerLabel} wins ${winAmountLabel}.</b>`;
   return [
-    `<b>🎮 ${options.gameType.toUpperCase()} ${options.mode.toUpperCase()} RESULT</b>`,
-    `Match ID: <code>${matchPrefix}-${String(options.battleId).padStart(6, "0")}</code>`,
-    `Fair ID: <code>${options.fairId}</code>`,
-    "",
-    `<blockquote><b>Players</b>`,
-    `Challenger: <b>${options.playerOneLabel}</b>`,
-    `Opponent: <b>${options.playerTwoLabel}</b>`,
-    `<b>Stake:</b> <b>${stakeLabel}</b> each`,
+    "<blockquote>",
+    `<b>${gameEmoji} ${options.gameType.toUpperCase()}–${versusLabel}</b>`,
+    `<b>ID #${options.battleId}</b>`,
+    `<b>STAKED AMOUNT: ${stakeLabel}</b>`,
+    `<b>WIN AMOUNT: ${winAmountLabel}</b>`,
     "",
     ...roundLines,
-    "</blockquote>",
     "",
-    `${winnerLine} · <b>${playerOneRoundWins} — ${playerTwoRoundWins}</b>`,
-    payoutLabel,
-    options.tie
-      ? "No balance was lost; the stake was returned."
-      : options.playerOneWon
-        ? options.mode === "pvb"
-          ? `<b>🏆 YOU WON ${formatMoney(options.payoutMinor, options.currency)}</b> — your wallet has been credited.`
-          : `<b>🏆 WINNER PAYOUT ${formatMoney(options.payoutMinor, options.currency)}</b> — the winning wallet has been credited.`
-        : options.mode === "pvb"
-          ? `<b>❌ YOU LOST</b> — your stake was settled to the house account.`
-          : `<b>❌ DEFEAT</b> — the opponent's winning wallet has been credited.`,
+    `<b>${options.tie ? "✅ DRAW" : options.playerOneWon ? "✅ WINNER" : "❌ WINNER"} — ${options.tie ? "Both players" : winnerLabel}</b>`,
+    "",
+    creditedLine,
+    "",
+    `<b>Fair ID: ${options.fairId}</b>`,
+    "</blockquote>",
   ].join("\n");
 }
 
@@ -4554,13 +5467,14 @@ async function createBattle(
       targetWins: input.targetWins,
       resultRule: input.resultRule,
       fairId: createFairId(),
-      status: input.mode === "pvp" ? "open" : "running",
+      status: input.mode === "pvp" ? "open" : "pending_confirmation",
+      turnDeadlineAt: new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS),
     })
     .returning();
   if (!battle) throw new Error("Could not create battle");
 
   if (input.mode === "pvp") {
-    await sendPvpMessage(
+    const sent = await sendPvpMessage(
       resultBot,
       chatId,
       [
@@ -4579,15 +5493,20 @@ async function createBattle(
       ].join("\n"),
       {
         inline_keyboard: [[
-          { text: "Accept battle", callback_data: `battle:join:${battle.id}` },
-          { text: "Decline", callback_data: `battle:decline:${battle.id}` },
+          { text: "✅ Accept battle", callback_data: `battle:join:${battle.id}` },
+          { text: "❌ Reject", callback_data: `battle:decline:${battle.id}` },
         ]],
       },
     );
+    await db
+      .update(casinoChallengesTable)
+      .set({ messageId: sent.message_id })
+      .where(eq(casinoChallengesTable.id, battle.id));
+    scheduleBattleTimeout(resultBot, battle.id);
     return;
   }
 
-  await resultBot.sendMessage(
+  const sent = await resultBot.sendMessage(
     chatId,
     [
       `<b>🤖 ${game.emoji} ${game.gameType.toUpperCase()} — PLAYER VS BOT</b>`,
@@ -4605,17 +5524,300 @@ async function createBattle(
     {
       inline_keyboard: [[
         {
-          text: "🤖 Play with Bot",
+          text: "✅ Play with Bot",
           callback_data: ownedCallback(`battle:pvb:play:${battle.id}`, player.telegramUserId),
         },
         {
-          text: "Cancel",
+          text: "❌ Cancel",
           callback_data: ownedCallback(`battle:pvb:cancel:${battle.id}`, player.telegramUserId),
         },
       ]],
     },
   );
+  await db
+    .update(casinoChallengesTable)
+    .set({ messageId: sent.message_id })
+    .where(eq(casinoChallengesTable.id, battle.id));
   scheduleBattleTimeout(resultBot, battle.id);
+}
+
+type RouletteChoice =
+  | "odd"
+  | "even"
+  | "1-8"
+  | "9-18"
+  | "19-25"
+  | "26-35"
+  | `number:${number}`;
+
+function rouletteChoiceLabel(choice: RouletteChoice): string {
+  if (choice.startsWith("number:")) return `Number ${choice.slice(7)}`;
+  if (choice === "odd") return "Odd";
+  if (choice === "even") return "Even";
+  return choice;
+}
+
+function rouletteChoiceMatches(choice: RouletteChoice, result: number): boolean {
+  if (choice === "odd") return result % 2 === 1;
+  if (choice === "even") return result % 2 === 0;
+  if (choice === "1-8") return result >= 1 && result <= 8;
+  if (choice === "9-18") return result >= 9 && result <= 18;
+  if (choice === "19-25") return result >= 19 && result <= 25;
+  if (choice === "26-35") return result >= 26 && result <= 35;
+  return result === Number(choice.slice(7));
+}
+
+function isRouletteChoice(value: string): value is RouletteChoice {
+  return (
+    value === "odd" ||
+    value === "even" ||
+    value === "1-8" ||
+    value === "9-18" ||
+    value === "19-25" ||
+    value === "26-35" ||
+    /^number:(?:[1-9]|[12]\d|3[0-6])$/.test(value)
+  );
+}
+
+function rouletteKeyboard(
+  ownerTelegramUserId: number,
+  battleId: number,
+  numberMode = false,
+): { inline_keyboard: InlineKeyboardButton[][] } {
+  if (numberMode) {
+    const rows: InlineKeyboardButton[][] = [];
+    for (let number = 1; number <= 36; number += 6) {
+      rows.push(
+        Array.from({ length: 6 }, (_, index) => number + index)
+          .filter((value) => value <= 36)
+          .map((value) => ({
+            text: String(value),
+            callback_data: ownedCallback(
+              `roulette:choose:${battleId}:number:${value}`,
+              ownerTelegramUserId,
+            ),
+          })),
+      );
+    }
+    rows.push([{
+      text: "↩️ Back to bets",
+      callback_data: ownedCallback(`roulette:menu:${battleId}`, ownerTelegramUserId),
+    }]);
+    return { inline_keyboard: rows };
+  }
+  return {
+    inline_keyboard: [
+      [
+        { text: "Odd", callback_data: ownedCallback(`roulette:choose:${battleId}:odd`, ownerTelegramUserId) },
+        { text: "Even", callback_data: ownedCallback(`roulette:choose:${battleId}:even`, ownerTelegramUserId) },
+      ],
+      [
+        { text: "1–8", callback_data: ownedCallback(`roulette:choose:${battleId}:1-8`, ownerTelegramUserId) },
+        { text: "9–18", callback_data: ownedCallback(`roulette:choose:${battleId}:9-18`, ownerTelegramUserId) },
+      ],
+      [
+        { text: "19–25", callback_data: ownedCallback(`roulette:choose:${battleId}:19-25`, ownerTelegramUserId) },
+        { text: "26–35", callback_data: ownedCallback(`roulette:choose:${battleId}:26-35`, ownerTelegramUserId) },
+      ],
+      [{
+        text: "🔢 Number 1–36",
+        callback_data: ownedCallback(`roulette:numbers:${battleId}`, ownerTelegramUserId),
+      }],
+    ],
+  };
+}
+
+async function sendRouletteSticker(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<boolean> {
+  if (rouletteStickerIds.length === 0) await loadRouletteStickerPack(bot);
+  if (rouletteStickerIds.length === 0) return false;
+  let index = randomInt(rouletteStickerIds.length);
+  if (rouletteStickerIds.length > 1 && index === lastRouletteStickerIndex) {
+    index = (index + 1 + randomInt(rouletteStickerIds.length - 1)) % rouletteStickerIds.length;
+  }
+  lastRouletteStickerIndex = index;
+  await bot.sendSticker(chatId, rouletteStickerIds[index]);
+  return true;
+}
+
+async function startRoulette(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  amountMinor: number | null,
+  currency: Currency,
+): Promise<void> {
+  if (!amountMinor) {
+    await bot.sendMessage(chatId, "<b>Usage:</b> <code>/roul AMOUNT INR|USD</code>\nExample: <code>/roul 30 INR</code>");
+    return;
+  }
+  if (!(await betInRange(amountMinor, currency, "roulette"))) {
+    await bot.sendMessage(chatId, await configuredBetLimitText(currency, "roulette"));
+    return;
+  }
+  const player = await ensurePlayer(user);
+  const wallet = await ensureWallet(player.id, currency);
+  const jackpot = await ensureJackpot(currency);
+  const [participant] = await db
+    .select()
+    .from(casinoJackpotParticipantsTable)
+    .where(
+      and(
+        eq(casinoJackpotParticipantsTable.jackpotId, jackpot.id),
+        eq(casinoJackpotParticipantsTable.playerId, player.id),
+      ),
+    )
+    .limit(1);
+  const jackpotMinor = jackpotContribution(amountMinor, Boolean(participant));
+  if (wallet.balanceMinor < amountMinor + jackpotMinor) {
+    await bot.sendMessage(chatId, `<b>❌ Insufficient balance</b>\nAvailable: <b>${formatMoney(wallet.balanceMinor, currency)}</b>`);
+    return;
+  }
+  const [battle] = await db
+    .insert(casinoChallengesTable)
+    .values({
+      creatorPlayerId: player.id,
+      mode: "pvb",
+      playerTwoId: null,
+      chatId,
+      gameType: "roulette",
+      emoji: "🎰",
+      currency,
+      stakeMinor: amountMinor,
+      rounds: 1,
+      rollsPerRound: 1,
+      targetWins: null,
+      resultRule: "roulette_pending",
+      fairId: createFairId(),
+      status: "roulette_choice",
+      turnDeadlineAt: new Date(Date.now() + BATTLE_TURN_TIMEOUT_MS),
+    })
+    .returning();
+  if (!battle) throw new Error("Could not create roulette room");
+  const sent = await bot.sendMessage(
+    chatId,
+    [
+      "<b>🎰 ROULETTE–VS BOT ROOM</b>",
+      "",
+      `<b>ROOM ID #${battle.id}</b>`,
+      `<b>PLAYER:</b> ${casinoPlayerLabel(player, "Player")}`,
+      `<b>STAKED AMOUNT:</b> ${formatMoney(amountMinor, currency)}`,
+      "<b>GROUP BETS PAY 1.92× · NUMBER BETS PAY 36×</b>",
+      "",
+      "Choose a side below:",
+    ].join("\n"),
+    rouletteKeyboard(player.telegramUserId, battle.id),
+  );
+  await db
+    .update(casinoChallengesTable)
+    .set({ messageId: sent.message_id })
+    .where(eq(casinoChallengesTable.id, battle.id));
+  scheduleBattleTimeout(bot, battle.id);
+}
+
+async function handleRouletteChoice(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  battleId: number,
+  choice: RouletteChoice,
+): Promise<void> {
+  const [battle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(eq(casinoChallengesTable.id, battleId))
+    .limit(1);
+  if (!battle || battle.mode !== "pvb" || battle.gameType !== "roulette" || battle.status !== "roulette_choice") {
+    await bot.sendMessage(chatId, "That roulette room is no longer waiting for a choice.");
+    return;
+  }
+  const [player] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+    .limit(1);
+  if (!player || player.telegramUserId !== user.id) return;
+  const [claimed] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "roulette_spinning", resultRule: choice, turnDeadlineAt: null })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "roulette_choice"),
+      ),
+    )
+    .returning();
+  if (!claimed) return;
+  clearBattleTimeout(battle.id);
+  try {
+    if (battle.messageId) {
+      await bot.editMessageText(
+        chatId,
+        battle.messageId,
+        `<b>🎰 ROULETTE–VS BOT #${battle.id}</b>\n\nSelection: <b>${rouletteChoiceLabel(choice)}</b>\n\n<b>Wheel spinning…</b>`,
+        { inline_keyboard: [] },
+      );
+    }
+  } catch (error) {
+    logger.warn({ err: error, battleId: battle.id }, "Roulette room update failed");
+  }
+  const result = randomInt(1, 37);
+  const stickerSent = await sendRouletteSticker(bot, chatId);
+  const won = rouletteChoiceMatches(choice, result);
+  const numericChoice = choice.startsWith("number:");
+  const payoutMultiplier = numericChoice ? 36 : 1.92;
+  let settled: Awaited<ReturnType<typeof settleBattle>>;
+  try {
+    settled = await settleBattle({
+      battleId: battle.id,
+      chatId: battle.chatId,
+      playerOneId: battle.creatorPlayerId,
+      playerTwoId: null,
+      mode: "pvb",
+      gameType: "roulette",
+      currency: parseCurrency(battle.currency, "USD"),
+      stakeMinor: battle.stakeMinor,
+      playerOneScore: won ? 1 : 0,
+      playerTwoScore: won ? 0 : 1,
+      playerOneWon: won,
+      payoutMultiplier: won ? payoutMultiplier : 0,
+      fairId: battle.fairId ?? createFairId(),
+    });
+  } catch (error) {
+    logger.error({ err: error, battleId: battle.id }, "Roulette settlement failed");
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: "cancelled", completedAt: new Date() })
+      .where(eq(casinoChallengesTable.id, battle.id));
+    await bot.sendMessage(chatId, "Roulette could not settle this room. Please contact support before playing again.");
+    return;
+  }
+  if (won) {
+    await broadcastPlayerWin(
+      bot,
+      player.id,
+      "roulette",
+      Math.round(battle.stakeMinor * payoutMultiplier),
+      parseCurrency(battle.currency, "USD"),
+    );
+  }
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>🎰 ROULETTE–VS BOT RESULT</b>",
+      "",
+      `<b>Room:</b> #${battle.id}`,
+      `<b>Your selection:</b> ${rouletteChoiceLabel(choice)}`,
+      `<b>Verified sticker result:</b> ${stickerSent ? "sent" : "unavailable"} · <b>Number ${result}</b>`,
+      won
+        ? `<b>✅ WIN — ${formatMoney(Math.round(battle.stakeMinor * payoutMultiplier), parseCurrency(battle.currency, "USD"))} credited (${payoutMultiplier}×).</b>`
+        : `<b>❌ LOSS — ${formatMoney(battle.stakeMinor, parseCurrency(battle.currency, "USD"))} went to the house.</b>`,
+      `<b>Balance:</b> ${formatMoney(settled.playerOneBalance, parseCurrency(battle.currency, "USD"))}`,
+      `<b>Fair ID:</b> <code>${settled.fairId}</code>`,
+    ].join("\n"),
+  );
 }
 
 async function createPvbRematch(
@@ -4694,7 +5896,13 @@ async function createPvbRematch(
       rollsPerRound: previousBattle.rollsPerRound,
       targetWins: previousBattle.targetWins,
       currency: parseCurrency(previousBattle.currency, "USD"),
-      resultRule: previousBattle.resultRule === "crazy" ? "crazy" : "high",
+      resultRule:
+        previousBattle.gameType === "coin" &&
+        (previousBattle.resultRule === "heads" || previousBattle.resultRule === "tails")
+          ? previousBattle.resultRule
+          : previousBattle.resultRule === "crazy"
+            ? "crazy"
+            : "high",
     },
   );
 }
@@ -4746,6 +5954,19 @@ async function joinBattle(
     await resultBot.sendMessage(chatId, "Another player joined this battle first.");
     return;
   }
+  let progressUpdated = false;
+  try {
+    if (battle.messageId) {
+      await resultBot.editMessageText(
+        chatId,
+        battle.messageId,
+        `<b>✅ BATTLE ACCEPTED</b>\n\nOpponent: ${casinoPlayerLabel(player, "Player")}\n\nThe game is starting.`,
+        { inline_keyboard: [] },
+      );
+    }
+  } catch (error) {
+    logger.warn({ err: error, battleId: battle.id }, "Battle acceptance message update failed");
+  }
   const isCoinBattle = claimedBattle.gameType === "coin";
   const [startedBattle] = await db
     .update(casinoChallengesTable)
@@ -4757,6 +5978,20 @@ async function joinBattle(
     .returning();
   if (startedBattle) {
     if (startedBattle.gameType === "coin") {
+      const preselectedSide =
+        startedBattle.resultRule === "heads" || startedBattle.resultRule === "tails"
+          ? startedBattle.resultRule.toUpperCase() as "HEADS" | "TAILS"
+          : null;
+      if (preselectedSide) {
+        await resolvePreselectedPvpCoin(
+          resultBot,
+          helperBots,
+          chatId,
+          startedBattle,
+          preselectedSide,
+        );
+        return;
+      }
       const [challenger, opponent] = await Promise.all([
         db
           .select()
@@ -4788,14 +6023,14 @@ async function joinBattle(
         {
           inline_keyboard: [[
             {
-              text: "Heads",
+              text: "✅ Heads",
               callback_data: ownedCallback(
                 `coin:choose:${startedBattle.id}:HEADS`,
                 opponent?.telegramUserId ?? user.id,
               ),
             },
             {
-              text: "Tails",
+              text: "✅ Tails",
               callback_data: ownedCallback(
                 `coin:choose:${startedBattle.id}:TAILS`,
                 opponent?.telegramUserId ?? user.id,
@@ -4810,6 +6045,112 @@ async function joinBattle(
     await promptPvpTurn(resultBot, startedBattle);
     scheduleBattleTimeout(resultBot, startedBattle.id);
   }
+}
+
+async function handlePvbCoinChoice(
+  resultBot: TelegramBot,
+  helperBots: Map<string, TelegramBot>,
+  chatId: number,
+  user: TelegramUser,
+  battleId: number,
+  pickedSide: "HEADS" | "TAILS",
+): Promise<void> {
+  const [battle] = await db
+    .select()
+    .from(casinoChallengesTable)
+    .where(eq(casinoChallengesTable.id, battleId))
+    .limit(1);
+  if (
+    !battle ||
+    battle.mode !== "pvb" ||
+    battle.gameType !== "coin" ||
+    battle.status !== "coin_choice"
+  ) {
+    await resultBot.sendMessage(chatId, "<b>❌ That coin VS Bot room is no longer waiting for a choice.</b>");
+    return;
+  }
+  const [player] = await db
+    .select()
+    .from(casinoPlayersTable)
+    .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+    .limit(1);
+  if (!player || player.telegramUserId !== user.id) {
+    return;
+  }
+  const [claimed] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "coin_flipping", turnDeadlineAt: null })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "coin_choice"),
+      ),
+    )
+    .returning();
+  if (!claimed) return;
+  let progressUpdated = false;
+  try {
+    if (battle.messageId) {
+      await resultBot.editMessageText(
+        chatId,
+        battle.messageId,
+        `<b>✅ ${escapeTelegramText(player.username ? `@${player.username}` : player.displayName)} chose ${pickedSide}.</b>\n\n<b>Coin in the air... 1... 2... 3...</b>`,
+        { inline_keyboard: [] },
+      );
+      progressUpdated = true;
+    }
+  } catch (error) {
+    logger.warn({ err: error, battleId: battle.id }, "Coin choice message update failed");
+  }
+  if (!progressUpdated) {
+    await resultBot.sendMessage(
+      chatId,
+      `<b>🪙 ${escapeTelegramText(player.username ? `@${player.username}` : player.displayName)} chose ${pickedSide}.</b>\n\n<b>Coin in the air... 1... 2... 3...</b>`,
+    );
+  }
+  const coinBot =
+    helperBots.get("coin") ??
+    helperBots.get("dice") ??
+    Array.from(new Set(helperBots.values()))[0] ??
+    resultBot;
+  await wait(3_000);
+  const landedSide = randomInt(0, 2) === 0 ? "HEADS" : "TAILS";
+  await coinBot.sendSticker(
+    chatId,
+    landedSide === "HEADS"
+      ? "CAACAgUAAxkBAAFTwsdqoCIDn3aYNkEzBzK4bgaG_1nKTQACNiAAAqKnAAFVo9ol5MRo_sE9BA"
+      : "CAACAgUAAxkBAAFTwshqoCIEvo5YGjBgGT068tbqlGtqqwAC1CEAAhR4AAFVY1ajxrKoHbg9BA",
+  );
+  await wait(PVP_RESULT_DELAY_MS);
+  const playerWon = pickedSide === landedSide;
+  const settled = await settleBattle({
+    battleId: battle.id,
+    chatId: battle.chatId,
+    playerOneId: battle.creatorPlayerId,
+    playerTwoId: null,
+    mode: "pvb",
+    gameType: "coin",
+    currency: parseCurrency(battle.currency, "USD"),
+    stakeMinor: battle.stakeMinor,
+    playerOneScore: playerWon ? 1 : 0,
+    playerTwoScore: playerWon ? 0 : 1,
+    playerOneWon: playerWon,
+    fairId: battle.fairId ?? createFairId(),
+  });
+  await resultBot.sendMessage(
+    chatId,
+    [
+      `<b>🪙 COIN VS BOT RESULT</b>`,
+      "",
+      `<b>Your choice:</b> ${pickedSide}`,
+      `<b>Coin landed:</b> ${landedSide}`,
+      playerWon
+        ? `<b>✅ WIN — ${formatMoney(Math.round(battle.stakeMinor * 1.92), parseCurrency(battle.currency, "USD"))} credited to your wallet.</b>`
+        : `<b>❌ LOSS — ${formatMoney(battle.stakeMinor, parseCurrency(battle.currency, "USD"))} went to the house.</b>`,
+      `<b>Wallet balance:</b> ${formatMoney(settled.playerOneBalance, parseCurrency(battle.currency, "USD"))}`,
+      `<b>Fair ID:</b> <code>${settled.fairId}</code>`,
+    ].join("\n"),
+  );
 }
 
 async function declineBattle(
@@ -4860,6 +6201,95 @@ async function declineBattle(
   );
 }
 
+async function resolvePreselectedPvpCoin(
+  resultBot: TelegramBot,
+  helperBots: Map<string, TelegramBot>,
+  chatId: number,
+  battle: typeof casinoChallengesTable.$inferSelect,
+  pickedSide: "HEADS" | "TAILS",
+): Promise<void> {
+  const [challenger, opponent] = await Promise.all([
+    db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+      .limit(1)
+      .then(([row]) => row),
+    db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.id, battle.playerTwoId as number))
+      .limit(1)
+      .then(([row]) => row),
+  ]);
+  if (!challenger || !opponent || !battle.playerTwoId) return;
+  const [claimed] = await db
+    .update(casinoChallengesTable)
+    .set({ status: "coin_flipping", turnDeadlineAt: null })
+    .where(
+      and(
+        eq(casinoChallengesTable.id, battle.id),
+        eq(casinoChallengesTable.status, "coin_choice"),
+      ),
+    )
+    .returning();
+  if (!claimed) return;
+  await sendPvpMessage(
+    resultBot,
+    chatId,
+    `<b>🪙 ${casinoPlayerLabel(challenger, "Challenger")} selected ${pickedSide}.</b>\n\n<b>Coin in the air... 1... 2... 3...</b>`,
+  );
+  await wait(3_000);
+  const landedSide = randomInt(0, 2) === 0 ? "HEADS" : "TAILS";
+  const coinBot =
+    helperBots.get("coin") ??
+    helperBots.get("dice") ??
+    Array.from(new Set(helperBots.values()))[0] ??
+    resultBot;
+  await coinBot.sendSticker(
+    chatId,
+    landedSide === "HEADS"
+      ? "CAACAgUAAxkBAAFTwsdqoCIDn3aYNkEzBzK4bgaG_1nKTQACNiAAAqKnAAFVo9ol5MRo_sE9BA"
+      : "CAACAgUAAxkBAAFTwshqoCIEvo5YGjBgGT068tbqlGtqqwAC1CEAAhR4AAFVY1ajxrKoHbg9BA",
+  );
+  await wait(PVP_RESULT_DELAY_MS);
+  const challengerWon = pickedSide === landedSide;
+  const settled = await settleBattle({
+    battleId: battle.id,
+    chatId: battle.chatId,
+    playerOneId: battle.creatorPlayerId,
+    playerTwoId: battle.playerTwoId,
+    mode: "pvp",
+    gameType: "coin",
+    currency: parseCurrency(battle.currency, "USD"),
+    stakeMinor: battle.stakeMinor,
+    playerOneScore: challengerWon ? 1 : 0,
+    playerTwoScore: challengerWon ? 0 : 1,
+    playerOneWon: challengerWon,
+    fairId: battle.fairId ?? createFairId(),
+  });
+  const winner = challengerWon ? challenger : opponent;
+  const loser = challengerWon ? opponent : challenger;
+  await sendPvpMessage(
+    resultBot,
+    chatId,
+    [
+      `<b>🪙 COIN FLIP #${String(battle.id).padStart(4, "0")} — RESULT</b>`,
+      "",
+      `<b>Selected side:</b> ${pickedSide}`,
+      `<b>Coin landed:</b> ${landedSide}`,
+      "",
+      challengerWon
+        ? `<b>✅ ${casinoPlayerLabel(winner, "Player")} won.</b>`
+        : `<b>❌ ${casinoPlayerLabel(loser, "Player")} lost.</b>`,
+      `<b>Winner:</b> ${casinoPlayerLabel(winner, "Player")}`,
+      `<b>Loser:</b> ${casinoPlayerLabel(loser, "Player")}`,
+      `Prize: <b>${formatMoney(Math.round(battle.stakeMinor * 1.92), parseCurrency(battle.currency, "USD"))}</b>`,
+      `Fair ID: <code>${settled.fairId}</code>`,
+    ].join("\n"),
+  );
+}
+
 async function confirmPvbBattle(
   resultBot: TelegramBot,
   chatId: number,
@@ -4876,7 +6306,25 @@ async function confirmPvbBattle(
     battle.mode !== "pvb" ||
     battle.status !== "pending_confirmation"
   ) {
-    await resultBot.sendMessage(chatId, "That PVB room is no longer waiting for confirmation.");
+    if (battle) {
+      const [creator] = await db
+        .select()
+        .from(casinoPlayersTable)
+        .where(eq(casinoPlayersTable.id, battle.creatorPlayerId))
+        .limit(1);
+      await resultBot.sendMessage(
+        chatId,
+        [
+          `<b>🤖 ${escapeTelegramText(battle.gameType.toUpperCase())} VS BOT</b>`,
+          "",
+          `<b>${escapeTelegramText(creator?.username ? `@${creator.username}` : creator?.displayName ?? "Player")} ${escapeTelegramText(battle.emoji)} — send now!</b>`,
+          "",
+          "<b>This room is already active or completed.</b>",
+        ].join("\n"),
+      );
+    } else {
+      await resultBot.sendMessage(chatId, "<b>❌ This PVB room was not found.</b>");
+    }
     return;
   }
   const [creator] = await db
@@ -4908,20 +6356,91 @@ async function confirmPvbBattle(
     await resultBot.sendMessage(chatId, "That PVB room was already started or cancelled.");
     return;
   }
+  if (startedBattle.gameType === "coin") {
+    await db
+      .update(casinoChallengesTable)
+      .set({ status: "coin_choice", turnDeadlineAt: deadline })
+      .where(eq(casinoChallengesTable.id, startedBattle.id));
+    const preselectedSide =
+      startedBattle.resultRule === "heads" || startedBattle.resultRule === "tails"
+        ? startedBattle.resultRule.toUpperCase() as "HEADS" | "TAILS"
+        : null;
+    if (preselectedSide) {
+      await handlePvbCoinChoice(
+        resultBot,
+        new Map<string, TelegramBot>(),
+        chatId,
+        user,
+        startedBattle.id,
+        preselectedSide,
+      );
+      return;
+    }
+    const coinChoiceText = [
+        `<b>✅ COIN–VS BOT CONFIRMED</b>`,
+        "",
+        `<b>ID #${startedBattle.id}</b>`,
+        `<b>STAKED AMOUNT: ${formatMoney(startedBattle.stakeMinor, parseCurrency(startedBattle.currency, "USD"))}</b>`,
+        `<b>WIN AMOUNT: ${formatMoney(Math.round(startedBattle.stakeMinor * 1.92), parseCurrency(startedBattle.currency, "USD"))}</b>`,
+        "",
+        `<b>${casinoPlayerLabel(creator, "Player")}, choose Heads or Tails:</b>`,
+        "<b>The bot will send the random result sticker after your choice.</b>",
+      ].join("\n");
+    const coinChoiceKeyboard = {
+        inline_keyboard: [[
+          {
+            text: "✅ Heads",
+            callback_data: ownedCallback(
+              `coin:pvb:choose:${startedBattle.id}:HEADS`,
+              creator.telegramUserId,
+            ),
+          },
+          {
+            text: "✅ Tails",
+            callback_data: ownedCallback(
+              `coin:pvb:choose:${startedBattle.id}:TAILS`,
+              creator.telegramUserId,
+            ),
+          },
+        ]],
+      };
+    try {
+      if (battle.messageId) {
+        await resultBot.editMessageText(
+          chatId,
+          battle.messageId,
+          coinChoiceText,
+          coinChoiceKeyboard,
+        );
+      } else {
+        await resultBot.sendMessage(chatId, coinChoiceText, coinChoiceKeyboard);
+      }
+    } catch (error) {
+      logger.warn({ err: error, battleId: battle.id }, "PVB coin choice message update failed");
+      if (battle.messageId) {
+        await resultBot.sendMessage(chatId, coinChoiceText, coinChoiceKeyboard);
+      }
+    }
+    scheduleBattleTimeout(resultBot, startedBattle.id);
+    return;
+  }
   await resultBot.sendMessage(
     chatId,
     [
-      "<b>✅ PVB ROOM CONFIRMED</b>",
+      `<b>✅ ${battle.gameType.toUpperCase()}–VS BOT CONFIRMED</b>`,
       "",
-      `<b>🎯 ${casinoPlayerLabel(creator, "Challenge maker")}</b>, your ${battle.gameType.toUpperCase()} arena is ready.`,
+      `<b>ID #${battle.id}</b>`,
+      `<b>STAKED AMOUNT: ${formatMoney(battle.stakeMinor, parseCurrency(battle.currency, "USD"))}</b>`,
+      `<b>WIN AMOUNT: ${formatMoney(Math.round(battle.stakeMinor * 1.92), parseCurrency(battle.currency, "USD"))}</b>`,
+      `<b>ROUNDS: ${battle.rounds}× · ${battle.rollsPerRound} ${battle.emoji} per round</b>`,
       "",
-      `<b>Send ${battle.emoji} now</b> to begin Round 1.`,
+      `<b>${battle.emoji} NOW — send it to begin Round 1/${battle.rounds}</b>`,
       "Your result will be verified and revealed after the 3-second game reveal delay.",
       "",
       "<i>Good luck — play fair, play smart.</i>",
     ].join("\n"),
   );
-  await promptPvbRound(resultBot, startedBattle);
+  await promptPvbRound(resultBot, startedBattle, battle.messageId);
 }
 
 async function cancelPvbBattle(
@@ -5016,6 +6535,18 @@ async function handleCoinChoice(
     return;
   }
   const challengerSide = pickedSide === "HEADS" ? "TAILS" : "HEADS";
+  try {
+    if (battle.messageId) {
+      await resultBot.editMessageText(
+        chatId,
+        battle.messageId,
+        `<b>✅ ${casinoPlayerLabel(opponentPlayer, "Opponent")} picked ${pickedSide}.</b>\n\n<b>Coin in the air... 1... 2... 3...</b>`,
+        { inline_keyboard: [] },
+      );
+    }
+  } catch (error) {
+    logger.warn({ err: error, battleId: battle.id }, "Coin PVP choice message update failed");
+  }
   await sendPvpMessage(
     resultBot,
     chatId,
@@ -5033,9 +6564,15 @@ async function handleCoinChoice(
     Array.from(new Set(helperBots.values()))[0] ??
     resultBot;
   const landedSide = randomInt(0, 2) === 0 ? "HEADS" : "TAILS";
-  await coinBot.sendMessage(chatId, "🪙");
+  await coinBot.sendSticker(
+    chatId,
+    landedSide === "HEADS"
+      ? "CAACAgUAAxkBAAFTwsdqoCIDn3aYNkEzBzK4bgaG_1nKTQACNiAAAqKnAAFVo9ol5MRo_sE9BA"
+      : "CAACAgUAAxkBAAFTwshqoCIEvo5YGjBgGT068tbqlGtqqwAC1CEAAhR4AAFVY1ajxrKoHbg9BA",
+  );
   await wait(PVP_RESULT_DELAY_MS);
-  const playerOneWon = challengerSide === landedSide;
+  const chosenPlayerWon = pickedSide === landedSide;
+  const playerOneWon = !chosenPlayerWon;
   const settled = await settleBattle({
     battleId: battle.id,
     chatId: battle.chatId,
@@ -5054,7 +6591,7 @@ async function handleCoinChoice(
     db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.id, battle.creatorPlayerId)).limit(1).then(([row]) => row),
     db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.id, battle.playerTwoId)).limit(1).then(([row]) => row),
   ]);
-  const winner = playerOneWon ? challenger : opponent;
+  const winner = chosenPlayerWon ? opponent : challenger;
   await sendPvpMessage(
     resultBot,
     chatId,
@@ -5062,11 +6599,15 @@ async function handleCoinChoice(
       `🪙 <b>Coin Flip #${String(battle.id).padStart(4, "0")} — Result</b>`,
       "",
       `Coin landed on: <b>${landedSide}</b>`,
-      `${casinoPlayerLabel(opponent, "Opponent")}: ${pickedSide}`,
+      `<b>Chosen side:</b> ${pickedSide}`,
+      `<b>Chosen player:</b> ${casinoPlayerLabel(opponent, "Opponent")}`,
       `${casinoPlayerLabel(challenger, "Challenger")}: ${challengerSide}`,
       "",
-      `<b>🏆 Winner: ${casinoPlayerLabel(winner, "Player")}</b>`,
-      `<b>❌ Loser: ${casinoPlayerLabel(playerOneWon ? opponent : challenger, "Player")}</b>`,
+      chosenPlayerWon
+        ? `<b>🏆 ${casinoPlayerLabel(opponent, "Player")} chose ${pickedSide} and WON.</b>`
+        : `<b>❌ ${casinoPlayerLabel(opponent, "Player")} chose ${pickedSide} and LOST.</b>`,
+      `<b>Winner: ${casinoPlayerLabel(winner, "Player")}</b>`,
+      `<b>Loser: ${casinoPlayerLabel(winner === opponent ? challenger : opponent, "Player")}</b>`,
       `🏦 Prize: ${formatMoney(Math.round(battle.stakeMinor * 1.92), parseCurrency(battle.currency, "USD"))} credited`,
       `Fair ID: <code>${settled.fairId}</code>`,
     ].join("\n"),
@@ -5481,6 +7022,7 @@ async function handlePlayerPvpRoll(
 async function promptPvbRound(
   resultBot: TelegramBot,
   battle: typeof casinoChallengesTable.$inferSelect,
+  existingMessageId?: number | null,
 ): Promise<void> {
   const [creator] = await db
     .select()
@@ -5533,17 +7075,29 @@ async function promptPvbRound(
     })
     .where(eq(casinoChallengesTable.id, battle.id));
   scheduleBattleTimeout(resultBot, battle.id);
-  await resultBot.sendMessage(
-    battle.chatId,
-    [
-      `<b>🎮 ${battle.gameType.toUpperCase()} PVB · ROUND ${round}</b>`,
+  const text = [
+      `<b>${battle.emoji} ${battle.gameType.toUpperCase()}–VS BOT · ROUND ${round}/${battle.rounds}</b>`,
+      `<b>ID #${battle.id} · STAKE ${formatMoney(battle.stakeMinor, parseCurrency(battle.currency, "USD"))} · WIN ${formatMoney(Math.round(battle.stakeMinor * 1.92), parseCurrency(battle.currency, "USD"))}</b>`,
       "",
       `<b>🎯 ${escapeTelegramText(creatorLabel)}</b>, send <b>${battle.emoji}</b> directly in this group.`,
-      `<b>${remaining}</b> ${remaining === 1 ? "emoji" : "emojis"} remaining in this round · 60 seconds`,
+      `<b>${remaining}</b> ${remaining === 1 ? "emoji" : "emojis"} remaining in this round · 120 seconds`,
       "",
       "<i>Send only the fresh Telegram game emoji. Forwarded or duplicate rolls are rejected.</i>",
-    ].join("\n"),
-  );
+    ].join("\n");
+  if (existingMessageId) {
+    try {
+      await resultBot.editMessageText(
+        battle.chatId,
+        existingMessageId,
+        text,
+        { inline_keyboard: [] },
+      );
+      return;
+    } catch (error) {
+      logger.warn({ err: error, battleId: battle.id }, "PVB prompt message update failed");
+    }
+  }
+  await resultBot.sendMessage(battle.chatId, text);
 }
 
 function buildPvbRoundScores(
@@ -6209,9 +7763,10 @@ function limboCardSvg(data: {
   <rect width="1200" height="650" rx="30" fill="url(#bg)"/>
   <circle cx="100" cy="100" r="3" fill="#fff"/><circle cx="270" cy="210" r="4" fill="#f9d5ff"/>
   <circle cx="930" cy="120" r="3" fill="#fff"/><circle cx="1060" cy="260" r="4" fill="#f9d5ff"/>
-  <text x="55" y="65" fill="${statusColor}" font-size="30" font-family="DejaVu Sans" font-weight="bold">${status}!</text>
-  <text x="55" y="175" fill="#fff" font-size="105" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.result)}x</text>
-  <text x="60" y="220" fill="#d9c8ef" font-size="25" font-family="DejaVu Sans">Target multiplier: ${escapeXml(data.target)}x</text>
+  <text x="55" y="65" fill="#f7d66b" font-size="28" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO · LIMBO</text>
+  <text x="55" y="112" fill="${statusColor}" font-size="34" font-family="DejaVu Sans" font-weight="bold">${status}!</text>
+  <text x="55" y="190" fill="#fff" font-size="116" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.result)}x</text>
+  <text x="60" y="235" fill="#d9c8ef" font-size="27" font-family="DejaVu Sans">Target multiplier: ${escapeXml(data.target)}x</text>
   <g transform="translate(845 75) rotate(16)">
     <path d="M120 15 C188 70 193 180 120 255 C47 180 52 70 120 15Z" fill="url(#rocket)" stroke="#b04ce2" stroke-width="6"/>
     <circle cx="120" cy="112" r="28" fill="#56d8e8" stroke="#793bb2" stroke-width="9"/>
@@ -6220,13 +7775,14 @@ function limboCardSvg(data: {
     <path d="M101 260 L94 304 L120 276 L146 304 L139 260Z" fill="#ff5f2e"/>
   </g>
   <line x1="55" y1="305" x2="1145" y2="305" stroke="#ffffff" stroke-opacity=".16"/>
-  <text x="55" y="365" fill="#cdbce2" font-size="25" font-family="DejaVu Sans">PLAYER</text>
-  <text x="55" y="405" fill="#fff" font-size="30" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.player)}</text>
-  <text x="55" y="480" fill="#cdbce2" font-size="25" font-family="DejaVu Sans">BET</text>
-  <text x="55" y="520" fill="#fff" font-size="32" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.bet)}</text>
-  <text x="720" y="480" fill="#cdbce2" font-size="25" font-family="DejaVu Sans">STATUS</text>
-  <text x="720" y="520" fill="${statusColor}" font-size="32" font-family="DejaVu Sans" font-weight="bold">${status}</text>
-  <text x="55" y="605" fill="#b59acb" font-size="20" font-family="DejaVu Sans">ROLEXCASINO LIMBO · FAIR RANDOM RESULT</text>
+  <rect x="42" y="324" width="1116" height="210" rx="26" fill="#ffffff" fill-opacity=".06" stroke="#ffffff" stroke-opacity=".12"/>
+  <text x="78" y="375" fill="#cdbce2" font-size="24" font-family="DejaVu Sans" font-weight="bold">PLAYER</text>
+  <text x="78" y="422" fill="#fff" font-size="38" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.player)}</text>
+  <text x="78" y="485" fill="#cdbce2" font-size="24" font-family="DejaVu Sans" font-weight="bold">BET</text>
+  <text x="78" y="525" fill="#fff" font-size="36" font-family="DejaVu Sans" font-weight="bold">${escapeXml(data.bet)}</text>
+  <text x="720" y="375" fill="#cdbce2" font-size="24" font-family="DejaVu Sans" font-weight="bold">STATUS</text>
+  <text x="720" y="422" fill="${statusColor}" font-size="38" font-family="DejaVu Sans" font-weight="bold">${status}</text>
+  <text x="55" y="605" fill="#b59acb" font-size="21" font-family="DejaVu Sans">FAIR RANDOM RESULT · PROVABLY GENERATED BY ROLEXCASINO</text>
 </svg>`;
 }
 
@@ -6325,8 +7881,8 @@ async function playLimbo(
       `Target: <b>${targetMultiplier.toFixed(2)}x</b>`,
       `Result: <b>${resultMultiplier.toFixed(2)}x</b>`,
       won
-        ? `<b>🏆 WON ${formatMoney(payoutMinor, currency)} (${targetMultiplier.toFixed(2)}x)</b>`
-        : `<b>❌ YOU LOST ${formatMoney(amountMinor, currency)}</b>`,
+        ? `<b>✅ WIN — ${formatMoney(payoutMinor, currency)} (${targetMultiplier.toFixed(2)}x)</b>`
+        : `<b>❌ LOSS — ${formatMoney(amountMinor, currency)}</b>`,
       `Balance: <b>${formatMoney(settled.balanceMinor, currency)}</b>`,
       `Fair ID: <code>${settled.fairId}</code>`,
     ].join("\n"),
@@ -6349,8 +7905,13 @@ function minesBombPositions(fairId: string, mines: number): Set<number> {
 }
 
 function minesMultiplier(mines: number, revealedCount: number): number {
-  const step = mines === 1 ? 1.1 : mines === 2 ? 1.2 : 1.3;
-  return Number(Math.pow(step, revealedCount).toFixed(2));
+  const tables: Record<number, number[]> = {
+    1: [1.1, 1.2, 1.3, 1.5, 1.71, 2.0, 2.21, 2.41, 2.69, 3.1, 3.51, 4.1, 4.5, 5.51, 7.41, 10],
+    2: [1.1, 1.31, 1.52, 2.1, 2.52, 3.48, 4.38, 5.69, 7.78, 9.28, 12.31, 15.12, 17.13, 19.23, 21.23, 25],
+    3: [1.1, 1.25, 1.45, 1.75, 2.15, 2.7, 3.4, 4.25, 5.35, 6.75, 8.55, 10.8, 13.65, 17.25, 21.8, 27.5],
+  };
+  const table = tables[mines] ?? tables[3];
+  return table[Math.min(Math.max(revealedCount - 1, 0), table.length - 1)] ?? 1;
 }
 
 function minesKeyboard(
@@ -6369,23 +7930,42 @@ function minesKeyboard(
             : game.revealed.has(cell)
               ? "💎"
               : "⬜",
-          ...(finished
-            ? {}
-            : {
-                callback_data: ownedCallback(
-                  `mines:open:${game.fairId}:${cell}`,
-                  game.userId,
-                ),
-              }),
+          callback_data: ownedCallback(
+            finished
+              ? `mines:closed:${game.fairId}`
+              : `mines:open:${game.fairId}:${cell}`,
+            game.userId,
+          ),
         };
       }),
     );
   }
   if (!finished) {
+    if (game.autoMode && game.autoRunning) {
+      rows.push([
+        {
+          text: "⏹ Stop Auto",
+          callback_data: ownedCallback(`mines:auto:stop:${game.fairId}`, game.userId),
+        },
+        {
+          text: `💰 Cash Out ${game.multiplier.toFixed(2)}×`,
+          callback_data: ownedCallback(`mines:cashout:${game.fairId}`, game.userId),
+        },
+      ]);
+    } else {
+      rows.push([
+        {
+          text: `💰 Cash Out ${game.multiplier.toFixed(2)}×`,
+          callback_data: ownedCallback(`mines:cashout:${game.fairId}`, game.userId),
+        },
+      ]);
+    }
+  }
+  if (!finished && game.autoMode && !game.autoRunning) {
     rows.push([
       {
-        text: `💰 Cash Out ${game.multiplier.toFixed(2)}×`,
-        callback_data: ownedCallback(`mines:cashout:${game.fairId}`, game.userId),
+        text: "✅ Start Auto",
+        callback_data: ownedCallback(`mines:auto:start:${game.fairId}`, game.userId),
       },
     ]);
   }
@@ -6585,6 +8165,7 @@ async function startMinesGame(
   amountMinor: number,
   currency: Currency,
   mines: number,
+  autoMode = false,
 ): Promise<void> {
   const player = await ensurePlayer(user);
   if (mines < 1 || mines > 3 || !(await betInRange(amountMinor, currency, "mines"))) {
@@ -6621,6 +8202,8 @@ async function startMinesGame(
     revealed: new Set(),
     multiplier: 1,
     status: "active",
+    autoMode,
+    autoRunning: false,
   };
   game.bombs = minesBombPositions(game.fairId, mines);
   await reserveMinesStake(game);
@@ -6636,25 +8219,29 @@ async function handleMinesChoice(
   user: TelegramUser,
   fairId: string,
   cell: number,
+  internalAuto = false,
 ): Promise<void> {
   const game = activeMinesGames.get(fairId);
   if (!game || game.userId !== user.id || game.status !== "active") {
-    await bot.sendMessage(chatId, "That Mines round is no longer active.");
+    if (!internalAuto) await bot.sendMessage(chatId, "That Mines round is no longer active.");
     return;
   }
+  if (settlingMinesGames.has(fairId)) return;
+  if (game.autoMode && game.autoRunning && !internalAuto) return;
   if (cell < 0 || cell >= 16 || game.revealed.has(cell)) return;
   if (game.bombs.has(cell)) {
+    settlingMinesGames.add(fairId);
     game.status = "lost";
-    await wait(PVP_RESULT_DELAY_MS);
     const settled = await completeMinesGame(game, "LOSS");
     activeMinesGames.delete(fairId);
+    settlingMinesGames.delete(fairId);
     if (game.messageId) {
       await bot.editMessageText(
         chatId,
         game.messageId,
         minesBoardText(
           game,
-          `<b>💥 YOU LOST ${formatMoney(game.amountMinor, game.currency)}</b>\nBalance: <b>${formatMoney(settled.balanceMinor, game.currency)}</b>`,
+          `<b>❌ LOSS — ${formatMoney(game.amountMinor, game.currency)}</b>\nBalance: <b>${formatMoney(settled.balanceMinor, game.currency)}</b>`,
         ),
           minesKeyboard(bot, game),
       );
@@ -6664,17 +8251,18 @@ async function handleMinesChoice(
   game.revealed.add(cell);
   game.multiplier = minesMultiplier(game.mines, game.revealed.size);
   if (game.revealed.size >= 16 - game.mines) {
+    settlingMinesGames.add(fairId);
     game.status = "cashed_out";
-    await wait(PVP_RESULT_DELAY_MS);
     const settled = await completeMinesGame(game, "CASHOUT");
     activeMinesGames.delete(fairId);
+    settlingMinesGames.delete(fairId);
     if (game.messageId) {
       await bot.editMessageText(
         chatId,
         game.messageId,
         minesBoardText(
           game,
-          `<b>🏆 PERFECT CLEAR — CASHED OUT ${formatMoney(settled.payoutMinor, game.currency)}</b>\nBalance: <b>${formatMoney(settled.balanceMinor, game.currency)}</b>`,
+          `<b>✅ PERFECT CLEAR — CASHED OUT ${formatMoney(settled.payoutMinor, game.currency)}</b>\nBalance: <b>${formatMoney(settled.balanceMinor, game.currency)}</b>`,
         ),
           minesKeyboard(bot, game),
       );
@@ -6683,6 +8271,50 @@ async function handleMinesChoice(
   }
   if (game.messageId) {
     await bot.editMessageText(chatId, game.messageId, minesBoardText(game), minesKeyboard(bot, game));
+  }
+}
+
+async function runMinesAuto(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  fairId: string,
+): Promise<void> {
+  const game = activeMinesGames.get(fairId);
+  if (!game || game.userId !== user.id || game.status !== "active" || !game.autoMode) return;
+  if (game.autoRunning) return;
+  game.autoRunning = true;
+  if (game.messageId) {
+    await bot.editMessageText(chatId, game.messageId, minesBoardText(game, "<b>✅ AUTO MODE RUNNING</b>\nCash out at any safe reveal."), minesKeyboard(bot, game));
+  }
+  for (let cell = 0; cell < 16; cell += 1) {
+    if (!activeMinesGames.has(fairId) || game.status !== "active" || !game.autoRunning) return;
+    if (game.revealed.has(cell)) continue;
+    await wait(1_000);
+    if (!activeMinesGames.has(fairId) || game.status !== "active" || !game.autoRunning) return;
+    await handleMinesChoice(bot, chatId, user, fairId, cell, true);
+  }
+}
+
+async function stopMinesAuto(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  fairId: string,
+): Promise<void> {
+  const game = activeMinesGames.get(fairId);
+  if (!game || game.userId !== user.id || game.status !== "active") {
+    await bot.sendMessage(chatId, "That Mines round is no longer active.");
+    return;
+  }
+  game.autoRunning = false;
+  if (game.messageId) {
+    await bot.editMessageText(
+      chatId,
+      game.messageId,
+      minesBoardText(game, "<b>⏹ AUTO MODE STOPPED</b>\nChoose a tile, start Auto again, or cash out."),
+      minesKeyboard(bot, game),
+    );
   }
 }
 
@@ -6697,14 +8329,17 @@ async function cashOutMines(
     await bot.sendMessage(chatId, "That Mines round is no longer active.");
     return;
   }
-  if (game.revealed.size === 0) {
-    await bot.sendMessage(chatId, "Reveal at least one safe tile before cashing out.");
-    return;
-  }
+  if (settlingMinesGames.has(fairId)) return;
+  settlingMinesGames.add(fairId);
   game.status = "cashed_out";
-  await wait(PVP_RESULT_DELAY_MS);
-  const settled = await completeMinesGame(game, "CASHOUT");
+  game.autoRunning = false;
   activeMinesGames.delete(fairId);
+  let settled: { balanceMinor: number; payoutMinor: number };
+  try {
+    settled = await completeMinesGame(game, "CASHOUT");
+  } finally {
+    settlingMinesGames.delete(fairId);
+  }
   if (game.messageId) {
     await bot.editMessageText(
       chatId,
@@ -7033,7 +8668,7 @@ async function sendHistory(bot: TelegramBot, chatId: number, playerId: number): 
     return;
   }
   const image = await gameHistoryCardPng(
-    player?.displayName ?? "Player",
+    player?.username ? `@${player.username}` : player?.displayName ?? "Player",
     history,
   );
   await bot.sendPhoto(
@@ -7044,33 +8679,174 @@ async function sendHistory(bot: TelegramBot, chatId: number, playerId: number): 
 }
 
 async function sendLeaderboard(bot: TelegramBot, chatId: number): Promise<void> {
-  const wallets = await db
-    .select()
-    .from(casinoWalletsTable)
-    .where(gte(casinoWalletsTable.balanceMinor, 0))
-    .orderBy(desc(casinoWalletsTable.balanceMinor))
-    .limit(10);
-  const playerIds = wallets.map((wallet) => wallet.playerId);
-  const players =
-    playerIds.length > 0
-      ? await db
-          .select()
-          .from(casinoPlayersTable)
-          .where(inArray(casinoPlayersTable.id, playerIds))
-      : [];
-  const names = new Map(players.map((player) => [player.id, player.displayName]));
-  await bot.sendMessage(
+  await sendWagerLeaderboard(bot, chatId, "global");
+}
+
+type WagerLeaderboardMode = "global" | "weekly" | "monthly";
+
+type WagerLeaderboardItem = {
+  rank: number;
+  name: string;
+  wagerInrMinor: number;
+  wagerLabel: string;
+};
+
+function leaderboardPeriod(mode: WagerLeaderboardMode): {
+  title: string;
+  subtitle: string;
+  since: Date | null;
+} {
+  const now = Date.now();
+  if (mode === "weekly") {
+    return {
+      title: "WEEKLY WAGER LEADERBOARD",
+      subtitle: "HIGHEST WAGER · LAST 7 DAYS · TOP 10 PLAYERS",
+      since: new Date(now - 7 * 24 * 60 * 60 * 1_000),
+    };
+  }
+  if (mode === "monthly") {
+    return {
+      title: "MONTHLY WAGER LEADERBOARD",
+      subtitle: "HIGHEST WAGER · LAST 30 DAYS · TOP 10 PLAYERS",
+      since: new Date(now - 30 * 24 * 60 * 60 * 1_000),
+    };
+  }
+  return {
+    title: "GLOBAL WAGER LEADERBOARD",
+    subtitle: "ALL-TIME WAGER · TOP 10 PLAYERS",
+    since: null,
+  };
+}
+
+function isLeaderboardBot(player: typeof casinoPlayersTable.$inferSelect): boolean {
+  return Boolean(
+      player.isBot ||
+      /(?:^|[_\-\s])bot(?:$|[_\-\s])/i.test(player.username ?? "") ||
+      /(?:^|\s)bot(?:$|\s)/i.test(player.displayName),
+  );
+}
+
+function wagerLeaderboardSvg(
+  mode: WagerLeaderboardMode,
+  items: WagerLeaderboardItem[],
+): string {
+  const period = leaderboardPeriod(mode);
+  const rows = items.length > 0
+    ? items.map((item, index) => {
+        const y = 296 + index * 54;
+        const fill = index === 0 ? "#f6c453" : index === 1 ? "#cbd5e1" : index === 2 ? "#d99862" : "#ffffff";
+        return [
+          `<rect x="58" y="${y - 34}" width="1084" height="45" rx="14" fill="#ffffff" fill-opacity="${index < 3 ? ".09" : ".045"}" stroke="#ffffff" stroke-opacity=".08"/>`,
+          `<text x="88" y="${y}" fill="${fill}" font-size="29" font-family="DejaVu Sans, sans-serif" font-weight="bold">${item.rank}</text>`,
+          `<text x="172" y="${y}" fill="#ffffff" font-size="27" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(svgLabel(item.name, 28))}</text>`,
+          `<text x="1100" y="${y}" text-anchor="end" fill="${index < 3 ? "#76e3a3" : "#dbe7f5"}" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold">${escapeXml(item.wagerLabel)}</text>`,
+        ].join("");
+      }).join("")
+    : `<text x="600" y="350" text-anchor="middle" fill="#a9bad2" font-size="26" font-family="DejaVu Sans, sans-serif">No qualifying player wagers yet</text>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900">
+  <defs><linearGradient id="wagerBg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0d172d"/><stop offset=".55" stop-color="#172b4b"/><stop offset="1" stop-color="#111a35"/>
+  </linearGradient></defs>
+  <rect width="1200" height="900" rx="42" fill="url(#wagerBg)"/>
+  <circle cx="1080" cy="90" r="230" fill="#f6c453" opacity=".10"/>
+  <circle cx="70" cy="830" r="230" fill="#3b82f6" opacity=".10"/>
+  <rect x="42" y="42" width="1116" height="816" rx="32" fill="none" stroke="#ffffff" stroke-opacity=".15"/>
+  <text x="78" y="112" fill="#f6c453" font-size="25" font-family="DejaVu Sans, sans-serif" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="78" y="176" fill="#ffffff" font-size="45" font-family="DejaVu Sans, sans-serif" font-weight="bold">${period.title}</text>
+  <text x="78" y="218" fill="#9db0cb" font-size="22" font-family="DejaVu Sans, sans-serif" letter-spacing="2">${period.subtitle}</text>
+  <text x="172" y="266" fill="#8da2bd" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">PLAYER</text>
+  <text x="1100" y="266" text-anchor="end" fill="#8da2bd" font-size="18" font-family="DejaVu Sans, sans-serif" font-weight="bold">WAGERED (INR VALUE)</text>
+  ${rows}
+  <text x="78" y="825" fill="#7185a3" font-size="17" font-family="DejaVu Sans, sans-serif">Only verified human player accounts are shown. USD wagers are converted at the current platform rate.</text>
+</svg>`;
+}
+
+async function wagerLeaderboardPng(
+  mode: WagerLeaderboardMode,
+  items: WagerLeaderboardItem[],
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render wager leaderboard image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(wagerLeaderboardSvg(mode, items));
+  });
+}
+
+async function sendWagerLeaderboard(
+  bot: TelegramBot,
+  chatId: number,
+  mode: WagerLeaderboardMode,
+): Promise<void> {
+  const period = leaderboardPeriod(mode);
+  const roundRows = await db
+    .select({
+      playerId: casinoGameRoundsTable.playerId,
+      stakeMinor: casinoGameRoundsTable.stakeMinor,
+      currency: casinoGameRoundsTable.currency,
+    })
+    .from(casinoGameRoundsTable)
+    .where(period.since ? gte(casinoGameRoundsTable.createdAt, period.since) : undefined);
+  const battleRows = await db
+    .select({
+      creatorPlayerId: casinoChallengesTable.creatorPlayerId,
+      playerTwoId: casinoChallengesTable.playerTwoId,
+      stakeMinor: casinoChallengesTable.stakeMinor,
+      currency: casinoChallengesTable.currency,
+      completedAt: casinoChallengesTable.completedAt,
+    })
+    .from(casinoChallengesTable)
+    .where(
+      and(
+        eq(casinoChallengesTable.status, "completed"),
+        ...(period.since ? [gte(casinoChallengesTable.completedAt, period.since)] : []),
+      ),
+    );
+  const wagerByPlayer = new Map<number, number>();
+  const addWager = (playerId: number | null, amountMinor: number, currency: string) => {
+    if (playerId == null) return;
+    const wagerInr = convertMinor(amountMinor, parseCurrency(currency, "USD"), "INR");
+    wagerByPlayer.set(playerId, (wagerByPlayer.get(playerId) ?? 0) + wagerInr);
+  };
+  for (const row of roundRows) addWager(row.playerId, row.stakeMinor, row.currency);
+  for (const row of battleRows) {
+    addWager(row.creatorPlayerId, row.stakeMinor, row.currency);
+    addWager(row.playerTwoId, row.stakeMinor, row.currency);
+  }
+  const playerIds = [...wagerByPlayer.keys()];
+  const players = playerIds.length > 0
+    ? await db.select().from(casinoPlayersTable).where(inArray(casinoPlayersTable.id, playerIds))
+    : [];
+  const playerById = new Map(players.map((player) => [player.id, player]));
+  const items = playerIds
+    .filter((playerId) => {
+      const player = playerById.get(playerId);
+      return Boolean(player && !isLeaderboardBot(player));
+    })
+    .sort((left, right) => (wagerByPlayer.get(right) ?? 0) - (wagerByPlayer.get(left) ?? 0))
+    .slice(0, 10)
+    .map((playerId, index) => {
+      const player = playerById.get(playerId);
+      const wagerInrMinor = wagerByPlayer.get(playerId) ?? 0;
+      return {
+        rank: index + 1,
+        name: player?.username ? `@${player.username}` : player?.displayName ?? "Player",
+        wagerInrMinor,
+        wagerLabel: formatMoney(wagerInrMinor, "INR"),
+      };
+    });
+  const image = await wagerLeaderboardPng(mode, items);
+  await bot.sendPhoto(
     chatId,
-    [
-      "🏆 RolexCasino leaderboard",
-      "",
-      ...(wallets.length > 0
-        ? wallets.map(
-            (wallet, index) =>
-              `${index + 1}. ${escapeTelegramText(names.get(wallet.playerId) ?? "Player")} — ${formatMoney(wallet.balanceMinor, wallet.currency as Currency)}`,
-          )
-        : ["No funded player wallets yet."]),
-    ].join("\n"),
+    image,
+    `<b>🏆 ${period.title}</b>\n${escapeTelegramText(period.subtitle)}`,
   );
 }
 
@@ -7081,7 +8857,7 @@ async function sendGames(
   ownerTelegramUserId: number,
 ): Promise<void> {
   const configuredLimits = await Promise.all(
-      ["dice", "darts", "basketball", "football", "bowling", "slots", "limbo", "mines"].map(
+      ["dice", "darts", "basketball", "football", "bowling", "slots", "limbo", "mines", "roulette"].map(
       async (gameType) => [
         gameType,
         await configuredBetLimitText("INR", gameType),
@@ -7104,6 +8880,7 @@ async function sendGames(
       "🎲 <b>Dice Rush (dr)</b>",
       "🎲 <b>7up</b>",
       "🚀 <b>Limbo</b>",
+      "🎡 <b>Roulette–VS Bot</b> — <code>/roul AMOUNT INR|USD</code>",
       "💣 <b>Mines</b>",
       "♠️ <b>Blackjack</b> — <code>/bj AMOUNT INR|USD</code>",
       "",
@@ -7117,6 +8894,7 @@ async function sendGames(
         ["Bowling", "bowling"],
         ["Slots", "slots"],
         ["Limbo", "limbo"],
+        ["Roulette", "roulette"],
         ["Mines", "mines"],
         ["Blackjack", "bj"],
       ].map(([label, gameType]) => `${label}: ${limitByGame.get(gameType)}`).join("\n")}`,
@@ -7125,6 +8903,9 @@ async function sendGames(
       inline_keyboard: [[
         { text: "Currency", callback_data: ownedCallback("main:currency", ownerTelegramUserId) },
         { text: "Support", callback_data: ownedCallback("main:support", ownerTelegramUserId) },
+      ], [
+        { text: "❔ How to play", callback_data: ownedCallback("main:how", ownerTelegramUserId) },
+        { text: "📜 Terms", callback_data: ownedCallback("main:terms", ownerTelegramUserId) },
       ]],
     },
   );
@@ -7584,6 +9365,334 @@ async function distributeDueRewards(bot: TelegramBot): Promise<void> {
       logger.error({ err: error, rewardType: kind }, "Scheduled reward distribution failed");
     }
   }
+  try {
+    await distributeConfiguredGiveaways(bot);
+  } catch (error) {
+    logger.error({ err: error }, "Configured giveaway distribution failed");
+  }
+}
+
+type GiveawayKind = "monthly" | "multi_day" | "referral" | "giveaway" | "rakeback";
+
+type GiveawaySetting = typeof casinoGiveawaySettingsTable.$inferSelect;
+
+function isUserGiveawaySetting(settings: GiveawaySetting): boolean {
+  return settings.kind === "giveaway" || /^giveaway_\d+$/.test(settings.kind);
+}
+
+async function activeGiveawaySettings(): Promise<GiveawaySetting[]> {
+  const settings = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(eq(casinoGiveawaySettingsTable.enabled, true));
+  return settings
+    .filter(isUserGiveawaySetting)
+    .sort((left, right) => left.id - right.id);
+}
+
+function giveawayLabel(settings: GiveawaySetting, index: number): string {
+  return `GIVEAWAY ${index + 1}`;
+}
+
+async function giveawayPlayerMetrics(
+  playerId: number,
+  settings: GiveawaySetting,
+): Promise<{ wagerMinor: number; referrals: number; bets: number }> {
+  const since = settings.nextDrawAt
+    ? new Date(settings.nextDrawAt.getTime() - giveawayPeriodMs(settings))
+    : new Date(0);
+  const [rounds, battles, referrals] = await Promise.all([
+    db
+      .select()
+      .from(casinoGameRoundsTable)
+      .where(
+        and(
+          eq(casinoGameRoundsTable.playerId, playerId),
+          eq(casinoGameRoundsTable.currency, parseCurrency(settings.currency, "INR")),
+          gte(casinoGameRoundsTable.createdAt, since),
+        ),
+      ),
+    db
+      .select()
+      .from(casinoChallengesTable)
+      .where(
+        and(
+          eq(casinoChallengesTable.status, "completed"),
+          eq(casinoChallengesTable.currency, parseCurrency(settings.currency, "INR")),
+          gte(casinoChallengesTable.createdAt, since),
+          or(
+            eq(casinoChallengesTable.creatorPlayerId, playerId),
+            eq(casinoChallengesTable.playerTwoId, playerId),
+          ),
+        ),
+      ),
+    db
+      .select()
+      .from(casinoPlayersTable)
+      .where(eq(casinoPlayersTable.referredByPlayerId, playerId)),
+  ]);
+  return {
+    wagerMinor:
+      rounds.reduce((total, round) => total + round.stakeMinor, 0) +
+      battles.reduce((total, battle) => total + battle.stakeMinor, 0),
+    referrals: referrals.length,
+    bets: rounds.length + battles.length,
+  };
+}
+
+function giveawayOverviewSvg(
+  settings: GiveawaySetting[],
+  title: string,
+  subtitle: string,
+): string {
+  const rows = settings.slice(0, 7).map((settingsRow, index) => {
+    const currency = parseCurrency(settingsRow.currency, "INR");
+    const y = 230 + index * 82;
+    return [
+      `<text x="86" y="${y}" fill="#f6c453" font-size="25" font-family="DejaVu Sans" font-weight="bold">${escapeXml(giveawayLabel(settingsRow, index))}</text>`,
+      `<text x="420" y="${y}" fill="#ffffff" font-size="25" font-family="Deja Vu Sans" font-weight="bold">${escapeXml(formatMoney(settingsRow.amountMinor, currency))}</text>`,
+      `<text x="680" y="${y}" fill="#b6c7df" font-size="20" font-family="Deja Sans">Wager ${escapeXml(formatMoney(settingsRow.minWagerMinor, currency))} · Referrals ${settingsRow.minReferralCount}</text>`,
+      `<text x="420" y="${y + 30}" fill="#8da2bd" font-size="18" font-family="Deja Sans">Winners ${settingsRow.maxWinners} · Draw ${escapeXml(settingsRow.nextDrawAt?.toLocaleDateString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "pending")}</text>`,
+    ].join("");
+  }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820">
+  <defs><linearGradient id="giveaway-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#101a31"/><stop offset="1" stop-color="#183b45"/></linearGradient></defs>
+  <rect width="1400" height="820" rx="42" fill="url(#giveaway-bg)"/><rect x="42" y="42" width="1316" height="736" rx="32" fill="none" stroke="#f6c453" stroke-opacity=".38" stroke-width="2"/>
+  <text x="86" y="108" fill="#f6c453" font-size="30" font-family="DejaVu Sans" font-weight="bold" letter-spacing="5">ROLEXCASINO</text>
+  <text x="86" y="164" fill="#ffffff" font-size="48" font-family="Deja Sans" font-weight="bold">${escapeXml(title)}</text>
+  <text x="86" y="198" fill="#9db0cb" font-size="20" font-family="Deja Sans">${escapeXml(subtitle)}</text>
+  ${rows || `<text x="700" y="360" text-anchor="middle" fill="#b6c7df" font-size="28" font-family="Deja Sans">No active giveaways</text>`}
+  <text x="86" y="760" fill="#7185a3" font-size="18" font-family="Deja Sans">Eligibility is checked at join time and again before the draw.</text>
+  </svg>`;
+}
+
+async function giveawayOverviewPng(
+  settings: GiveawaySetting[],
+  title: string,
+  subtitle: string,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("convert", ["svg:-", "png:-"]);
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    process.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    process.on("error", reject);
+    process.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`Could not render giveaway image: ${Buffer.concat(errors).toString("utf8")}`));
+    });
+    process.stdin.end(giveawayOverviewSvg(settings, title, subtitle));
+  });
+}
+
+function giveawayOverviewKeyboard(
+  settings: GiveawaySetting[],
+): { inline_keyboard: InlineKeyboardButton[][] } {
+  return {
+    inline_keyboard: settings.map((settingsRow, index) => [{
+      text: `Join ${index + 1}`,
+      callback_data: `giveaway:select:${settingsRow.kind}`,
+    }]),
+  };
+}
+
+function giveawayPeriodMs(settings: {
+  periodDays: number;
+}): number {
+  return Math.max(1, settings.periodDays) * 24 * 60 * 60 * 1_000;
+}
+
+async function sendGiveawaySettings(
+  bot: TelegramBot,
+  chatId: number,
+  kind: string,
+): Promise<void> {
+  const [settings] = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(eq(casinoGiveawaySettingsTable.kind, kind))
+    .limit(1);
+  if (!settings || !settings.enabled) {
+    await bot.sendMessage(chatId, `<b>🎁 ${kind.toUpperCase()} is not configured.</b>`);
+    return;
+  }
+  const currency = parseCurrency(settings.currency, "INR");
+  await bot.sendMessage(
+    chatId,
+    [
+      `<b>🎁 ${kind.toUpperCase()} CONFIGURATION</b>`,
+      "",
+      `Reward: <b>${kind === "rakeback" ? `${(settings.amountMinor / 100).toFixed(2)}%` : formatMoney(settings.amountMinor, currency)}</b>`,
+      `Maximum winners: <b>${settings.maxWinners || "all eligible"}</b>`,
+      `Minimum wager: <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
+      `Minimum referrals: <b>${settings.minReferralCount}</b>`,
+      `Period: <b>${settings.periodDays} day(s)</b>`,
+      `Next draw: <b>${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "not scheduled"}</b>`,
+    ].join("\n"),
+  );
+}
+
+async function configureGiveaway(
+  bot: TelegramBot,
+  chatId: number,
+  userId: number,
+  kind: string,
+  values: {
+    amountMinor: number;
+    currency: Currency;
+    maxWinners: number;
+    minWagerMinor: number;
+    minReferralCount?: number;
+    periodDays: number;
+  },
+): Promise<void> {
+  const now = new Date();
+  const [existing] = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(eq(casinoGiveawaySettingsTable.kind, kind))
+    .limit(1);
+  const nextDrawAt = existing?.nextDrawAt && existing.nextDrawAt > now
+    ? existing.nextDrawAt
+    : new Date(now.getTime() + values.periodDays * 24 * 60 * 60 * 1_000);
+  if (existing) {
+    await db
+      .update(casinoGiveawaySettingsTable)
+      .set({
+        amountMinor: values.amountMinor,
+        currency: values.currency,
+        maxWinners: values.maxWinners,
+        minWagerMinor: values.minWagerMinor,
+        minReferralCount: values.minReferralCount ?? 0,
+        periodDays: values.periodDays,
+        enabled: true,
+        updatedByTelegramUserId: userId,
+        nextDrawAt,
+        updatedAt: now,
+      })
+      .where(eq(casinoGiveawaySettingsTable.id, existing.id));
+  } else {
+    await db.insert(casinoGiveawaySettingsTable).values({
+      kind,
+      amountMinor: values.amountMinor,
+      currency: values.currency,
+      maxWinners: values.maxWinners,
+      minWagerMinor: values.minWagerMinor,
+      minReferralCount: values.minReferralCount ?? 0,
+      periodDays: values.periodDays,
+      enabled: true,
+      updatedByTelegramUserId: userId,
+      nextDrawAt,
+    });
+  }
+  await bot.sendMessage(
+    chatId,
+    `<b>✅ ${kind.toUpperCase()} SAVED</b>\n\nNext draw: <b>${nextDrawAt.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" })}</b>`,
+  );
+}
+
+async function distributeConfiguredGiveaways(bot: TelegramBot): Promise<void> {
+  const now = new Date();
+  const settingsRows = await db
+    .select()
+    .from(casinoGiveawaySettingsTable)
+    .where(eq(casinoGiveawaySettingsTable.enabled, true));
+  for (const settings of settingsRows) {
+    if (!settings.nextDrawAt || settings.nextDrawAt > now) continue;
+    const kind = settings.kind as GiveawayKind;
+    const periodKey = settings.nextDrawAt.toISOString();
+    const since = new Date(settings.nextDrawAt.getTime() - giveawayPeriodMs(settings));
+    const players = await db.select().from(casinoPlayersTable);
+    const referralCounts = new Map<number, number>();
+    for (const player of players) {
+      if (player.referredByPlayerId != null) {
+        referralCounts.set(
+          player.referredByPlayerId,
+          (referralCounts.get(player.referredByPlayerId) ?? 0) + 1,
+        );
+      }
+    }
+    const rounds = await db
+      .select()
+      .from(casinoGameRoundsTable)
+      .where(
+        and(
+          gte(casinoGameRoundsTable.createdAt, since),
+          eq(casinoGameRoundsTable.currency, parseCurrency(settings.currency, "INR")),
+        ),
+      );
+    const wagerByPlayer = new Map<number, number>();
+    for (const round of rounds) {
+      wagerByPlayer.set(round.playerId, (wagerByPlayer.get(round.playerId) ?? 0) + round.stakeMinor);
+    }
+    let eligible = players.filter(
+      (player) =>
+        (wagerByPlayer.get(player.id) ?? 0) >= settings.minWagerMinor &&
+        (referralCounts.get(player.id) ?? 0) >= settings.minReferralCount,
+    );
+    if (kind === "referral") {
+      eligible = players
+        .filter((player) => player.referralEarningsMinor > 0)
+        .sort((left, right) => right.referralEarningsMinor - left.referralEarningsMinor);
+    } else if (kind !== "rakeback") {
+      eligible = shufflePlayers(eligible);
+    }
+    const recipients = settings.maxWinners > 0
+      ? eligible.slice(0, settings.maxWinners)
+      : eligible;
+    const recipientIds = new Set(recipients.map((recipient) => recipient.id));
+    for (const recipient of eligible) {
+      const rewardMinor = kind === "rakeback"
+        ? Math.floor((wagerByPlayer.get(recipient.id) ?? 0) * settings.amountMinor / 10_000)
+        : settings.amountMinor;
+      if (rewardMinor <= 0) continue;
+      const [claim] = await db
+        .insert(casinoGiveawayClaimsTable)
+        .values({
+          kind,
+          periodKey,
+          playerId: recipient.id,
+          amountMinor: rewardMinor,
+          currency: parseCurrency(settings.currency, "INR"),
+          selected: recipientIds.has(recipient.id),
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (!claim) continue;
+      if (!claim.selected) continue;
+      try {
+        const reward = await adjustBalance({
+          adminId: settings.updatedByTelegramUserId ?? 0,
+          telegramUserId: recipient.telegramUserId,
+          amountMinor: rewardMinor,
+          currency: parseCurrency(settings.currency, "INR"),
+          entryType: "admin_credit",
+          description: `${kind} giveaway reward`,
+        });
+        await bot.sendMessage(
+          recipient.telegramUserId,
+          [
+            `<b>🏆🎉 ${kind.toUpperCase()} WINNER</b>`,
+            "",
+            `Reward credited: <b>${formatMoney(rewardMinor, parseCurrency(settings.currency, "INR"))}</b>`,
+            `Balance: <b>${formatMoney(reward.balanceMinor, parseCurrency(settings.currency, "INR"))}</b>`,
+            "Withdrawal wagering rule: <b>1× the credited reward</b>.",
+            "Use /wagerstatus to check progress.",
+          ].join("\n"),
+        );
+      } catch (error) {
+        logger.warn({ err: error, playerId: recipient.id, kind }, "Giveaway reward notification failed");
+      }
+    }
+    await db
+      .update(casinoGiveawaySettingsTable)
+      .set({
+        nextDrawAt: new Date(settings.nextDrawAt.getTime() + giveawayPeriodMs(settings)),
+        updatedAt: now,
+      })
+      .where(eq(casinoGiveawaySettingsTable.id, settings.id));
+  }
 }
 
 async function handleAdminCommand(
@@ -7700,6 +9809,7 @@ async function handleAdminCommand(
 
   if (
     command === "set" ||
+    command === "setgameamount" ||
     normalizeConfigurableGameType(command.slice(3)) !== null ||
     parseCompactMinimumCommand(command) !== null
   ) {
@@ -7708,11 +9818,11 @@ async function handleAdminCommand(
       return true;
     }
     const compactSet = parseCompactMinimumCommand(command);
-    const gameToken = command === "set"
+    const gameToken = command === "set" || command === "setgameamount"
       ? args[0]
       : compactSet?.gameToken ?? command.slice(3);
     const gameType = normalizeConfigurableGameType(gameToken);
-    const valueArgs = command === "set"
+    const valueArgs = command === "set" || command === "setgameamount"
       ? args.slice(1)
       : compactSet
         ? [compactSet.amountToken, ...args]
@@ -7736,7 +9846,7 @@ async function handleAdminCommand(
     ) {
       await bot.sendMessage(
         chatId,
-        "Usage: /set GAME AMOUNT INR|USD or /setdice AMOUNT INR|USD\nExample: /set dice 25 INR",
+         "Usage: /setgameamount GAME AMOUNT INR|USD\nExample: /setgameamount roulette 25 INR",
       );
       return true;
     }
@@ -7914,12 +10024,13 @@ async function handleAdminCommand(
         ? await releaseEscrow(code)
         : await cancelEscrowImmediately(code);
       await refreshEscrowCard(bot, escrow, true);
+      await unpinEscrow(bot, escrow);
       const currency = parseCurrency(escrow.currency, "USD");
       await bot.sendMessage(
         chatId,
         decision === "seller"
-          ? `✅ Admin resolution complete: ${escrow.code} released to the accepting buyer. ${formatMoney(escrow.amountMinor, currency)} credited and the completed card remains pinned.`
-          : `✅ Admin resolution complete: ${escrow.code} cancelled. ${formatMoney(escrow.amountMinor, currency)} refunded to the seller; the completed card remains pinned.`,
+          ? `✅ Admin resolution complete: ${escrow.code} released to the accepting buyer. ${formatMoney(escrow.amountMinor, currency)} credited and the completed card was unpinned.`
+          : `✅ Admin resolution complete: ${escrow.code} cancelled. ${formatMoney(escrow.amountMinor, currency)} refunded to the seller; the completed card was unpinned.`,
       );
       await auditTransaction(
         bot,
@@ -8861,7 +10972,6 @@ async function handleMainUpdate(
   helperBots: Map<string, TelegramBot>,
 ): Promise<void> {
   if (update.callback_query) {
-    await bot.answerCallback(update.callback_query.id);
     const callback = update.callback_query;
     const chatId = callback.message?.chat.id;
     if (!chatId) return;
@@ -8873,10 +10983,25 @@ async function handleMainUpdate(
     const rawAction = callback.data ?? "";
     const action = resolveCallbackOwner(rawAction, callback.from.id);
     if (action === null) {
-      await bot.sendMessage(chatId, "This button belongs to another player.");
+      await bot.answerCallback(callback.id, BUTTON_NOT_FOR_YOU_MESSAGE, true);
       return;
     }
-    if (action.startsWith("cash:")) {
+    await bot.answerCallback(callback.id);
+    if (action.startsWith("roll:")) {
+      const [, rawStake, rawCurrency] = action.split(":");
+      const rollBot = helperBots.get("dice");
+      const stakeMinor = Number(rawStake);
+      if (rollBot && Number.isInteger(stakeMinor) && stakeMinor > 0) {
+        await playHelperGame(
+          rollBot,
+          bot,
+          chatId,
+          callback.from,
+          stakeMinor,
+          parseCurrency(rawCurrency, "USD"),
+        );
+      }
+    } else if (action.startsWith("cash:")) {
       await handleCashCallback(bot, chatId, callback, action);
     } else if (action.startsWith("deposit:network:")) {
       const [, , rawRequestId, rawNetwork] = action.split(":");
@@ -8968,23 +11093,75 @@ async function handleMainUpdate(
         await bot.sendMessage(chatId, "Withdrawals are available only in private chat.", privateOnlyKeyboard(bot, "withdraw"));
       }
     } else if (action === "main:currency") {
+      await openCurrencyMenu(
+        bot,
+        chatId,
+        player,
+        parseDisplayCurrency(player.preferredCurrency, "USD"),
+        callback.message?.message_id,
+      );
+    } else if (action === "main:language") {
       await bot.sendMessage(
         chatId,
-        `<b>🔄 Display Currency — ${parseCurrency(player.preferredCurrency, "USD")}</b>\n\nChoose the currency shown for your wallet and new bets.`,
-        currencyKeyboard(
-          parseCurrency(player.preferredCurrency, "USD"),
-          player.telegramUserId,
-        ),
+        "<b>🌐 Bot Language</b>\n\nChoose the language for your account menu.",
+        languageKeyboard(player.language ?? "en", player.telegramUserId),
+      );
+    } else if (action === "main:giveaway") {
+      await sendLatestGiveaway(bot, chatId);
+      await bot.sendMessage(
+        chatId,
+        "<b>🎁 Giveaway bot commands</b>\n<code>/latest</code> — show the latest giveaway\n<code>/join</code> — join the latest giveaway",
       );
     } else if (action === "main:support") {
       await sendSupport(bot, chatId);
+    } else if (action === "main:how") {
+      await sendHowToPlay(bot, chatId);
+    } else if (action === "main:terms") {
+      await sendGameTerms(bot, chatId);
     } else if (action.startsWith("currency:set:")) {
-      const currency = parseCurrency(action.split(":")[2], "USD");
+      const currency = parseDisplayCurrency(action.split(":")[2], "USD");
       await changePlayerCurrency(player.id, currency);
+      const text = [
+        `<b>✅ Currency updated — ${currency}</b>`,
+        "",
+        "Your display currency changed live. INR and USD remain the settlement wallets.",
+        "",
+        await balanceText(player.id, currency),
+      ].join("\n");
+      const keyboard = currencyKeyboard(currency, player.telegramUserId);
+      if (isPrivateChat(callback.message?.chat ?? { id: chatId, type: "group" })) {
+        const messageId = callback.message?.message_id;
+        if (messageId) {
+          await bot.editMessageText(chatId, messageId, text, keyboard);
+          currencyMenuMessages.set(player.telegramUserId, { chatId, messageId });
+        } else {
+          await openCurrencyMenu(bot, chatId, player, currency);
+        }
+      } else {
+        const existing = currencyMenuMessages.get(player.telegramUserId);
+        if (existing) {
+          try {
+            await bot.editMessageText(existing.chatId, existing.messageId, text, keyboard);
+          } catch {
+            currencyMenuMessages.delete(player.telegramUserId);
+            await openCurrencyMenu(bot, chatId, player, currency);
+          }
+        } else {
+          await openCurrencyMenu(bot, chatId, player, currency);
+        }
+      }
+    } else if (action.startsWith("language:set:")) {
+      const language = action.split(":")[2] ?? "en";
+      if (!BOT_LANGUAGES.some((item) => item.code === language)) return;
+      await db
+        .update(casinoPlayersTable)
+        .set({ language, updatedAt: new Date() })
+        .where(eq(casinoPlayersTable.id, player.id));
+      const selected = BOT_LANGUAGES.find((item) => item.code === language) ?? BOT_LANGUAGES[0];
       await bot.sendMessage(
         chatId,
-        `<b>✅ Currency updated</b>\n\nDisplay currency: <b>${currency}</b>\n\n${await balanceText(player.id, currency)}`,
-        currencyKeyboard(currency, player.telegramUserId),
+        `<b>✅ Language updated</b>\n\n${selected.flag} ${selected.label}`,
+        languageKeyboard(language, player.telegramUserId),
       );
     } else if (action.startsWith("tip:")) {
       await handleTipCallback(bot, chatId, player, action);
@@ -9073,14 +11250,100 @@ async function handleMainUpdate(
       if (Number.isSafeInteger(amountMinor) && Number.isInteger(mines)) {
         await startMinesGame(bot, chatId, callback.from, amountMinor, currency, mines);
       }
+    } else if (action.startsWith("mines:auto:start:")) {
+      await runMinesAuto(bot, chatId, callback.from, action.split(":")[3] ?? "");
+    } else if (action.startsWith("mines:auto:stop:")) {
+      await stopMinesAuto(bot, chatId, callback.from, action.split(":")[3] ?? "");
     } else if (action.startsWith("mines:open:")) {
       const [, , fairId, rawCell] = action.split(":");
       const cell = Number(rawCell);
       if (Number.isInteger(cell)) {
         await handleMinesChoice(bot, chatId, callback.from, fairId ?? "", cell);
       }
+    } else if (action.startsWith("mines:closed:")) {
+      await bot.sendMessage(chatId, "That Mines round is already closed.");
     } else if (action.startsWith("mines:cashout:")) {
       await cashOutMines(bot, chatId, callback.from, action.split(":")[2] ?? "");
+    } else if (action.startsWith("roulette:menu:")) {
+      const battleId = Number(action.split(":")[2]);
+      if (Number.isInteger(battleId)) {
+        const [battle] = await db
+          .select()
+          .from(casinoChallengesTable)
+          .where(eq(casinoChallengesTable.id, battleId))
+          .limit(1);
+        if (
+          battle &&
+          battle.mode === "pvb" &&
+          battle.gameType === "roulette" &&
+          battle.status === "roulette_choice" &&
+          battle.creatorPlayerId === player.id &&
+          battle.messageId
+        ) {
+          await bot.editMessageText(
+            chatId,
+            battle.messageId,
+            `<b>🎰 ROULETTE–VS BOT ROOM #${battle.id}</b>\n\nChoose a side below:`,
+            rouletteKeyboard(player.telegramUserId, battle.id),
+          );
+        }
+      }
+    } else if (action.startsWith("roulette:numbers:")) {
+      const battleId = Number(action.split(":")[2]);
+      if (Number.isInteger(battleId)) {
+        const [battle] = await db
+          .select()
+          .from(casinoChallengesTable)
+          .where(eq(casinoChallengesTable.id, battleId))
+          .limit(1);
+        if (
+          battle &&
+          battle.mode === "pvb" &&
+          battle.gameType === "roulette" &&
+          battle.status === "roulette_choice" &&
+          battle.creatorPlayerId === player.id &&
+          battle.messageId
+        ) {
+          await bot.editMessageText(
+            chatId,
+            battle.messageId,
+            `<b>🎰 ROULETTE–VS BOT ROOM #${battle.id}</b>\n\nChoose a number from 1 to 36:`,
+            rouletteKeyboard(player.telegramUserId, battle.id, true),
+          );
+        }
+      }
+    } else if (action.startsWith("roulette:choose:")) {
+      const [, , rawBattleId, firstChoice, rawNumber] = action.split(":");
+      const choice = firstChoice === "number"
+        ? `number:${rawNumber}` as RouletteChoice
+        : firstChoice as RouletteChoice;
+      const battleId = Number(rawBattleId);
+      if (
+        Number.isInteger(battleId) &&
+        (choice === "odd" ||
+          choice === "even" ||
+          choice === "1-8" ||
+          choice === "9-18" ||
+          isRouletteChoice(choice))
+      ) {
+        await handleRouletteChoice(bot, chatId, callback.from, battleId, choice);
+      }
+    } else if (action.startsWith("coin:pvb:choose:")) {
+      const [, , , rawBattleId, rawSide] = action.split(":");
+      const battleId = Number(rawBattleId);
+      if (
+        Number.isInteger(battleId) &&
+        (rawSide === "HEADS" || rawSide === "TAILS")
+      ) {
+        await handlePvbCoinChoice(
+          bot,
+          helperBots,
+          chatId,
+          callback.from,
+          battleId,
+          rawSide,
+        );
+      }
     } else if (action.startsWith("coin:choose:")) {
       const [, , rawBattleId, rawSide] = action.split(":");
       const battleId = Number(rawBattleId);
@@ -9104,11 +11367,16 @@ async function handleMainUpdate(
   const message = update.message;
   if (!message?.from) return;
   const chatId = message.chat.id;
+  const parsedCommand = message.text ? commandFrom(message.text) : null;
+  if (parsedCommand?.command === "power") {
+    await handlePowerCommand(bot, chatId, message.from.id, parsedCommand.args);
+    return;
+  }
+  if (!casinoPowerOn && !isAdmin(message.from.id)) {
+    await bot.sendMessage(chatId, MAINTENANCE_MESSAGE);
+    return;
+  }
   if (message.dice) {
-    if (!casinoPowerOn && !isAdmin(message.from.id)) {
-      await bot.sendMessage(chatId, MAINTENANCE_MESSAGE);
-      return;
-    }
     const player = await ensurePlayer(message.from);
     if (await handlePlayerPvpRoll(bot, message, player)) return;
     await handlePlayerPvbRoll(bot, message, player, helperBots);
@@ -9130,16 +11398,7 @@ async function handleMainUpdate(
   }
   if (!message.text) return;
   if (!message.text.trim().startsWith("/")) return;
-  const { command, args } = commandFrom(message.text);
-
-  if (command === "power") {
-    await handlePowerCommand(bot, chatId, message.from.id, args);
-    return;
-  }
-  if (!casinoPowerOn && !isAdmin(message.from.id)) {
-    await bot.sendMessage(chatId, MAINTENANCE_MESSAGE);
-    return;
-  }
+  const { command, args } = parsedCommand ?? commandFrom(message.text);
   const player = await ensurePlayer(message.from);
   if (await handleAdminCommand(bot, chatId, message.from.id, command, args, message)) return;
   const isGameplayCommand =
@@ -9148,7 +11407,10 @@ async function handleMainUpdate(
     command === "7up" ||
     command === "dr" ||
     command === "limbo" ||
+    command === "roul" ||
+    command === "roulette" ||
     command === "mines" ||
+    command === "minesauto" ||
     command === "bj" ||
     command === "blackjack" ||
     command === "jackpot";
@@ -9235,33 +11497,56 @@ async function handleMainUpdate(
   } else if (command === "help" || command === "support") {
     await sendMainHelp(bot, chatId, player.telegramUserId);
     if (command === "support") await sendSupport(bot, chatId);
+  } else if (command === "language" || command === "lang") {
+    await bot.sendMessage(
+      chatId,
+      "<b>🌐 Bot Language</b>\n\nChoose one of the available languages:",
+      languageKeyboard(player.language ?? "en", player.telegramUserId),
+    );
+  } else if (command === "rates" || command === "exchange") {
+    await sendCurrencyRates(bot, chatId);
+  } else if (command === "giveaway" || command === "latest") {
+    await sendLatestGiveaway(bot, chatId);
+    await bot.sendMessage(
+      chatId,
+      "<b>🎁 Giveaway bot commands</b>\n<code>/latest</code> — show the latest giveaway\n<code>/join</code> — join the latest giveaway",
+    );
+  } else if (command === "join") {
+    const settings = await activeGiveawaySettings();
+    if (settings[0]) await joinGiveaway(bot, chatId, message.from, settings[0]);
+    else await bot.sendMessage(chatId, "<b>🎁 No active giveaway right now.</b>\nPlease check again soon.");
   } else if (command === "balance" || command === "wallet" || command === "bal" || command === "wal") {
     const currency = parseCurrency(args[0], parseCurrency(player.preferredCurrency, "USD"));
     await sendWallet(bot, chatId, { ...player, preferredCurrency: currency });
   } else if (command === "profile") {
     await sendProfile(bot, chatId, player);
   } else if (command === "currency" || command === "changecurrency") {
-    const currency = args[0]?.toUpperCase();
-    if (!currency || !isSupportedCurrency(currency)) {
-      await bot.sendMessage(
+    const currency = args[0]?.toUpperCase() as DisplayCurrency | undefined;
+    if (!currency || !DISPLAY_CURRENCIES.some((item) => item.code === currency)) {
+      await openCurrencyMenu(
+        bot,
         chatId,
-        `<b>🔄 Display Currency — ${parseCurrency(player.preferredCurrency, "USD")}</b>\n\nChoose your wallet display currency.`,
-          currencyKeyboard(
-            parseCurrency(player.preferredCurrency, "USD"),
-            player.telegramUserId,
-          ),
+        player,
+        parseDisplayCurrency(player.preferredCurrency, "USD"),
       );
     } else {
       await changePlayerCurrency(player.id, currency);
-      await bot.sendMessage(
+      await openCurrencyMenu(
+        bot,
         chatId,
-        `<b>✅ Currency updated</b>\n\nDisplay currency: <b>${currency}</b>\n\n${await balanceText(player.id, currency)}`,
-          currencyKeyboard(currency, player.telegramUserId),
+        player,
+        currency,
       );
     }
-  } else if (command === "setwallet" && args.length === 0) {
-    await beginWalletSetup(bot, chatId, message.from.id);
   } else if (command === "setwallet" || command === "saveupi") {
+    if (!isPrivateChat(message.chat)) {
+      await bot.sendMessage(chatId, "Wallet setup is available only in your private chat with RolexCasino.");
+      return;
+    }
+    if (command === "setwallet" && args.length === 0) {
+      await beginWalletSetup(bot, chatId, message.from.id);
+      return;
+    }
     const value = command === "saveupi" ? args[0] : args.join("");
     if (!value) {
       await bot.sendMessage(chatId, "Usage: /setwallet UPI_ID_OR_CRYPTO_ADDRESS");
@@ -9283,8 +11568,14 @@ async function handleMainUpdate(
     await sendMyStats(bot, chatId, player);
   } else if (command === "stats") {
     await sendMyStats(bot, chatId, player);
-  } else if (command === "rank" || command === "leaderboard") {
-    await sendLeaderboard(bot, chatId);
+  } else if (command === "global" || command === "rank" || command === "leaderboard") {
+    await sendWagerLeaderboard(bot, chatId, "global");
+  } else if (command === "weekly") {
+    await sendWagerLeaderboard(bot, chatId, "weekly");
+  } else if (command === "monthly") {
+    await sendWagerLeaderboard(bot, chatId, "monthly");
+  } else if (command === "weeklybonus") {
+    await sendBonusClaimStatus(bot, chatId, player, "weekly");
   } else if (command === "reflead" || command === "referralleaderboard") {
     await sendReferralLeaderboard(bot, chatId);
   } else if (command === "wagerstatus") {
@@ -9294,7 +11585,14 @@ async function handleMainUpdate(
       player.id,
       parseCurrency(player.preferredCurrency, "USD"),
     );
-  } else if (command === "daily" || command === "weekly") {
+  } else if (command === "newclientseed") {
+    const seed = createClientSeed();
+    clientSeeds.set(player.telegramUserId, seed);
+    await bot.sendMessage(
+      chatId,
+      `<b>✅ YOUR NEW CLIENT SEED</b>\n\n<b>Your client seed:</b> <code>${seed}</code>\n\n<b>${escapeTelegramText("Keep this seed private. It is used as your new fairness/cache seed.")}</b> ❌`,
+    );
+  } else if (command === "daily") {
     await sendBonusClaimStatus(bot, chatId, player, command);
   } else if (command === "tip") {
     await handleTip(bot, chatId, message, player, args);
@@ -9330,12 +11628,37 @@ async function handleMainUpdate(
   } else if (command === "coin") {
     const coinArgs = args[0]?.toLowerCase() === "pvp" ? args.slice(1) : args;
     const repliedUser = message.reply_to_message?.from;
-    if (!repliedUser) {
-      await bot.sendMessage(chatId, "Reply to a player with /coin AMOUNT INR|USD to create a coin PVP room.");
-    } else {
-      const amountMinor = parseMoney(coinArgs[0]);
+    const requestedSide = coinArgs[0]?.toUpperCase();
+    if (!repliedUser && (requestedSide === "HEADS" || requestedSide === "TAILS")) {
+      const amountMinor = parseMoney(coinArgs[1]);
       const currency = parseCurrency(
-        coinArgs[1],
+        coinArgs[2],
+        parseCurrency(player.preferredCurrency, "USD"),
+      );
+      await createBattle(
+        bot,
+        chatId,
+        message.from,
+        { gameType: "coin", emoji: "🪙" },
+        {
+          mode: "pvb",
+          amountMinor,
+          rounds: 1,
+          rollsPerRound: 1,
+          targetWins: null,
+          currency,
+          resultRule: requestedSide.toLowerCase() as "heads" | "tails",
+        },
+      );
+    } else if (!repliedUser) {
+      await bot.sendMessage(chatId, "<b>Usage:</b> <code>/coin heads AMOUNT INR|USD</code> for PVB, or reply to a player with <code>/coin AMOUNT INR|USD</code> for PVP.");
+    } else {
+      const pvpSide = requestedSide === "HEADS" || requestedSide === "TAILS"
+        ? requestedSide
+        : null;
+      const amountMinor = parseMoney(pvpSide ? coinArgs[1] : coinArgs[0]);
+      const currency = parseCurrency(
+        pvpSide ? coinArgs[2] : coinArgs[1],
         parseCurrency(player.preferredCurrency, "USD"),
       );
       const invitedPlayer = await ensurePlayer(repliedUser);
@@ -9351,11 +11674,18 @@ async function handleMainUpdate(
           rollsPerRound: 1,
           targetWins: null,
           currency,
-          resultRule: "high",
+          resultRule: pvpSide ? pvpSide.toLowerCase() as "heads" | "tails" : "high",
         },
         invitedPlayer,
       );
     }
+  } else if (command === "roul" || command === "roulette") {
+    const amountMinor = parseMoney(args[0]);
+    const currency = parseCurrency(
+      args[1],
+      parseCurrency(player.preferredCurrency, "USD"),
+    );
+    await startRoulette(bot, chatId, message.from, amountMinor, currency);
   } else if (command === "limbo") {
     const targetToken = args[1]?.toLowerCase().replace(/x$/, "");
     const targetMultiplier = targetToken ? Number(targetToken) : null;
@@ -9376,6 +11706,18 @@ async function handleMainUpdate(
       await bot.sendMessage(chatId, "<b>Usage:</b> /mines AMOUNT INR|USD\n\nExample: <code>/mines 30 INR</code>");
     } else {
       await sendMinesSelection(bot, chatId, amountMinor, currency, player.telegramUserId);
+    }
+  } else if (command === "minesauto") {
+    const mines = Number(args[0]);
+    const amountMinor = parseMoney(args[1]);
+    const currency = parseCurrency(args[2], parseCurrency(player.preferredCurrency, "USD"));
+    if (!Number.isInteger(mines) || mines < 1 || mines > 3 || !amountMinor) {
+      await bot.sendMessage(
+        chatId,
+        "<b>Usage:</b> <code>/minesauto BOMBS AMOUNT INR|USD</code>\n\n<b>Example:</b> <code>/minesauto 2 30 INR</code>",
+      );
+    } else {
+      await startMinesGame(bot, chatId, message.from, amountMinor, currency, mines, true);
     }
   } else if (command === "bj" || command === "blackjack") {
     const amountMinor = parseMoney(args[0]);
@@ -9451,31 +11793,32 @@ async function handleMainUpdate(
 }
 
 async function playHelperGame(
-  bot: TelegramBot,
+  rollBot: TelegramBot,
+  resultBot: TelegramBot,
   chatId: number,
   user: TelegramUser,
   stakeMinor: number,
   currency: Currency,
 ): Promise<void> {
-  if (!bot.gameType) return;
+  if (!rollBot.gameType) return;
   const player = await ensurePlayer(user);
   const wallet = await ensureWallet(player.id, currency);
   if (wallet.balanceMinor < stakeMinor) {
-    await bot.sendMessage(
+    await resultBot.sendMessage(
       chatId,
       `Insufficient ${currency} balance. Your balance is ${formatMoney(wallet.balanceMinor, currency)}.\nAsk an administrator to review a balance credit.`,
     );
     return;
   }
 
-  const roll = await bot.sendDice(chatId);
+  const roll = await rollBot.sendDice(chatId);
   const rollValue = roll.dice?.value ?? 0;
-  const result = evaluateRoll(bot.gameType, rollValue);
+  const result = evaluateRoll(rollBot.gameType, rollValue);
   try {
     const settled = await settleGame({
       playerId: player.id,
-      helperBot: bot.label,
-      gameType: bot.gameType,
+      helperBot: rollBot.label,
+      gameType: rollBot.gameType,
       currency,
       stakeMinor,
       rollValue,
@@ -9483,13 +11826,13 @@ async function playHelperGame(
     });
     const payoutMinor = Math.floor(stakeMinor * result.multiplier);
     if (result.multiplier > 0) {
-      await broadcastPlayerWin(bot, player.id, bot.gameType, payoutMinor, currency);
+      await broadcastPlayerWin(resultBot, player.id, rollBot.gameType, payoutMinor, currency);
     }
     await sendDelayedGameResult(
-      bot,
+      resultBot,
       chatId,
       [
-        `<b>🎲 ${bot.gameType.toUpperCase()} RESULT</b>`,
+        `<b>🎲 ${rollBot.gameType.toUpperCase()} RESULT</b>`,
         "",
         "<blockquote>",
         `<b>Roll:</b> ${rollValue}`,
@@ -9498,23 +11841,26 @@ async function playHelperGame(
         `🎲 <b>Result:</b> ${result.outcome}`,
         "</blockquote>",
         result.multiplier > 0
-          ? `<b>🏆 YOU WON ${formatMoney(payoutMinor, currency)}</b>`
-          : `<b>❌ YOU LOST ${formatMoney(stakeMinor, currency)}</b>`,
+          ? `<b>✅ WIN — YOU WON ${formatMoney(payoutMinor, currency)}</b>`
+          : `<b>❌ LOSS — YOU LOST ${formatMoney(stakeMinor, currency)}</b>`,
         `Balance: <b>${formatMoney(settled.balanceMinor, currency)}</b>`,
         `Fair ID: <code>${settled.fairId}</code>`,
       ].join("\n"),
       {
         inline_keyboard: [
-          [{ text: "Roll again", callback_data: `roll:${stakeMinor}:${currency}` }],
+          [{
+            text: "Roll again",
+            callback_data: ownedCallback(`roll:${stakeMinor}:${currency}`, user.id),
+          }],
         ],
       },
     );
     await auditTransaction(
-      bot,
+      resultBot,
       [
         "Type: helper game settlement",
         `Player: ${player.telegramUserId}`,
-        `Game: ${bot.gameType}`,
+        `Game: ${rollBot.gameType}`,
         `Stake: ${formatMoney(stakeMinor, currency)}`,
         `Payout: ${formatMoney(payoutMinor, currency)}`,
         `Fair ID: <code>${settled.fairId}</code>`,
@@ -9523,7 +11869,7 @@ async function playHelperGame(
     );
   } catch (error) {
     if (error instanceof Error && error.message === "INSUFFICIENT_BALANCE") {
-      await bot.sendMessage(chatId, "The round was not accepted because your balance changed. Check /balance and try again.");
+      await resultBot.sendMessage(chatId, "The round was not accepted because your balance changed. Check /balance and try again.");
       return;
     }
     throw error;
@@ -9567,16 +11913,16 @@ function simpleGameResultText(options: {
     ? `${options.rollValues.join(" + ")} = ${options.rollValue}`
     : String(options.rollValue);
   return [
-    `<b>${options.outcome.multiplier > 0 ? "🏆🎉" : "❌"} ${title}</b>`,
+    `<b>${options.outcome.multiplier > 0 ? "✅ WIN" : "❌ LOSS"} · ${title}</b>`,
     "",
     "<blockquote>",
     isPredict ? `<b>Your pick:</b> ${dicePickLabel(options.choice)}` : "",
     `<b>Multiplier:</b> <b>${options.outcome.multiplier.toFixed(2)}×</b>`,
     `<b>Bet:</b> <b>${formatMoney(options.stakeMinor, options.currency)} → ${formatMoney(options.payoutMinor, options.currency)}</b>`,
-    `🎲 <b>Rolled value:</b> <b>${rollLabel}</b> ${options.outcome.multiplier > 0 ? "✔️" : "✖️"}`,
+    `🎲 <b>Rolled value:</b> <b>${rollLabel}</b> ${options.outcome.multiplier > 0 ? "✅" : "❌"}`,
     "</blockquote>",
     options.outcome.multiplier > 0
-      ? `<b>🏆 YOU WON ${formatMoney(options.payoutMinor, options.currency)}</b>`
+      ? `<b>✅ YOU WON ${formatMoney(options.payoutMinor, options.currency)}</b>`
       : `<b>❌ YOU LOST ${formatMoney(options.stakeMinor, options.currency)}</b>`,
     `Balance: <b>${formatMoney(options.balanceMinor, options.currency)}</b>`,
     `Fair ID: <code>${options.fairId}</code>`,
@@ -9590,13 +11936,13 @@ function blackjackCardsLabel(cards: import("./rolex-casino-blackjack").Blackjack
 function blackjackStatusText(status: BlackjackStatus): string {
   switch (status) {
     case "player_blackjack":
-      return "BLACKJACK";
+      return "✅ BLACKJACK — YOU WIN";
     case "won":
-      return "YOU WIN";
+      return "✅ YOU WIN";
     case "lost":
-      return "DEALER WINS";
+      return "❌ YOU LOSE — DEALER WINS";
     case "push":
-      return "PUSH";
+      return "✅ PUSH — STAKE RETURNED";
     default:
       return "YOUR TURN";
   }
@@ -9650,26 +11996,37 @@ function blackjackCardSvg(room: BlackjackRoom): string {
   const dealerCards = game.status === "active"
     ? [game.dealerCards[0], null]
     : game.dealerCards;
-  const cardMarkup = (
+  const cardWidth = 146;
+  const cardHeight = 200;
+  const handMarkup = (
     cards: (import("./rolex-casino-blackjack").BlackjackCard | null)[],
     y: number,
-  ) => cards.map((card, index) => {
-    const x = 80 + index * 145;
-    const label = card ? escapeXml(blackjackCardLabel(card)) : "🂠";
-    const color = card && ["♥", "♦"].includes(card.suit) ? "#ef7890" : "#f2f4f7";
-    return `<g transform="translate(${x} ${y})"><rect width="118" height="158" rx="16" fill="#f8fafc" stroke="#d6b45e" stroke-width="3"/><text x="59" y="83" text-anchor="middle" fill="${color}" font-size="38" font-family="DejaVu Sans" font-weight="bold">${label}</text></g>`;
-  }).join("");
+  ) => {
+    const gap = 16;
+    const totalWidth = cards.length * cardWidth + Math.max(0, cards.length - 1) * gap;
+    const startX = 76 + Math.max(0, (700 - totalWidth) / 2);
+    return cards.map((card, index) => {
+      const x = startX + index * (cardWidth + gap);
+      if (!card) {
+        return `<g transform="translate(${x} ${y})"><rect width="${cardWidth}" height="${cardHeight}" rx="18" fill="#32146b" stroke="#46e7a0" stroke-width="4"/><rect x="12" y="12" width="${cardWidth - 24}" height="${cardHeight - 24}" rx="12" fill="none" stroke="#e5c45f" stroke-width="3" stroke-dasharray="9 6"/><text x="${cardWidth / 2}" y="122" text-anchor="middle" fill="#f5d477" font-size="58" font-family="DejaVu Sans" font-weight="bold">R</text></g>`;
+      }
+      const isRed = card.suit === "♥" || card.suit === "♦";
+      const color = isRed ? "#c52258" : "#111827";
+      const rankSize = card.rank === "10" ? 34 : 42;
+      return `<g transform="translate(${x} ${y})"><rect width="${cardWidth}" height="${cardHeight}" rx="18" fill="#fbfcff" stroke="#46e7a0" stroke-width="4"/><text x="17" y="44" fill="${color}" font-size="${rankSize}" font-family="DejaVu Sans" font-weight="bold">${escapeXml(card.rank)}</text><text x="18" y="82" fill="${color}" font-size="34" font-family="DejaVu Sans" font-weight="bold">${escapeXml(card.suit)}</text><text x="${cardWidth / 2}" y="142" text-anchor="middle" fill="${color}" font-size="58" font-family="DejaVu Sans" font-weight="bold">${escapeXml(card.suit)}</text><text x="${cardWidth - 18}" y="${cardHeight - 17}" text-anchor="end" fill="${color}" font-size="${rankSize}" font-family="DejaVu Sans" font-weight="bold" transform="rotate(180 ${cardWidth - 18} ${cardHeight - 17})">${escapeXml(card.rank)}</text></g>`;
+    }).join("");
+  };
   const resultColor =
     game.status === "won" || game.status === "player_blackjack" ? "#70e59a" :
       game.status === "lost" ? "#ff7d91" : "#f3cf69";
   const result = game.status === "active" ? "YOUR TURN" : blackjackStatusText(game.status);
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820">
   <defs><linearGradient id="felt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#061d25"/><stop offset="1" stop-color="#123d3b"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#bb8a2d"/><stop offset=".5" stop-color="#ffe9a2"/><stop offset="1" stop-color="#c99b3b"/></linearGradient></defs>
-  <rect width="1200" height="700" rx="38" fill="url(#felt)"/><circle cx="1040" cy="110" r="240" fill="#d0a848" opacity=".08"/><circle cx="180" cy="620" r="260" fill="#4fd1c5" opacity=".07"/><rect x="36" y="36" width="1128" height="628" rx="28" fill="none" stroke="#d9b55c" stroke-opacity=".38" stroke-width="2"/>
-  <text x="72" y="96" fill="#f5d477" font-size="24" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text><text x="72" y="145" fill="#fff" font-size="42" font-family="DejaVu Sans" font-weight="bold">BLACKJACK</text><text x="1090" y="106" text-anchor="end" fill="#b7d8d0" font-size="20" font-family="DejaVu Sans">ROOM ${escapeXml(room.roomId)}</text>
-  <text x="72" y="210" fill="#9cc4bd" font-size="20" font-family="DejaVu Sans" font-weight="bold">DEALER · ${game.status === "active" ? "HIDDEN CARD" : `${blackjackHandValue(game.dealerCards)} POINTS`}</text>${cardMarkup(dealerCards, 232)}
-  <line x1="72" y1="424" x2="1128" y2="424" stroke="#d9b55c" stroke-opacity=".22"/><text x="72" y="466" fill="#9cc4bd" font-size="20" font-family="DejaVu Sans" font-weight="bold">PLAYER · ${blackjackHandValue(game.playerCards)} POINTS</text>${cardMarkup(game.playerCards, 486)}
-  <text x="690" y="530" fill="${resultColor}" font-size="35" font-family="DejaVu Sans" font-weight="bold">${result}</text><text x="690" y="575" fill="#fff" font-size="25" font-family="DejaVu Sans">BET ${escapeXml(formatMoney(room.amountMinor, room.currency))}</text><text x="690" y="618" fill="url(#gold)" font-size="20" font-family="DejaVu Sans">FAIR RANDOM RESULT</text>
+  <rect width="1400" height="820" rx="38" fill="url(#felt)"/><circle cx="1210" cy="130" r="270" fill="#d0a848" opacity=".08"/><circle cx="220" cy="740" r="300" fill="#4fd1c5" opacity=".07"/><rect x="36" y="36" width="1328" height="748" rx="28" fill="none" stroke="#d9b55c" stroke-opacity=".38" stroke-width="2"/>
+  <text x="76" y="102" fill="#f5d477" font-size="32" font-family="DejaVu Sans" font-weight="bold" letter-spacing="6">ROLEX-CASINO</text><text x="76" y="162" fill="#fff" font-size="58" font-family="DejaVu Sans" font-weight="bold">BLACKJACK</text><text x="1290" y="102" text-anchor="end" fill="#b7d8d0" font-size="25" font-family="DejaVu Sans">ROOM ${escapeXml(room.roomId)}</text><text x="1290" y="146" text-anchor="end" fill="#ffffff" font-size="32" font-family="DejaVu Sans" font-weight="bold">${escapeXml(room.playerLabel)}</text>
+  <text x="76" y="222" fill="#9cc4bd" font-size="25" font-family="DejaVu Sans" font-weight="bold">DEALER · ${game.status === "active" ? "HIDDEN CARD" : `${blackjackHandValue(game.dealerCards)} POINTS`}</text>${handMarkup(dealerCards, 244)}
+  <line x1="76" y1="492" x2="1290" y2="492" stroke="#d9b55c" stroke-opacity=".22"/><text x="76" y="536" fill="#9cc4bd" font-size="25" font-family="DejaVu Sans" font-weight="bold">PLAYER · ${blackjackHandValue(game.playerCards)} POINTS</text>${handMarkup(game.playerCards, 558)}
+  <rect x="920" y="220" width="350" height="520" rx="24" fill="#071a25" stroke="#46e7a0" stroke-opacity=".45" stroke-width="2"/><text x="950" y="278" fill="#b7d8d0" font-size="23" font-family="DejaVu Sans" font-weight="bold">ROUND RESULT</text><text x="950" y="348" fill="${resultColor}" font-size="42" font-family="DejaVu Sans" font-weight="bold">${result}</text><text x="950" y="414" fill="#fff" font-size="29" font-family="DejaVu Sans">BET ${escapeXml(formatMoney(room.amountMinor, room.currency))}</text><text x="950" y="475" fill="#b7d8d0" font-size="24" font-family="DejaVu Sans">PLAYER SCORE</text><text x="950" y="525" fill="#fff" font-size="48" font-family="DejaVu Sans" font-weight="bold">${blackjackHandValue(game.playerCards)}</text><text x="950" y="586" fill="#b7d8d0" font-size="24" font-family="DejaVu Sans">DEALER SCORE</text><text x="950" y="636" fill="#fff" font-size="48" font-family="DejaVu Sans" font-weight="bold">${game.status === "active" ? "?" : blackjackHandValue(game.dealerCards)}</text><text x="950" y="694" fill="url(#gold)" font-size="22" font-family="DejaVu Sans">FAIR RANDOM RESULT</text>
   </svg>`;
 }
 
@@ -9690,44 +12047,66 @@ async function blackjackCardPng(room: BlackjackRoom): Promise<Buffer> {
 }
 
 async function finishBlackjackRoom(bot: TelegramBot, room: BlackjackRoom): Promise<void> {
+  if (blackjackActionsInFlight.has(room.roomId)) return;
+  blackjackActionsInFlight.add(room.roomId);
   const payoutMultiplier = blackjackMultiplier(room.game.status);
-  const settled = await settleGame({
-    playerId: room.playerId,
-    helperBot: "blackjack-main",
-    gameType: "bj",
-    currency: room.currency,
-    stakeMinor: room.amountMinor,
-    rollValue: blackjackHandValue(room.game.playerCards),
-    result: {
-      outcome: room.game.status === "push" ? "PUSH" : payoutMultiplier > 0 ? "WIN" : "LOSS",
-      multiplier: payoutMultiplier,
-    },
-    fairId: room.fairId,
-  });
-  activeBlackjackRooms.delete(room.roomId);
-  const image = await blackjackCardPng(room);
-  const caption = blackjackCaption(room, settled);
-  if (room.messageId) {
-    await bot.editPhoto(room.chatId, room.messageId, image, caption);
-  } else {
-    const sent = await bot.sendPhoto(room.chatId, image, caption);
-    room.messageId = sent.message_id;
+  try {
+    const settled = await settleGame({
+      playerId: room.playerId,
+      helperBot: "blackjack-main",
+      gameType: "bj",
+      currency: room.currency,
+      stakeMinor: room.amountMinor,
+      rollValue: blackjackHandValue(room.game.playerCards),
+      result: {
+        outcome: room.game.status === "push" ? "PUSH" : payoutMultiplier > 0 ? "WIN" : "LOSS",
+        multiplier: payoutMultiplier,
+      },
+      fairId: room.fairId,
+    });
+    activeBlackjackRooms.delete(room.roomId);
+    const image = await blackjackCardPng(room);
+    const caption = blackjackCaption(room, settled);
+    if (room.messageId) {
+      try {
+        await bot.editPhoto(
+          room.chatId,
+          room.messageId,
+          image,
+          caption,
+          { inline_keyboard: [] },
+        );
+      } catch (error) {
+        logger.warn({ err: error, roomId: room.roomId }, "Blackjack result edit failed; sending result message");
+        try {
+          await bot.editReplyMarkup(room.chatId, room.messageId, { inline_keyboard: [] });
+        } catch (markupError) {
+          logger.warn({ err: markupError, roomId: room.roomId }, "Blackjack button cleanup failed");
+        }
+        await bot.sendPhoto(room.chatId, image, caption);
+      }
+    } else {
+      const sent = await bot.sendPhoto(room.chatId, image, caption);
+      room.messageId = sent.message_id;
+    }
+    if (payoutMultiplier > 0) {
+      await broadcastPlayerWin(bot, room.playerId, "blackjack", Math.round(room.amountMinor * payoutMultiplier), room.currency);
+    }
+    await auditTransaction(
+      bot,
+      [
+        "Type: blackjack settlement",
+        `Player: ${room.userId}`,
+        `Room: ${room.roomId}`,
+        `Stake: ${formatMoney(room.amountMinor, room.currency)}`,
+        `Payout: ${formatMoney(Math.round(room.amountMinor * payoutMultiplier), room.currency)}`,
+        `Fair ID: <code>${room.fairId}</code>`,
+        `Outcome: ${room.game.status}`,
+      ].join("\n"),
+    );
+  } finally {
+    blackjackActionsInFlight.delete(room.roomId);
   }
-  if (payoutMultiplier > 0) {
-    await broadcastPlayerWin(bot, room.playerId, "blackjack", Math.round(room.amountMinor * payoutMultiplier), room.currency);
-  }
-  await auditTransaction(
-    bot,
-    [
-      "Type: blackjack settlement",
-      `Player: ${room.userId}`,
-      `Room: ${room.roomId}`,
-      `Stake: ${formatMoney(room.amountMinor, room.currency)}`,
-      `Payout: ${formatMoney(Math.round(room.amountMinor * payoutMultiplier), room.currency)}`,
-      `Fair ID: <code>${room.fairId}</code>`,
-      `Outcome: ${room.game.status}`,
-    ].join("\n"),
-  );
 }
 
 async function updateBlackjackRoom(bot: TelegramBot, room: BlackjackRoom): Promise<void> {
@@ -9767,6 +12146,9 @@ async function startBlackjack(
   const room: BlackjackRoom = {
     roomId: randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase(),
     userId: user.id,
+    playerLabel: user.username
+      ? `@${user.username}`
+      : [user.first_name, user.last_name].filter(Boolean).join(" ") || "Player",
     playerId: player.id,
     chatId,
     amountMinor,
@@ -9799,16 +12181,32 @@ async function handleBlackjackAction(
 ): Promise<void> {
   const room = activeBlackjackRooms.get(roomId);
   if (!room || room.userId !== user.id || room.chatId !== chatId || room.game.status !== "active") {
-    await bot.sendMessage(chatId, "That Blackjack room is no longer active.");
     return;
   }
-  if (action === "hit") blackjackHit(room.game);
-  else blackjackStand(room.game);
-  if (room.game.status === "active") await updateBlackjackRoom(bot, room);
-  else await finishBlackjackRoom(bot, room);
+  if (blackjackActionsInFlight.has(room.roomId)) return;
+  blackjackActionsInFlight.add(room.roomId);
+  try {
+    if (action === "hit") blackjackHit(room.game);
+    else blackjackStand(room.game);
+    if (room.game.status === "active") {
+      await updateBlackjackRoom(bot, room);
+      blackjackActionsInFlight.delete(room.roomId);
+    } else {
+      blackjackActionsInFlight.delete(room.roomId);
+      await finishBlackjackRoom(bot, room);
+    }
+  } catch (error) {
+    blackjackActionsInFlight.delete(room.roomId);
+    logger.error({ err: error, roomId: room.roomId, action }, "Blackjack action failed");
+    await bot.sendMessage(chatId, "Blackjack could not finish this action. Please check the room result.");
+  }
 }
 
-async function handleHelperUpdate(bot: TelegramBot, update: TelegramUpdate): Promise<void> {
+async function handleHelperUpdate(
+  bot: TelegramBot,
+  update: TelegramUpdate,
+  resultBot: TelegramBot,
+): Promise<void> {
   if (update.callback_query) {
     await bot.answerCallback(update.callback_query.id);
     const callback = update.callback_query;
@@ -9818,20 +12216,24 @@ async function handleHelperUpdate(bot: TelegramBot, update: TelegramUpdate): Pro
       await bot.sendMessage(chatId, MAINTENANCE_MESSAGE);
       return;
     }
-    if (!callback.message || !isOfficialGameChat(callback.message.chat)) {
-      await bot.sendMessage(
-        chatId,
-        "Games are available only in the official RolexCasino group.",
-        officialGroupKeyboard(),
-      );
-      return;
-    }
-    if (callback.data?.startsWith("roll:")) {
-      const [, rawStake, rawCurrency] = callback.data.split(":");
+    const rawAction = callback.data ?? "";
+    if (!rawAction.startsWith("owner:")) return;
+    const action = resolveCallbackOwner(rawAction, callback.from.id);
+    if (action === null) return;
+    if (!callback.message || !isOfficialGameChat(callback.message.chat)) return;
+    if (action.startsWith("roll:")) {
+      const [, rawStake, rawCurrency] = action.split(":");
       const stakeMinor = Number(rawStake);
       const currency = parseCurrency(rawCurrency, "USD");
       if (Number.isInteger(stakeMinor) && stakeMinor > 0) {
-        await playHelperGame(bot, chatId, callback.from, stakeMinor, currency);
+        await playHelperGame(
+          bot,
+          resultBot,
+          chatId,
+          callback.from,
+          stakeMinor,
+          currency,
+        );
       }
     }
     return;
@@ -9839,42 +12241,494 @@ async function handleHelperUpdate(bot: TelegramBot, update: TelegramUpdate): Pro
 
   const message = update.message;
   if (!message?.from || !message.text) return;
-  const { command, args } = commandFrom(message.text);
   if (!casinoPowerOn && !isAdmin(message.from.id)) {
     await bot.sendMessage(message.chat.id, MAINTENANCE_MESSAGE);
     return;
   }
-  if (isPrivateChat(message.chat)) {
-    await bot.sendMessage(
-      message.chat.id,
-      [
-        "<b>🤖 This is a RolexCasino game helper.</b>",
-        "",
-        "I can process game rolls in the official RolexCasino group.",
-        "For /withdraw, /deposit, /daily, /weekly, /balance, /profile, /support, and account commands, message the main RolexCasino bot.",
-        "Your command was received and was not ignored.",
-      ].join("\n"),
-    );
-    return;
-  }
-  if (!isOfficialGameChat(message.chat)) {
-    await bot.sendMessage(
-      message.chat.id,
-      "Games are available only in the official RolexCasino group.",
-      officialGroupKeyboard(),
-    );
-    return;
-  }
+  const { command, args } = commandFrom(message.text);
+  if (isPrivateChat(message.chat) || !isOfficialGameChat(message.chat)) return;
   if (command === "roll" || command === "play") {
     const amountMinor = parseMoney(args[0]);
     const player = await ensurePlayer(message.from);
     const currency = parseCurrency(args[1], parseCurrency(player.preferredCurrency, "USD"));
-    if (!amountMinor) {
-      await bot.sendMessage(message.chat.id, "Usage: /roll 100 INR or /roll 10.50 USD");
+    if (amountMinor) {
+      await playHelperGame(
+        bot,
+        resultBot,
+        message.chat.id,
+        message.from,
+        amountMinor,
+        currency,
+      );
+    }
+    return;
+  }
+}
+
+async function sendLatestGiveaway(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<void> {
+  const settings = await activeGiveawaySettings();
+  if (!settings.length) {
+    await bot.sendMessage(chatId, "<b>🎁 No active giveaway right now.</b>\nPlease check again soon.");
+    return;
+  }
+  const image = await giveawayOverviewPng(
+    settings,
+    "ACTIVE GIVEAWAYS",
+    "Choose one giveaway to review its requirements and join.",
+  );
+  await bot.sendMessage(
+    chatId,
+    "<b>🎁 Choose a giveaway below.</b>\nThe bot checks your wager and referral requirements before joining.",
+    giveawayOverviewKeyboard(settings),
+  );
+  await bot.sendPhoto(
+    chatId,
+    image,
+    "<b>🎁 ACTIVE ROLEXCASINO GIVEAWAYS</b>\nSelect a giveaway to see its requirements.",
+    giveawayOverviewKeyboard(settings),
+  );
+}
+
+async function sendGiveawayRequirements(
+  bot: TelegramBot,
+  chatId: number,
+  settings: GiveawaySetting,
+  index: number,
+): Promise<void> {
+  const currency = parseCurrency(settings.currency, "INR");
+  await bot.sendMessage(
+    chatId,
+    [
+      `<b>🎁 ${giveawayLabel(settings, index)}</b>`,
+      "",
+      `Prize: <b>${formatMoney(settings.amountMinor, currency)}</b>`,
+      `Winners: <b>${settings.maxWinners}</b>`,
+      `Minimum wager: <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
+      `Minimum referrals: <b>${settings.minReferralCount}</b>`,
+      `Draw: <b>${settings.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "scheduled soon"}</b>`,
+      "",
+      "Eligibility is checked again before the draw.",
+    ].join("\n"),
+    {
+      inline_keyboard: [[{
+        text: "Join giveaway",
+        callback_data: `giveaway:join:${settings.kind}`,
+      }]],
+    },
+  );
+}
+
+async function joinGiveaway(
+  bot: TelegramBot,
+  chatId: number,
+  user: TelegramUser,
+  settings: GiveawaySetting,
+): Promise<void> {
+  const player = await ensurePlayer(user);
+  const metrics = await giveawayPlayerMetrics(player.id, settings);
+  const currency = parseCurrency(settings.currency, "INR");
+  if (
+    metrics.wagerMinor < settings.minWagerMinor ||
+    metrics.referrals < settings.minReferralCount
+  ) {
+    await bot.sendMessage(
+      chatId,
+      [
+        "<b>❌ You are not eligible yet.</b>",
+        "",
+        `Wager: <b>${formatMoney(metrics.wagerMinor, currency)}</b> / <b>${formatMoney(settings.minWagerMinor, currency)}</b>`,
+        `Referrals: <b>${metrics.referrals}</b> / <b>${settings.minReferralCount}</b>`,
+        "",
+        "Keep playing and referring players, then press Join again.",
+      ].join("\n"),
+    );
+    return;
+  }
+  const periodKey = settings.nextDrawAt?.toISOString() ?? `${settings.updatedAt.toISOString()}:${settings.id}`;
+  const [entry] = await db
+    .insert(casinoGiveawayClaimsTable)
+    .values({
+      kind: settings.kind,
+      periodKey,
+      playerId: player.id,
+      amountMinor: settings.amountMinor,
+      currency: parseCurrency(settings.currency, "INR"),
+      selected: false,
+    })
+    .onConflictDoNothing()
+    .returning();
+  await bot.sendMessage(
+    chatId,
+    entry
+      ? `<b>✅ You joined ${settings.kind === "giveaway" ? "the giveaway" : settings.kind.replace("giveaway_", "Giveaway ")}.</b>\nUse /giveawayrank to see your points and rank.`
+      : "<b>ℹ️ You are already registered for this giveaway.</b>",
+  );
+}
+
+async function sendGiveawayAdminPanel(
+  bot: TelegramBot,
+  chatId: number,
+  admin: TelegramUser,
+): Promise<void> {
+  const settings = await activeGiveawaySettings();
+  const [claims, players] = await Promise.all([
+    db.select().from(casinoGiveawayClaimsTable),
+    db.select().from(casinoPlayersTable),
+  ]);
+  const playerNames = new Map(players.map((player) => [player.id, player.username ? `@${player.username}` : player.displayName]));
+  const winnerNames = claims
+    .filter((claim) => claim.selected)
+    .slice(-8)
+    .map((claim) => playerNames.get(claim.playerId) ?? `Player ${claim.playerId}`)
+    .join(", ") || "—";
+  const now = new Date();
+  const completed = settings.filter((settingsRow) => settingsRow.nextDrawAt && settingsRow.nextDrawAt <= now).length;
+  const active = settings.length - completed;
+  const subtitle = [
+    `Admin: ${admin.first_name ?? ""} ${admin.last_name ?? ""}`.trim(),
+    `Started ${settings.length} · Completed ${completed} · Active ${active}`,
+    `Winners: ${winnerNames}`,
+  ].join(" · ");
+  const image = await giveawayOverviewPng(settings, "ADMIN GIVEAWAY PANEL", subtitle);
+  await bot.sendPhoto(
+    chatId,
+    image,
+    [
+      "<b>🛡️ GIVEAWAY ADMIN PANEL</b>",
+      "",
+      `Admin: <b>${escapeTelegramText(`${admin.first_name ?? ""} ${admin.last_name ?? ""}`.trim() || "Admin")}</b>`,
+      `Total started: <b>${settings.length}</b>`,
+      `Completed: <b>${completed}</b>`,
+      `Active: <b>${active}</b>`,
+      `Recent winners: <b>${escapeTelegramText(winnerNames)}</b>`,
+      "",
+      "<b>Admin commands</b>",
+      "<code>/giveawayadd AMOUNT MAX_WINNERS DAYS MIN_WAGER MIN_REFERRALS INR|USD</code>",
+      "<code>/giveawayoff NUMBER</code>",
+      "<code>/latest</code> · <code>/giveawayrank</code>",
+    ].join("\n"),
+    {
+      inline_keyboard: settings.map((settingsRow, index) => [{
+        text: `Manage ${index + 1}`,
+        callback_data: `giveaway:select:${settingsRow.kind}`,
+      }]),
+    },
+  );
+}
+
+async function giveawayRankings(bot: TelegramBot, chatId: number): Promise<void> {
+  const [players, rounds, battles] = await Promise.all([
+    db.select().from(casinoPlayersTable).where(eq(casinoPlayersTable.isBot, false)),
+    db.select().from(casinoGameRoundsTable),
+    db.select().from(casinoChallengesTable).where(eq(casinoChallengesTable.status, "completed")),
+  ]);
+  const wagerByPlayer = new Map<number, number>();
+  const betsByPlayer = new Map<number, number>();
+  for (const round of rounds) {
+    wagerByPlayer.set(round.playerId, (wagerByPlayer.get(round.playerId) ?? 0) + round.stakeMinor);
+    betsByPlayer.set(round.playerId, (betsByPlayer.get(round.playerId) ?? 0) + 1);
+  }
+  for (const battle of battles) {
+    wagerByPlayer.set(
+      battle.creatorPlayerId,
+      (wagerByPlayer.get(battle.creatorPlayerId) ?? 0) + battle.stakeMinor,
+    );
+    betsByPlayer.set(battle.creatorPlayerId, (betsByPlayer.get(battle.creatorPlayerId) ?? 0) + 1);
+    if (battle.playerTwoId) {
+      wagerByPlayer.set(
+        battle.playerTwoId,
+        (wagerByPlayer.get(battle.playerTwoId) ?? 0) + battle.stakeMinor,
+      );
+      betsByPlayer.set(battle.playerTwoId, (betsByPlayer.get(battle.playerTwoId) ?? 0) + 1);
+    }
+  }
+  const rows = players
+    .map((player) => {
+      const referrals = players.filter((candidate) => candidate.referredByPlayerId === player.id).length;
+      const bets = betsByPlayer.get(player.id) ?? 0;
+      return {
+        player,
+        referrals,
+        bets,
+        points: referrals + bets * 0.5,
+        wagerMinor: wagerByPlayer.get(player.id) ?? 0,
+      };
+    })
+    .filter((row) => row.points > 0)
+    .sort((left, right) => right.points - left.points || right.referrals - left.referrals);
+  if (!rows.length) {
+    await bot.sendMessage(chatId, "<b>🏆 Giveaway rank</b>\nNo eligible points have been earned yet.");
+    return;
+  }
+  const lines = rows.map((row, index) => {
+    const name = row.player.username ? `@${row.player.username}` : row.player.displayName;
+    return `<b>${index + 1}.</b> ${escapeTelegramText(name)} — <b>${row.points.toFixed(1)} pts</b> · ${row.referrals} referrals · ${row.bets} bets`;
+  });
+  for (let index = 0; index < lines.length; index += 30) {
+    await bot.sendMessage(
+      chatId,
+      `<b>🏆 GIVEAWAY RANK ${index + 1}-${Math.min(index + 30, lines.length)}</b>\n\n${lines.slice(index, index + 30).join("\n")}`,
+    );
+  }
+}
+
+async function handleGiveawayUpdate(
+  bot: TelegramBot,
+  update: TelegramUpdate,
+): Promise<void> {
+  if (update.callback_query) {
+    if (
+      update.callback_query.message &&
+      !isPrivateChat(update.callback_query.message.chat)
+    ) {
       return;
     }
-    await playHelperGame(bot, message.chat.id, message.from, amountMinor, currency);
+    await bot.answerCallback(update.callback_query.id);
+    const callback = update.callback_query;
+    const message = callback.message;
+    if (!message) return;
+    const parts = (callback.data ?? "").split(":");
+    if (parts[0] !== "giveaway") return;
+    const settings = await activeGiveawaySettings();
+    const selectedKind = parts[2];
+    const selected = settings.find((settingsRow) => settingsRow.kind === selectedKind);
+    if (!selected) {
+      await bot.sendMessage(message.chat.id, "That giveaway is no longer active.");
+      return;
+    }
+    if (parts[1] === "select") {
+      await sendGiveawayRequirements(
+        bot,
+        message.chat.id,
+        selected,
+        Math.max(0, settings.indexOf(selected)),
+      );
+    } else if (parts[1] === "join") {
+      await joinGiveaway(bot, message.chat.id, callback.from, selected);
+    }
     return;
+  }
+  const message = update.message;
+  if (!message?.from || !message.text || !message.text.trim().startsWith("/")) return;
+  if (!isPrivateChat(message.chat)) return;
+  const { command, args } = commandFrom(message.text);
+  const giveawayCommands = new Set([
+    "start",
+    "help",
+    "giveawayhelp",
+    "join",
+    "latest",
+    "giveawayrank",
+    "givewayrank",
+    "giveawayadd",
+    "givewayadd",
+    "giveawayoff",
+  ]);
+  if (!giveawayCommands.has(command)) return;
+  if (command === "start" && isAdmin(message.from.id)) {
+    await sendGiveawayAdminPanel(bot, message.chat.id, message.from);
+    return;
+  }
+  if (command === "giveawayhelp" || command === "help" || command === "start") {
+    await bot.sendMessage(
+      message.chat.id,
+      [
+        "<b>🎁 GIVEAWAY BOT</b>",
+        "",
+        "<b>/latest</b> — show the latest giveaway",
+        "<b>/join</b> — join the latest giveaway",
+         "<b>/giveawayrank</b> — view giveaway points and referrals",
+        "",
+        "Giveaway settings are managed from the main RolexCasino bot.",
+      ].join("\n"),
+    );
+    return;
+  }
+  if (command === "latest") {
+    await sendLatestGiveaway(bot, message.chat.id);
+    return;
+  }
+  if (command === "join") {
+    const settings = await activeGiveawaySettings();
+    if (settings[0]) await joinGiveaway(bot, message.chat.id, message.from, settings[0]);
+    else await bot.sendMessage(message.chat.id, "<b>🎁 No active giveaway right now.</b>\nPlease check again soon.");
+    return;
+  }
+  if (command === "giveawayrank" || command === "givewayrank") {
+    await giveawayRankings(bot, message.chat.id);
+    return;
+  }
+  if (command === "giveawayadd" || command === "givewayadd") {
+    if (!isAdmin(message.from.id)) {
+      await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
+      return;
+    }
+    const amountMinor = parseMoney(args[0]);
+    const maxWinners = Number(args[1]);
+    const periodDays = Number(args[2]);
+    const minWagerMinor = parseMoney(args[3]) ?? 0;
+    const minReferralCount = Number(args[4]);
+    const currency = parseCurrency(args[5], "INR");
+    if (
+      !amountMinor ||
+      !Number.isInteger(maxWinners) ||
+      maxWinners < 1 ||
+      !Number.isInteger(periodDays) ||
+      periodDays < 1 ||
+      !Number.isInteger(minReferralCount) ||
+      minReferralCount < 0 ||
+      !isSupportedCurrency(currency)
+    ) {
+      await bot.sendMessage(
+        message.chat.id,
+        "<b>Usage:</b> <code>/giveawayadd AMOUNT MAX_WINNERS DAYS MIN_WAGER MIN_REFERRALS INR|USD</code>",
+      );
+      return;
+    }
+    const allSettings = await db.select().from(casinoGiveawaySettingsTable);
+    const nextNumber = allSettings.reduce((highest, settingsRow) => {
+      const match = settingsRow.kind.match(/^giveaway_(\d+)$/);
+      return match ? Math.max(highest, Number(match[1])) : highest;
+    }, allSettings.some((settingsRow) => settingsRow.kind === "giveaway") ? 1 : 0) + 1;
+    await configureGiveaway(bot, message.chat.id, message.from.id, `giveaway_${nextNumber}`, {
+      amountMinor,
+      currency,
+      maxWinners,
+      minWagerMinor,
+      minReferralCount,
+      periodDays,
+    });
+    return;
+  }
+  if (command === "giveawayoff") {
+    if (!isAdmin(message.from.id)) {
+      await bot.sendMessage(message.chat.id, ADMIN_RESTRICTED_MESSAGE);
+      return;
+    }
+    const number = Number(args[0]);
+    const settings = await activeGiveawaySettings();
+    const selected = settings[number - 1];
+    if (!selected) {
+      await bot.sendMessage(message.chat.id, "<b>Usage:</b> <code>/giveawayoff NUMBER</code>");
+      return;
+    }
+    await db
+      .update(casinoGiveawaySettingsTable)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(casinoGiveawaySettingsTable.id, selected.id));
+    await bot.sendMessage(message.chat.id, `<b>✅ Giveaway ${number} disabled.</b>`);
+    return;
+  }
+  if (command === "houseroyale" || command === "house" || command === "hb") {
+    await sendHouseBalance(bot, message.chat.id, message.from.id);
+    return;
+  }
+  if (command === "setdaily" || command === "setweekly" || command === "setmin" || command === "setminimum") {
+    await handleAdminCommand(bot, message.chat.id, message.from.id, command, args, message);
+    return;
+  }
+  if (
+    command === "monthlybonus" ||
+    command === "multiday" ||
+    command === "setmultiday" ||
+    command === "rakeback" ||
+    command === "setrefer" ||
+    command === "setgiveway"
+  ) {
+    const requestedKind: GiveawayKind =
+      command === "monthlybonus"
+        ? "monthly"
+        : command === "rakeback"
+          ? "rakeback"
+          : command === "setrefer"
+            ? "referral"
+            : command === "multiday" || command === "setmultiday"
+              ? "multi_day"
+              : "giveaway";
+    if (args.length === 0) {
+      await sendGiveawaySettings(bot, message.chat.id, requestedKind);
+      return;
+    }
+    const amountMinor = parseMoney(args[0]);
+    if (requestedKind === "rakeback") {
+      const rate = Number.parseFloat(args[0]?.replace("%", "") ?? "");
+      const minWagerMinor = parseMoney(args[1]);
+      const periodDays = Number(args[2]);
+      const currency = parseCurrency(args[3], "INR");
+      if (
+        !Number.isFinite(rate) ||
+        rate <= 0 ||
+        rate > 100 ||
+        !minWagerMinor ||
+        !Number.isInteger(periodDays) ||
+        periodDays < 1 ||
+        !isSupportedCurrency(currency)
+      ) {
+        await bot.sendMessage(message.chat.id, "<b>Usage:</b> <code>/rakeback RATE% MIN_WAGER DAYS INR|USD</code>");
+        return;
+      }
+      await configureGiveaway(bot, message.chat.id, message.from.id, requestedKind, {
+        amountMinor: Math.round(rate * 100),
+        currency,
+        maxWinners: 0,
+        minWagerMinor,
+        periodDays,
+      });
+      return;
+    }
+    if (requestedKind === "referral") {
+      const maxWinners = Number(args[0]);
+      const referralAmountMinor = parseMoney(args[1]);
+      const currency = parseCurrency(args[2], "INR");
+      if (!Number.isInteger(maxWinners) || maxWinners < 1 || !referralAmountMinor || !isSupportedCurrency(currency)) {
+        await bot.sendMessage(message.chat.id, "<b>Usage:</b> <code>/setrefer PLACE AMOUNT INR|USD</code>");
+        return;
+      }
+      await configureGiveaway(bot, message.chat.id, message.from.id, requestedKind, {
+        amountMinor: referralAmountMinor,
+        currency,
+        maxWinners,
+        minWagerMinor: 0,
+        periodDays: 30,
+      });
+      return;
+    }
+    const maxWinners = Number(args[1]);
+    const daysIndex = requestedKind === "monthly" ? 2 : 2;
+    const periodDays = Number(args[daysIndex]);
+    const minWagerIndex = requestedKind === "monthly" ? 3 : 3;
+    const maybeMinWager = requestedKind === "monthly" ? 0 : parseMoney(args[minWagerIndex]);
+    const currency = parseCurrency(
+      requestedKind === "monthly" ? args[3] : args[4],
+      "INR",
+    );
+    if (
+      !amountMinor ||
+      !Number.isInteger(maxWinners) ||
+      maxWinners < 1 ||
+      !Number.isInteger(periodDays) ||
+      periodDays < 1 ||
+      (requestedKind !== "monthly" && !maybeMinWager) ||
+      !isSupportedCurrency(currency)
+    ) {
+      await bot.sendMessage(
+        message.chat.id,
+        requestedKind === "monthly"
+          ? "<b>Usage:</b> <code>/monthlybonus AMOUNT MAX_WINNERS DAYS INR|USD</code>"
+          : "<b>Usage:</b> <code>/multiday AMOUNT MAX_WINNERS DAYS MIN_WAGER INR|USD</code>",
+      );
+      return;
+    }
+    await configureGiveaway(bot, message.chat.id, message.from.id, requestedKind, {
+      amountMinor,
+      currency,
+      maxWinners,
+      minWagerMinor: maybeMinWager ?? 0,
+      periodDays,
+    });
   }
 }
 
@@ -9884,6 +12738,10 @@ export async function startRolexCasinoBots(): Promise<void> {
     logger.warn("TELEGRAM_BOT_TOKEN is not configured; RolexCasino bots are disabled");
     return;
   }
+  void refreshDisplayRates();
+  setInterval(() => {
+    void refreshDisplayRates();
+  }, 60 * 60 * 1_000);
 
   const mainBot = new TelegramBot({ label: "main-bot", token: mainToken });
   const helpers: TelegramBot[] = [];
@@ -9891,7 +12749,9 @@ export async function startRolexCasinoBots(): Promise<void> {
   try {
     await mainBot.preparePolling();
     await mainBot.initialize();
+    await mainBot.setCommands(MAIN_BOT_COMMANDS);
     await loadPremiumEmojiPack(mainBot);
+    activeMainBot = mainBot;
   } catch (error) {
     logger.error({ err: error }, "RolexCasino main bot initialization failed");
     return;
@@ -9926,7 +12786,9 @@ export async function startRolexCasinoBots(): Promise<void> {
       }
     }
   }
+  logger.info("RolexCasino recovering active battle timers");
   await recoverPvbBattleTimeouts(mainBot);
+  logger.info("RolexCasino active battle timers recovered");
   void drawDueJackpots(mainBot).catch((error) => {
     logger.error({ err: error }, "Daily jackpot draw failed");
   });
@@ -9944,7 +12806,46 @@ export async function startRolexCasinoBots(): Promise<void> {
     handleMainUpdate(bot, update, helperLinks, helperBotsByGame),
   );
   for (const helper of helpers) {
-    void helper.start(handleHelperUpdate);
+    void helper.start((helperBot, update) =>
+      handleHelperUpdate(helperBot, update, mainBot),
+    );
+  }
+
+  const giveawayToken = process.env.TELEGRAM_GIVEAWAY_BOT_TOKEN ?? "";
+  if (giveawayToken) {
+    logger.info("RolexCasino starting giveaway bot");
+    const giveawayBot = new TelegramBot({
+      label: "giveaway-bot",
+      token: giveawayToken,
+    });
+    void (async () => {
+      try {
+        await giveawayBot.initialize();
+        await Promise.race([
+          giveawayBot.preparePolling(),
+          wait(5_000).then(() => {
+            throw new Error("giveaway webhook cleanup exceeded 5 seconds");
+          }),
+        ]).catch((error) => {
+          logger.warn(
+            { err: error, bot: "giveaway-bot" },
+            "Giveaway webhook cleanup did not finish quickly; starting polling anyway",
+          );
+        });
+        await giveawayBot.setCommands([
+          { command: "start", description: "Open the giveaway panel" },
+          { command: "latest", description: "Show active giveaways" },
+          { command: "join", description: "Join the latest giveaway" },
+          { command: "giveawayrank", description: "Show giveaway points" },
+        ]);
+        void giveawayBot.start(handleGiveawayUpdate);
+      } catch (error) {
+        logger.error(
+          { err: error, bot: "giveaway-bot" },
+          "RolexCasino giveaway bot initialization failed; main bot will continue",
+        );
+      }
+    })();
   }
 
   logger.info(
