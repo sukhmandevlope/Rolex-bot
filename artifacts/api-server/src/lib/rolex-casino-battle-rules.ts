@@ -150,7 +150,7 @@ export function calculateBattlePayouts(input: {
   };
 }
 
-export const BATTLE_TURN_TIMEOUT_MS = 60_000;
+export const BATTLE_TURN_TIMEOUT_MS = 120_000;
 
 export function isBattleTurnExpired(
   deadline: Date | null | undefined,
