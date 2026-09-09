@@ -3206,42 +3206,34 @@ type RackbackCardData = {
 };
 
 function applyRolexGoldBlackTheme(svg: string): string {
-  const colors: Record<string, string> = {
-    "#10182e": "#0a0805",
-    "#183b45": "#17100a",
-    "#080d19": "#050505",
-    "#151a2c": "#120d08",
-    "#252b43": "#211408",
-    "#101a31": "#0a0704",
-    "#203d54": "#1b1007",
-    "#10162d": "#080604",
-    "#202b57": "#170d06",
-    "#3b2457": "#1d1007",
-    "#2563eb": "#8a5b16",
-    "#3b82f6": "#a8731d",
-    "#6e83ff": "#8a5b16",
-    "#7184cf": "#b8862e",
-    "#879cff": "#c59437",
-    "#8ea6ff": "#d1a84f",
-    "#9dd7ff": "#e0bd6c",
-    "#9db0cb": "#c4a76a",
-    "#8da2bd": "#b99650",
-    "#aeb9df": "#d2b66d",
-    "#b6c7df": "#d6b86b",
-    "#bfc9ec": "#dfc47c",
-    "#dbe7f5": "#f0d78d",
-    "#dce3ff": "#ecd080",
-    "#aab8e5": "#d3b468",
-    "#76e3a3": "#f2c95d",
-    "#70e59a": "#f2c95d",
-    "#9affba": "#ffe29a",
-    "#e56d86": "#9e6c1e",
-    "#ff8291": "#d09a2f",
+  const rolexPalette = new Set([
+    "#050505", "#080604", "#0a0704", "#0a0805", "#120d08", "#17100a",
+    "#1b1007", "#1d1007", "#211408", "#2a1707", "#8a5b16", "#a66d18",
+    "#a8731d", "#b6791f", "#b8862e", "#b99650", "#c4a76a", "#c58e2e",
+    "#c59437", "#c99b3b", "#d09a2f", "#d1a84f", "#d2b66d", "#d3b468",
+    "#d6b86b", "#d99862", "#d29a35", "#e0bd6c", "#e5ad43", "#e5c45f",
+    "#e6ad42", "#e7ad42", "#ecd080", "#f0d78d", "#f1b83d", "#f2c95d",
+    "#f3cf69", "#f4b72b", "#f5d477", "#f6a91a", "#f6c453", "#f7d66b",
+    "#ffe29a", "#ffe38a", "#ffe6a1", "#ffe7a5", "#ffe9a2", "#ffe9a6",
+  ]);
+  const toRolexColor = (raw: string): string => {
+    const normalized = raw.toLowerCase();
+    if (rolexPalette.has(normalized)) return normalized;
+    const hex = normalized.length === 4
+      ? normalized.slice(1).split("").map((digit) => digit + digit).join("")
+      : normalized.slice(1);
+    const red = Number.parseInt(hex.slice(0, 2), 16);
+    const green = Number.parseInt(hex.slice(2, 4), 16);
+    const blue = Number.parseInt(hex.slice(4, 6), 16);
+    const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+    if (luminance < 0.14) return "#050505";
+    if (luminance < 0.3) return "#17100a";
+    if (luminance < 0.5) return "#8a5b16";
+    if (luminance < 0.68) return "#b8862e";
+    if (luminance < 0.84) return "#d6b86b";
+    return "#fff0bd";
   };
-  return Object.entries(colors).reduce(
-    (themed, [from, to]) => themed.split(from).join(to),
-    svg,
-  );
+  return svg.replace(/#[0-9a-f]{6}|#[0-9a-f]{3}(?![0-9a-f])/gi, toRolexColor);
 }
 
 function rackbackCardSvg(data: RackbackCardData): string {
