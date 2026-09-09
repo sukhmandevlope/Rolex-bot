@@ -3022,6 +3022,8 @@ const MAIN_BOT_COMMANDS = [
   ["giveaway", "View latest giveaway"],
   ["join", "Join latest giveaway"],
   ["giveawayrank", "View the giveaway leaderboard"],
+  ["cancelgiveaway", "Cancel an active giveaway (admins only, private DM)"],
+  ["editgiveaway", "Edit an active giveaway (admins only, private DM)"],
   ["hrinfo", "View House Royale players and chances"],
   ["rates", "View live currency rates"],
   ["currency", "Choose display currency"],
@@ -14059,6 +14061,10 @@ async function handleMainUpdate(
       return;
     }
     await bot.answerCallback(callback.id);
+    if (action.startsWith("giveaway:admin:")) {
+      await handleGiveawayAdminAction(bot, callback);
+      return;
+    }
     if (action.startsWith("roll:")) {
       const [, rawStake, rawCurrency] = action.split(":");
       const rollBot = helperBots.get("dice");
@@ -14484,6 +14490,30 @@ async function handleMainUpdate(
   if (!message.text) return;
   if (!message.text.trim().startsWith("/")) return;
   const { command, args } = parsedCommand ?? commandFrom(message.text);
+  if (command === "cancelgiveaway" || command === "editgiveaway") {
+    if (!isPrivateChat(message.chat)) {
+      await bot.sendMessage(
+        chatId,
+        "Giveaway admin controls are available only in a private DM.",
+      );
+      return;
+    }
+    if (!isAdmin(message.from.id)) {
+      await bot.sendMessage(chatId, ADMIN_RESTRICTED_MESSAGE);
+      return;
+    }
+    logger.info(
+      { command, userId: message.from.id, chatId },
+      "Giveaway admin command received by main bot",
+    );
+    const giveawayBot = activeGiveawayBot ?? bot;
+    if (command === "cancelgiveaway") {
+      await sendGiveawayCancelPanel(giveawayBot, chatId);
+    } else {
+      await sendGiveawayEditPanel(giveawayBot, chatId);
+    }
+    return;
+  }
   const player = await ensurePlayer(message.from);
   if (await handleAdminCommand(bot, chatId, message.from.id, command, args, message)) return;
   const isGameplayCommand =
@@ -16139,7 +16169,15 @@ async function handleGiveawayAdminAction(
   callback: TelegramCallbackQuery,
 ): Promise<boolean> {
   const message = callback.message;
-  if (!message || !isAdmin(callback.from.id)) {
+  if (!message) {
+    await bot.sendMessage(callback.from.id, "Giveaway admin controls are available only in a private DM.");
+    return true;
+  }
+  if (!isPrivateChat(message.chat)) {
+    await bot.sendMessage(message.chat.id, "Giveaway admin controls are available only in a private DM.");
+    return true;
+  }
+  if (!isAdmin(callback.from.id)) {
     await bot.sendMessage(message?.chat.id ?? callback.from.id, ADMIN_RESTRICTED_MESSAGE);
     return true;
   }
