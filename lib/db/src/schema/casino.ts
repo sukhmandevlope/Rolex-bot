@@ -17,6 +17,8 @@ export const casinoPlayersTable = pgTable("casino_players", {
   telegramUserId: bigint("telegram_user_id", { mode: "number" })
     .notNull()
     .unique(),
+    isBot: boolean("is_bot").notNull().default(false),
+    language: varchar("language", { length: 8 }).notNull().default("en"),
   username: text("username").unique(),
   displayName: text("display_name").notNull(),
   preferredCurrency: varchar("preferred_currency", { length: 3 })
@@ -82,6 +84,119 @@ export const casinoWeeklyBonusSettingsTable = pgTable(
       withTimezone: true,
     }),
   },
+);
+
+export const casinoGiveawaySettingsTable = pgTable(
+  "casino_giveaway_settings",
+  {
+    id: serial("id").primaryKey(),
+    kind: varchar("kind", { length: 24 }).notNull().unique(),
+    announcementChatId: bigint("announcement_chat_id", { mode: "number" }),
+    announcementMessageId: integer("announcement_message_id"),
+    amountMinor: integer("amount_minor").notNull().default(0),
+    currency: varchar("currency", { length: 3 }).notNull().default("INR"),
+    maxWinners: integer("max_winners").notNull().default(1),
+    minWagerMinor: integer("min_wager_minor").notNull().default(0),
+    minReferralCount: integer("min_referral_count").notNull().default(0),
+    periodDays: integer("period_days").notNull().default(1),
+    enabled: boolean("enabled").notNull().default(false),
+    updatedByTelegramUserId: bigint("updated_by_telegram_user_id", {
+      mode: "number",
+    }),
+    nextDrawAt: timestamp("next_draw_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+);
+
+export const casinoGiveawayClaimsTable = pgTable(
+  "casino_giveaway_claims",
+  {
+    id: serial("id").primaryKey(),
+    kind: varchar("kind", { length: 24 }).notNull(),
+    periodKey: varchar("period_key", { length: 80 }).notNull(),
+    playerId: integer("player_id")
+      .notNull()
+      .references(() => casinoPlayersTable.id),
+    amountMinor: integer("amount_minor").notNull(),
+    currency: varchar("currency", { length: 3 }).notNull(),
+    selected: boolean("selected").notNull().default(false),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    giveawayPlayerPeriodUnique: unique("casino_giveaway_claim_player_period_unique").on(
+      table.kind,
+      table.periodKey,
+      table.playerId,
+    ),
+  }),
+);
+
+export const casinoHouseRoyalesTable = pgTable(
+  "casino_house_royales",
+  {
+    id: serial("id").primaryKey(),
+    chatId: bigint("chat_id", { mode: "number" }),
+    announcementMessageId: integer("announcement_message_id"),
+    currency: varchar("currency", { length: 3 }).notNull().default("USD"),
+    entryAmountMinor: integer("entry_amount_minor").notNull(),
+    maxPlayers: integer("max_players").notNull(),
+    prizePoolMinor: integer("prize_pool_minor").notNull(),
+    minWagerMinor: integer("min_wager_minor").notNull(),
+    wagerPeriodDays: integer("wager_period_days").notNull().default(30),
+    status: varchar("status", { length: 16 }).notNull().default("open"),
+    joinDeadlineAt: timestamp("join_deadline_at", { withTimezone: true }),
+    bracketState: text("bracket_state"),
+    createdByTelegramUserId: bigint("created_by_telegram_user_id", {
+      mode: "number",
+    }).notNull(),
+    fairId: varchar("fair_id", { length: 80 }).notNull(),
+    winnerOneMinor: integer("winner_one_minor").notNull().default(0),
+    winnerTwoMinor: integer("winner_two_minor").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    drawnAt: timestamp("drawn_at", { withTimezone: true }),
+  },
+);
+
+export const casinoHouseRoyalePlayersTable = pgTable(
+  "casino_house_royale_players",
+  {
+    id: serial("id").primaryKey(),
+    royaleId: integer("royale_id")
+      .notNull()
+      .references(() => casinoHouseRoyalesTable.id),
+    dmChatId: bigint("dm_chat_id", { mode: "number" }),
+    dmMessageId: integer("dm_message_id"),
+    eligibilityConfirmedAt: timestamp("eligibility_confirmed_at", {
+      withTimezone: true,
+    }),
+    playerId: integer("player_id")
+      .notNull()
+      .references(() => casinoPlayersTable.id),
+    entryAmountMinor: integer("entry_amount_minor").notNull(),
+    selected: boolean("selected").notNull().default(false),
+    placement: integer("placement"),
+    payoutMinor: integer("payout_minor").notNull().default(0),
+    joinedAt: timestamp("joined_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    royalePlayerUnique: unique("casino_house_royale_player_unique").on(
+      table.royaleId,
+      table.playerId,
+    ),
+  }),
 );
 
 export const casinoBonusClaimsTable = pgTable(
@@ -214,6 +329,34 @@ export const casinoGameRoundsTable = pgTable("casino_game_rounds", {
     .defaultNow(),
 });
 
+export const casinoDailyLossRewardsTable = pgTable(
+  "casino_daily_loss_rewards",
+  {
+    id: serial("id").primaryKey(),
+    playerId: integer("player_id")
+      .notNull()
+      .references(() => casinoPlayersTable.id),
+    dayKey: varchar("day_key", { length: 10 }).notNull(),
+    currency: varchar("currency", { length: 3 }).notNull(),
+    lossMinor: integer("loss_minor").notNull().default(0),
+    rewardMinor: integer("reward_minor").notNull().default(0),
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => ({
+    playerDayCurrencyUnique: unique(
+      "casino_daily_loss_reward_player_day_currency_unique",
+    ).on(table.playerId, table.dayKey, table.currency),
+  }),
+);
+
 export const casinoCashRequestsTable = pgTable("casino_cash_requests", {
   id: serial("id").primaryKey(),
   playerId: integer("player_id")
@@ -230,6 +373,33 @@ export const casinoCashRequestsTable = pgTable("casino_cash_requests", {
     .notNull()
     .defaultNow(),
   reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+});
+
+export const casinoCryptoTipsTable = pgTable("casino_crypto_tips", {
+  id: serial("id").primaryKey(),
+  eventId: text("event_id").notNull().unique(),
+  transactionId: text("transaction_id").notNull().unique(),
+  playerId: integer("player_id")
+    .notNull()
+    .references(() => casinoPlayersTable.id),
+  senderTelegramUserId: bigint("sender_telegram_user_id", { mode: "number" }).notNull(),
+  senderUsername: text("sender_username"),
+  recipientUsername: text("recipient_username").notNull(),
+  token: varchar("token", { length: 24 }).notNull(),
+  network: varchar("network", { length: 24 }).notNull(),
+  currency: varchar("currency", { length: 3 }).notNull().default("USD"),
+  grossAmountMinor: integer("gross_amount_minor").notNull(),
+  feeMinor: integer("fee_minor").notNull().default(0),
+  creditedAmountMinor: integer("credited_amount_minor").notNull(),
+  confirmations: integer("confirmations").notNull().default(0),
+  isRisky: boolean("is_risky").notNull().default(false),
+  flashDetected: boolean("flash_detected").notNull().default(false),
+  status: varchar("status", { length: 20 }).notNull().default("credited"),
+  rejectionReason: text("rejection_reason"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  processedAt: timestamp("processed_at", { withTimezone: true }),
 });
 
 export const casinoWagerRequirementsTable = pgTable(
@@ -462,7 +632,10 @@ export type CasinoPlayer = typeof casinoPlayersTable.$inferSelect;
 export type CasinoWallet = typeof casinoWalletsTable.$inferSelect;
 export type CasinoLedgerEntry = typeof casinoLedgerEntriesTable.$inferSelect;
 export type CasinoGameRound = typeof casinoGameRoundsTable.$inferSelect;
+export type CasinoDailyLossReward =
+  typeof casinoDailyLossRewardsTable.$inferSelect;
 export type CasinoCashRequest = typeof casinoCashRequestsTable.$inferSelect;
+export type CasinoCryptoTip = typeof casinoCryptoTipsTable.$inferSelect;
 export type CasinoWagerRequirement =
   typeof casinoWagerRequirementsTable.$inferSelect;
 export type CasinoEscrow = typeof casinoEscrowsTable.$inferSelect;
