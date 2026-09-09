@@ -1,7 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { and, desc, eq, gte, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, or, sql } from "drizzle-orm";
 import {
   casinoChallengeParticipantsTable,
   casinoChallengeRollsTable,
@@ -269,6 +269,8 @@ const minesFairRecords = new Map<string, MinesGame>();
 const settlingMinesGames = new Set<string>();
 const clientSeeds = new Map<number, string>();
 const currencyMenuMessages = new Map<number, { chatId: number; messageId: number }>();
+const DEAL_CARD_TTL_MS = 2 * 60 * 1_000;
+const dealCardDeletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let rouletteStickerIds: string[] = [];
 const rouletteStickerIdsByNumber = new Map<number, string>();
 let activeMainBot: TelegramBot | null = null;
@@ -4852,6 +4854,70 @@ async function tipCardPng(data: TipCardData): Promise<Buffer> {
   });
 }
 
+function scheduleDealCardDeletion(
+  bot: TelegramBot,
+  chatId: number,
+  messageId: number,
+  label: "tip" | "escrow",
+  delayMs = DEAL_CARD_TTL_MS,
+  unpin = false,
+): void {
+  const key = `${chatId}:${messageId}`;
+  if (dealCardDeletionTimers.has(key)) return;
+  const timer = setTimeout(() => {
+    void (async () => {
+      try {
+        if (unpin) {
+          try {
+            await bot.unpinChatMessage(chatId, messageId);
+          } catch (error) {
+            logger.debug({ err: error, chatId, messageId, label }, "Deal card unpin skipped during cleanup");
+          }
+        }
+        await bot.deleteMessage(chatId, messageId);
+        logger.info({ chatId, messageId, label }, "Deal card automatically deleted");
+      } catch (error) {
+        logger.debug({ err: error, chatId, messageId, label }, "Deal card cleanup skipped");
+      } finally {
+        dealCardDeletionTimers.delete(key);
+      }
+    })();
+  }, Math.max(0, delayMs));
+  dealCardDeletionTimers.set(key, timer);
+}
+
+async function recoverRecentEscrowCardDeletions(bot: TelegramBot): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - DEAL_CARD_TTL_MS);
+    const recentEscrows = await db
+      .select({
+        chatId: casinoEscrowsTable.chatId,
+        messageId: casinoEscrowsTable.messageId,
+        createdAt: casinoEscrowsTable.createdAt,
+      })
+      .from(casinoEscrowsTable)
+      .where(
+        and(
+          isNotNull(casinoEscrowsTable.messageId),
+          gte(casinoEscrowsTable.createdAt, cutoff),
+        ),
+      );
+    for (const escrow of recentEscrows) {
+      if (!escrow.messageId) continue;
+      scheduleDealCardDeletion(
+        bot,
+        escrow.chatId,
+        escrow.messageId,
+        "escrow",
+        DEAL_CARD_TTL_MS - (Date.now() - escrow.createdAt.getTime()),
+        true,
+      );
+    }
+  } catch (error) {
+    logger.warn({ err: error }, "Recent escrow card cleanup recovery failed");
+  }
+}
+
 async function sendTipCard(
   bot: TelegramBot,
   chatId: number,
@@ -4864,12 +4930,15 @@ async function sendTipCard(
   if (messageId) {
     try {
       await bot.editPhoto(chatId, messageId, image, caption, replyMarkup);
+      scheduleDealCardDeletion(bot, chatId, messageId, "tip");
       return;
     } catch (error) {
       logger.warn({ err: error, chatId, messageId }, "Tip live card update failed; sending replacement");
+      scheduleDealCardDeletion(bot, chatId, messageId, "tip");
     }
   }
-  await bot.sendPhoto(chatId, image, caption, replyMarkup);
+  const sent = await bot.sendPhoto(chatId, image, caption, replyMarkup);
+  scheduleDealCardDeletion(bot, chatId, sent.message_id, "tip");
 }
 
 async function acceptEscrow(
@@ -5206,6 +5275,16 @@ async function sendEscrowCard(
       .update(casinoEscrowsTable)
       .set({ messageId: storedMessageId })
       .where(eq(casinoEscrowsTable.id, escrow.id));
+  }
+  if (storedMessageId) {
+    scheduleDealCardDeletion(
+      bot,
+      escrow.chatId,
+      storedMessageId,
+      "escrow",
+      DEAL_CARD_TTL_MS,
+      true,
+    );
   }
   if (pin) {
     try {
@@ -16700,6 +16779,7 @@ export async function startRolexCasinoBots(): Promise<void> {
     await mainBot.setCommands(MAIN_BOT_COMMANDS);
     await loadPremiumEmojiPack(mainBot);
     activeMainBot = mainBot;
+    void recoverRecentEscrowCardDeletions(mainBot);
   } catch (error) {
     logger.error({ err: error }, "RolexCasino main bot initialization failed");
     return;
