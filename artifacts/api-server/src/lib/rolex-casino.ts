@@ -958,6 +958,11 @@ function isAdmin(userId: number): boolean {
   return isAdminUser(userId, process.env.CASINO_ADMIN_TELEGRAM_IDS);
 }
 
+function isTelegramMessageMissingError(error: unknown): boolean {
+  return error instanceof Error &&
+    /message to (?:edit|delete) not found|message not found/i.test(error.message);
+}
+
 class TelegramBot {
   private offset = 0;
   private username = "";
@@ -11250,6 +11255,7 @@ async function houseRoyaleInfo(
     `<b>👑 HOUSE ROYALE #${royale.id}</b>\nJoined players are listed below. ${isAdmin(viewerTelegramUserId) ? "Choose a 1–5 chance tier for each player." : ""}`,
     keyboard.length > 0 ? { inline_keyboard: keyboard } : undefined,
   );
+  await sendActiveGiveawayList(bot, chatId);
 }
 
 async function setHouseRoyaleWinChance(
@@ -11341,9 +11347,18 @@ async function sendHouseRoyale(
   const isAnnouncement = groupId !== null && chatId === groupId;
   let sent: TelegramMessage;
   if (isAnnouncement && royale.announcementMessageId) {
-    sent = await bot.editPhoto(chatId, royale.announcementMessageId, image, caption, {
-      inline_keyboard: keyboard,
-    });
+    try {
+      sent = await bot.editPhoto(chatId, royale.announcementMessageId, image, caption, {
+        inline_keyboard: keyboard,
+      });
+    } catch (error) {
+      if (!isTelegramMessageMissingError(error)) throw error;
+      logger.warn(
+        { err: error, royaleId: royale.id, messageId: royale.announcementMessageId },
+        "House Royale announcement was missing; publishing a replacement",
+      );
+      sent = await bot.sendPhoto(chatId, image, caption, { inline_keyboard: keyboard });
+    }
   } else {
     sent = await bot.sendPhoto(chatId, image, caption, { inline_keyboard: keyboard });
   }
@@ -12549,7 +12564,22 @@ async function publishGiveawayAnnouncement(
   ].join("\n");
   let sent: TelegramMessage;
   if (settings.announcementMessageId && settings.announcementChatId === groupId) {
-    sent = await announcementBot.editPhoto(groupId, settings.announcementMessageId, image, caption, keyboard);
+    try {
+      sent = await announcementBot.editPhoto(
+        groupId,
+        settings.announcementMessageId,
+        image,
+        caption,
+        keyboard,
+      );
+    } catch (error) {
+      if (!isTelegramMessageMissingError(error)) throw error;
+      logger.warn(
+        { err: error, kind: settings.kind, messageId: settings.announcementMessageId },
+        "Giveaway announcement was missing; publishing a replacement",
+      );
+      sent = await announcementBot.sendPhoto(groupId, image, caption, keyboard);
+    }
   } else {
     sent = await announcementBot.sendPhoto(groupId, image, caption, keyboard);
   }
@@ -12564,6 +12594,54 @@ async function publishGiveawayAnnouncement(
     await announcementBot.pinChatMessage(groupId, sent.message_id);
   } catch (error) {
     logger.warn({ err: error, kind: settings.kind }, "Giveaway announcement pin failed");
+  }
+}
+
+async function sendActiveGiveawayList(
+  bot: TelegramBot,
+  chatId: number,
+): Promise<void> {
+  const settings = await activeGiveawaySettings();
+  if (!settings.length) {
+    await bot.sendMessage(chatId, "<b>🎁 ACTIVE GIVEAWAYS</b>\n\nNo active giveaways are configured right now.");
+    return;
+  }
+  const lines = settings.flatMap((settingsRow, index) => {
+    const currency = parseCurrency(settingsRow.currency, "INR");
+    return [
+      `<b>${index + 1}. ${escapeTelegramText(giveawayLabel(settingsRow, index))}</b>`,
+      `Prize: <b>${escapeTelegramText(giveawayPrizeSummary(settingsRow))}</b>`,
+      `Maximum winners: <b>${settingsRow.maxWinners > 0 ? settingsRow.maxWinners : "all eligible"}</b>`,
+      `Minimum wager: <b>${formatMoney(settingsRow.minWagerMinor, currency)}</b> · Referrals: <b>${settingsRow.minReferralCount}</b>`,
+      `Next draw: <b>${settingsRow.nextDrawAt?.toLocaleString("en-IN", { timeZone: "Asia/Calcutta" }) ?? "scheduled soon"}</b>`,
+      "",
+    ];
+  });
+  await bot.sendMessage(
+    chatId,
+    [
+      "<b>🎁 ALL ACTIVE GIVEAWAYS</b>",
+      "",
+      ...lines,
+      "Use the buttons below to view requirements or join.",
+    ].join("\n"),
+    giveawayOverviewKeyboard(settings),
+  );
+}
+
+async function ensureActiveGiveawayAnnouncements(
+  bot: TelegramBot,
+): Promise<void> {
+  const settings = await activeGiveawaySettings();
+  for (const settingsRow of settings) {
+    try {
+      await publishGiveawayAnnouncement(bot, settingsRow);
+    } catch (error) {
+      logger.error(
+        { err: error, kind: settingsRow.kind },
+        "Active giveaway announcement recovery failed",
+      );
+    }
   }
 }
 
@@ -16613,6 +16691,7 @@ async function handleGiveawayUpdate(
       return;
     }
     await sendHouseRoyale(bot, message.chat.id, await activeHouseRoyale(), message.from.id);
+    await sendActiveGiveawayList(bot, message.chat.id);
     return;
   }
   if (command === "joinroyale") {
@@ -16920,6 +16999,7 @@ export async function startRolexCasinoBots(): Promise<void> {
           { command: "organize", description: "Organize an 8-player House Royale (admins)" },
           { command: "hr", description: "Host House Royale (admins)" },
         ]);
+        void ensureActiveGiveawayAnnouncements(giveawayBot);
         void giveawayBot.start(handleGiveawayUpdate);
       } catch (error) {
         logger.error(
