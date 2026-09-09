@@ -4857,13 +4857,19 @@ async function sendTipCard(
   chatId: number,
   data: TipCardData,
   replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] },
+  messageId?: number,
 ): Promise<void> {
-  await bot.sendPhoto(
-    chatId,
-    await tipCardPng(data),
-    `<b>${escapeTelegramText(data.status)}</b>\n${escapeTelegramText(data.note)}`,
-    replyMarkup,
-  );
+  const image = await tipCardPng(data);
+  const caption = `<b>${escapeTelegramText(data.status)}</b>\n${escapeTelegramText(data.note)}`;
+  if (messageId) {
+    try {
+      await bot.editPhoto(chatId, messageId, image, caption, replyMarkup);
+      return;
+    } catch (error) {
+      logger.warn({ err: error, chatId, messageId }, "Tip live card update failed; sending replacement");
+    }
+  }
+  await bot.sendPhoto(chatId, image, caption, replyMarkup);
 }
 
 async function acceptEscrow(
@@ -5126,6 +5132,7 @@ async function sendEscrowCard(
   buyer: typeof casinoPlayersTable.$inferSelect,
   seller: typeof casinoPlayersTable.$inferSelect,
   pin = true,
+  messageIdOverride?: number,
 ): Promise<void> {
   const currency = parseCurrency(escrow.currency, "USD");
   const [sellerAvatarDataUri, buyerAvatarDataUri] = await Promise.all([
@@ -5173,10 +5180,12 @@ async function sendEscrowCard(
             { text: "❌ Mutual cancel", callback_data: `escrow:cancel:${escrow.code}` },
           ]]
         : [];
-  if (escrow.messageId) {
+  const liveMessageId = messageIdOverride ?? escrow.messageId;
+  let storedMessageId = liveMessageId;
+  if (liveMessageId) {
     await bot.editPhoto(
       escrow.chatId,
-      escrow.messageId,
+      liveMessageId,
       image,
       caption,
       { inline_keyboard: inlineKeyboard },
@@ -5190,23 +5199,17 @@ async function sendEscrowCard(
       { inline_keyboard: inlineKeyboard },
       { copyableCode: escrow.code },
     );
+    storedMessageId = sent.message_id;
+  }
+  if (storedMessageId && storedMessageId !== escrow.messageId) {
     await db
       .update(casinoEscrowsTable)
-      .set({ messageId: sent.message_id })
+      .set({ messageId: storedMessageId })
       .where(eq(casinoEscrowsTable.id, escrow.id));
   }
   if (pin) {
     try {
-      if (!escrow.messageId) {
-        const [stored] = await db
-          .select({ messageId: casinoEscrowsTable.messageId })
-          .from(casinoEscrowsTable)
-          .where(eq(casinoEscrowsTable.id, escrow.id))
-          .limit(1);
-        if (stored?.messageId) await bot.pinChatMessage(escrow.chatId, stored.messageId);
-      } else {
-        await bot.pinChatMessage(escrow.chatId, escrow.messageId);
-      }
+      if (storedMessageId) await bot.pinChatMessage(escrow.chatId, storedMessageId);
     } catch (error) {
       logger.warn({ err: error, escrowCode: escrow.code }, "Escrow pin failed");
     }
@@ -5217,6 +5220,7 @@ async function refreshEscrowCard(
   bot: TelegramBot,
   escrow: typeof casinoEscrowsTable.$inferSelect,
   pin = false,
+  messageIdOverride?: number,
 ): Promise<void> {
   const players = await db
     .select()
@@ -5228,7 +5232,7 @@ async function refreshEscrowCard(
   const buyer = players.find((player) => player.id === escrow.recipientPlayerId);
   const seller = players.find((player) => player.id === escrow.senderPlayerId);
   if (!buyer || !seller) throw new Error("ESCROW_PARTICIPANTS_NOT_FOUND");
-  await sendEscrowCard(bot, escrow, buyer, seller, pin);
+  await sendEscrowCard(bot, escrow, buyer, seller, pin, messageIdOverride);
 }
 
 async function handleEscrowCallback(
@@ -5236,6 +5240,7 @@ async function handleEscrowCallback(
   chatId: number,
   player: typeof casinoPlayersTable.$inferSelect,
   action: string,
+  messageId?: number,
 ): Promise<void> {
   const [, verb, rawCode] = action.split(":");
   const code = rawCode?.toUpperCase();
@@ -5243,7 +5248,7 @@ async function handleEscrowCallback(
   try {
     if (verb === "accept") {
       const escrow = await acceptEscrow(code, player.id);
-      await refreshEscrowCard(bot, escrow);
+      await refreshEscrowCard(bot, escrow, false, messageId);
       await auditTransaction(
         bot,
         [
@@ -5259,7 +5264,7 @@ async function handleEscrowCallback(
     }
     if (verb === "reject") {
       const escrow = await cancelEscrowImmediately(code, player.id);
-      await refreshEscrowCard(bot, escrow, true);
+      await refreshEscrowCard(bot, escrow, true, messageId);
       await unpinEscrow(bot, escrow);
       await auditTransaction(
         bot,
@@ -5274,7 +5279,7 @@ async function handleEscrowCallback(
     }
     if (verb === "release") {
       const escrow = await releaseEscrow(code, player.id);
-      await refreshEscrowCard(bot, escrow, true);
+      await refreshEscrowCard(bot, escrow, true, messageId);
       await unpinEscrow(bot, escrow);
       await auditTransaction(
         bot,
@@ -5293,7 +5298,7 @@ async function handleEscrowCallback(
         .limit(1);
       if (current?.status === "pending") {
         const escrow = await cancelEscrowImmediately(code, player.id);
-        await refreshEscrowCard(bot, escrow, true);
+        await refreshEscrowCard(bot, escrow, true, messageId);
         await auditTransaction(
           bot,
           [
@@ -5305,7 +5310,7 @@ async function handleEscrowCallback(
         );
       } else {
         const result = await requestEscrowCancellation(code, player.id);
-        await refreshEscrowCard(bot, result.escrow, result.completed);
+        await refreshEscrowCard(bot, result.escrow, result.completed, messageId);
         if (result.completed) {
           await auditTransaction(
             bot,
@@ -9561,7 +9566,10 @@ async function handleTip(
             text: "Confirm tip",
             callback_data: `tip:confirm:${player.id}:${targetPlayer.id}:${amountMinor}:${currency}`,
           },
-          { text: "Cancel", callback_data: `tip:cancel:${player.id}` },
+          {
+            text: "Cancel",
+            callback_data: `tip:cancel:${player.id}:${targetPlayer.id}:${amountMinor}:${currency}`,
+          },
         ]],
       },
     );
@@ -9656,6 +9664,7 @@ async function handleTipCallback(
   chatId: number,
   player: typeof casinoPlayersTable.$inferSelect,
   action: string,
+  messageId?: number,
 ): Promise<void> {
   const parts = action.split(":");
   const verb = parts[1];
@@ -9664,21 +9673,62 @@ async function handleTipCallback(
     await bot.sendMessage(chatId, "Only the player who created this tip can confirm or cancel it.");
     return;
   }
-  if (verb === "cancel") {
-    await bot.sendMessage(chatId, "Tip cancelled. No balance was changed.");
-    return;
-  }
-  if (verb !== "confirm") return;
   const targetPlayerId = Number(parts[3]);
   const amountMinor = Number(parts[4]);
   const currency = parseCurrency(parts[5], "USD");
+  if (verb === "cancel") {
+    let targetName = "Unknown recipient";
+    if (Number.isSafeInteger(targetPlayerId) && targetPlayerId > 0) {
+      const [target] = await db
+        .select()
+        .from(casinoPlayersTable)
+        .where(eq(casinoPlayersTable.id, targetPlayerId))
+        .limit(1);
+      if (target) targetName = target.displayName;
+    }
+    await sendTipCard(
+      bot,
+      chatId,
+      {
+        status: "TIP CANCELLED",
+        from: player.displayName,
+        to: targetName,
+        amount: Number.isSafeInteger(amountMinor) && amountMinor > 0
+          ? formatMoney(amountMinor, currency)
+          : "Not processed",
+        currency,
+        balance: "No balance changed",
+        fairId: "cancelled before transfer",
+        note: "The confirmation was cancelled safely",
+      },
+      { inline_keyboard: [] },
+      messageId,
+    );
+    return;
+  }
+  if (verb !== "confirm") return;
   if (
     !Number.isSafeInteger(targetPlayerId) ||
     targetPlayerId <= 0 ||
     !Number.isSafeInteger(amountMinor) ||
     amountMinor <= 0
   ) {
-    await bot.sendMessage(chatId, "This tip confirmation is invalid or expired.");
+    await sendTipCard(
+      bot,
+      chatId,
+      {
+        status: "TIP FAILED",
+        from: player.displayName,
+        to: "Unknown recipient",
+        amount: "Not processed",
+        currency,
+        balance: "No balance changed",
+        fairId: "invalid confirmation",
+        note: "This tip confirmation is invalid or expired",
+      },
+      { inline_keyboard: [] },
+      messageId,
+    );
     return;
   }
   const [targetPlayer] = await db
@@ -9687,7 +9737,22 @@ async function handleTipCallback(
     .where(eq(casinoPlayersTable.id, targetPlayerId))
     .limit(1);
   if (!targetPlayer) {
-    await bot.sendMessage(chatId, "The tip recipient is no longer available.");
+    await sendTipCard(
+      bot,
+      chatId,
+      {
+        status: "TIP FAILED",
+        from: player.displayName,
+        to: "Unavailable recipient",
+        amount: formatMoney(amountMinor, currency),
+        currency,
+        balance: "No balance changed",
+        fairId: "recipient unavailable",
+        note: "The recipient is no longer available",
+      },
+      { inline_keyboard: [] },
+      messageId,
+    );
     return;
   }
   try {
@@ -9716,6 +9781,7 @@ async function handleTipCallback(
           { text: "Play games", callback_data: ownedCallback("main:games", player.telegramUserId) },
         ]],
       },
+      messageId,
     );
     await notifyTipRecipient(bot, targetPlayer, player, amountMinor, currency);
     await auditTransaction(
@@ -9730,9 +9796,39 @@ async function handleTipCallback(
     );
   } catch (error) {
     if (error instanceof Error && error.message === "INSUFFICIENT_BALANCE") {
-      await bot.sendMessage(chatId, "Tip rejected because your balance is too low.");
+      await sendTipCard(
+        bot,
+        chatId,
+        {
+          status: "TIP FAILED",
+          from: player.displayName,
+          to: targetPlayer.displayName,
+          amount: formatMoney(amountMinor, currency),
+          currency,
+          balance: "No balance changed",
+          fairId: "insufficient balance",
+          note: "Tip rejected because your balance is too low",
+        },
+        { inline_keyboard: [] },
+        messageId,
+      );
     } else if (error instanceof Error && error.message === "SELF_TIP") {
-      await bot.sendMessage(chatId, "You cannot tip yourself.");
+      await sendTipCard(
+        bot,
+        chatId,
+        {
+          status: "TIP FAILED",
+          from: player.displayName,
+          to: targetPlayer.displayName,
+          amount: formatMoney(amountMinor, currency),
+          currency,
+          balance: "No balance changed",
+          fairId: "self-tip rejected",
+          note: "You cannot tip yourself",
+        },
+        { inline_keyboard: [] },
+        messageId,
+      );
     } else {
       throw error;
     }
@@ -14065,9 +14161,9 @@ async function handleMainUpdate(
         languageKeyboard(language, player.telegramUserId),
       );
     } else if (action.startsWith("tip:")) {
-      await handleTipCallback(bot, chatId, player, action);
+      await handleTipCallback(bot, chatId, player, action, callback.message?.message_id);
     } else if (action.startsWith("escrow:")) {
-      await handleEscrowCallback(bot, chatId, player, action);
+      await handleEscrowCallback(bot, chatId, player, action, callback.message?.message_id);
     } else if (action.startsWith("battle:pvb:play:")) {
       const battleId = Number(action.split(":")[3]);
       if (Number.isInteger(battleId)) {
